@@ -50,6 +50,7 @@ PROTOCOLS_FILE = APP / "protocols.conf"
 LEGACY_LAUNCHERS = APP / "protocols.conf"
 SHORTCUTS = APP / "shortcuts.conf"
 UI_CONF = APP / "ui.conf"
+LOGS_DIR = APP / "logs"
 
 # Window layouts a user can switch between; "rail" is the designed default and
 # "classic" is the pre-redesign window kept for continuity.
@@ -1032,9 +1033,17 @@ def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
         raise RuntimeError(f"{argv[0]} is not installed "
                            f"(launcher {launcher or p.default!r} for {p.label})")
     if p.injects:
-        return inject_credentials(c, p, argv)
-    spawn_detached(argv, env=p.env or None)
-    return f"{p.label} -> {c.sel} ({c.host}) via {Path(argv[0]).name}"
+        result = inject_credentials(c, p, argv)
+    else:
+        spawn_detached(argv, env=p.env or None)
+        result = f"{p.label} -> {c.sel} ({c.host}) via {Path(argv[0]).name}"
+    log_event("launch", sel=c.sel, host=c.host, protocol=p.id,
+              launcher=launcher or p.default)
+    # Remember the MAC while the host is surely on: that is what Wake needs later.
+    mac = learn_mac(c.host)
+    if mac and c.extra.get("rcm-mac") != mac:
+        set_connection_extra(c, "rcm-mac", mac)
+    return result
 
 
 def inject_credentials(c: Conn, p: Protocol, argv: list[str]) -> str:
@@ -1491,6 +1500,106 @@ def export_phonebook(dest: Path, conns: list[Conn] | None = None,
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(bytes(head) + b"".join(out_recs))
     return len(out_recs)
+
+
+# --------------------------------------------------------------------------- #
+# event log: one JSONL line per user-visible event
+# --------------------------------------------------------------------------- #
+@help_topic("logging", "The event log", ("logs", "jsonl", "history"),
+            section="Logs")
+def log_event(kind: str, **fields) -> None:
+    """Everything notable appends one JSON line to logs/YYYY-MM-DD.jsonl.
+
+    Session launches and ends (with duration), script runs (with exit codes),
+    probe transitions, Wake-on-LAN sends and credential changes all land in
+    the same daily file — plain JSONL, one object per line, rotated by name.
+    The Logs page reads these; `rcm history <sel>` filters to one connection.
+    """
+    import json
+    from datetime import datetime, timezone
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc)
+    record = {"ts": stamp.isoformat(timespec="seconds"), "kind": kind, **fields}
+    day_file = LOGS_DIR / f"{stamp:%Y-%m-%d}.jsonl"
+    with day_file.open("a") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def read_log_events(days: int = 7, kind: str = "", sel: str = "") -> list[dict]:
+    """Newest-first events from the last N daily files, optionally filtered."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    events: list[dict] = []
+    today = datetime.now(timezone.utc).date()
+    for offset in range(days):
+        day_file = LOGS_DIR / f"{today - timedelta(days=offset):%Y-%m-%d}.jsonl"
+        if not day_file.is_file():
+            continue
+        for line in day_file.read_text().splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if kind and record.get("kind") != kind:
+                continue
+            if sel and record.get("sel") != sel:
+                continue
+            events.append(record)
+    events.reverse()
+    return events
+
+
+# --------------------------------------------------------------------------- #
+# online probe + Wake-on-LAN
+# --------------------------------------------------------------------------- #
+def probe_host(host: str, port: int, timeout: float = 1.0) -> bool:
+    """One TCP connect, the whole probe. Serial by design: the caller runs ONE
+    of these at a time so 500 hosts never means 500 sockets."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def learn_mac(host: str) -> str:
+    """The MAC from the ARP table after a successful connect, else ''."""
+    neigh = subprocess.run(["ip", "neigh", "show", host],
+                           capture_output=True, text=True).stdout
+    match = re.search(r"lladdr\s+([0-9a-f:]{17})", neigh)
+    return match.group(1) if match else ""
+
+
+@help_topic("wake-on-lan", "Wake-on-LAN", ("wol", "wake", "magic packet", "mac"),
+            section="Connections")
+def wake(mac: str, host: str = "", port: int = 9) -> None:
+    """An offline machine with a known MAC can be woken from its row.
+
+    The MAC is learned automatically from the ARP table on a successful
+    connect and stored as `rcm-mac` in the .rdp. Waking sends the standard
+    magic packet — 6×FF then the MAC sixteen times — as a UDP broadcast on
+    port 9; no dependency, raw sockets suffice.
+    """
+    import socket
+    raw = bytes.fromhex(mac.replace(":", "").replace("-", ""))
+    if len(raw) != 6:
+        raise ValueError(f"not a MAC address: {mac!r}")
+    packet = b"\xff" * 6 + raw * 16
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(packet, ("255.255.255.255", port))
+    log_event("wake", mac=mac, host=host)
+
+
+def set_connection_extra(c: Conn, key: str, value: str) -> None:
+    """Upsert one rcm-* key in a connection's .rdp file."""
+    lines = c.path.read_text().splitlines()
+    prefix = f"{key}:s:"
+    lines = [line for line in lines if not line.startswith(prefix)]
+    if value:
+        lines.append(f"{prefix}{value}")
+    c.path.write_text("\n".join(lines) + "\n")
 
 
 # --------------------------------------------------------------------------- #
@@ -1958,7 +2067,7 @@ USAGE = """rcm -- remote connection manager
   rcm import <file.csv> [--overwrite] [--dry-run]
   rcm export [file.csv]          default: export/connections.csv
   rcm phonebook [out.rpb]        experimental Radmin phonebook (never overwrites live)
-  rcm gen-launcher               rebuild the .desktop jump list
+  rcm wake <sel>                 send a Wake-on-LAN magic packet\n  rcm history [sel]              recent events from the JSONL log\n  rcm gen-launcher               rebuild the .desktop jump list
   rcm install-icon               install the app icon into your icon theme
 """
 
@@ -2234,6 +2343,31 @@ def main(argv: list[str]) -> int:
 
     if cmd == "gen-launcher":
         print(f"{gen_launcher()} connection(s) -> {DESKTOP_FILE}")
+        return 0
+
+    if cmd == "wake":
+        if not rest:
+            print("usage: rcm wake <group/name>", file=sys.stderr)
+            return 2
+        c = find(rest[0])
+        if not c:
+            print(f"no such connection: {rest[0]}", file=sys.stderr)
+            return 1
+        mac = c.extra.get("rcm-mac", "")
+        if not mac:
+            print(f"{c.sel}: no rcm-mac recorded yet — connect once while it is "
+                  "on, the MAC is learned automatically", file=sys.stderr)
+            return 1
+        wake(mac, host=c.host)
+        print(f"magic packet sent to {mac} ({c.sel})")
+        return 0
+
+    if cmd == "history":
+        sel = rest[0] if rest else ""
+        for record in read_log_events(days=30, sel=sel)[:200]:
+            extras = {k: v for k, v in record.items() if k not in ("ts", "kind")}
+            print(f"  {record['ts']}  {record['kind']:8} "
+                  + " ".join(f"{k}={v}" for k, v in extras.items()))
         return 0
 
     if cmd == "health":
