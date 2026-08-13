@@ -377,8 +377,14 @@ class Win(Gtk.Window):
         self.say(f"pinned {label!r} — tabs live in ui.conf")
 
     def on_window_key(self, _widget, event) -> bool:
+        key_name = Gdk.keyval_name(event.keyval)
+        if key_name == "F1":
+            focused = self.get_focus()
+            self.show_help(getattr(focused, "rcm_help_topic", "") if focused
+                           else "")
+            return True
         if (event.state & Gdk.ModifierType.CONTROL_MASK) and \
-                Gdk.keyval_name(event.keyval) in ("t", "T"):
+                key_name in ("t", "T"):
             self.pin_current_query()
             return True
         return False
@@ -1376,6 +1382,114 @@ class Win(Gtk.Window):
     def show_connection_history(self, c) -> None:
         self.show_logs()   # viewer; a per-connection filter is a later refinement
         self.say(f"history for {c.sel}")
+
+    @help_topic_gui("help-window", "The Help window (F1)",
+                    ("help", "f1", "guide", "open code"), section="Help")
+    def show_help(self, topic_id: str = "") -> None:
+        """F1 opens the guide — anywhere, for the control under focus.
+
+        Widgets carry their topic; with none, the index opens. Every topic is
+        generated from the source docstring that implements the behaviour and
+        ends with an Open-code link straight to that file and line, opened in
+        the first goto-capable editor found (persisted once chosen).
+        """
+        import rcm_help
+        d = Gtk.Dialog(title="Help — Remote Connections", transient_for=self)
+        d.set_default_size(680, 460)
+        box = d.get_content_area()
+        pane = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        pane.set_position(210)
+        box.pack_start(pane, True, True, 0)
+
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        side.set_border_width(6)
+        search = Gtk.SearchEntry()
+        search.set_placeholder_text("search help…")
+        side.pack_start(search, False, False, 0)
+        topics_store = Gtk.TreeStore(str, str)   # title, topic_id
+        topics_view = Gtk.TreeView(model=topics_store, headers_visible=False)
+        topics_view.append_column(Gtk.TreeViewColumn(
+            "", Gtk.CellRendererText(), text=0))
+        side_scroller = Gtk.ScrolledWindow()
+        side_scroller.add(topics_view)
+        side.pack_start(side_scroller, True, True, 0)
+        pane.pack1(side, False, False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        content.set_border_width(10)
+        title_label = Gtk.Label(xalign=0)
+        body_label = Gtk.Label(xalign=0, yalign=0)
+        body_label.set_line_wrap(True)
+        body_label.set_selectable(True)
+        body_scroller = Gtk.ScrolledWindow()
+        body_scroller.add(body_label)
+        source_button = Gtk.Button(label="")
+        source_button.set_relief(Gtk.ReliefStyle.NONE)
+        content.pack_start(title_label, False, False, 0)
+        content.pack_start(body_scroller, True, True, 0)
+        content.pack_start(source_button, False, False, 0)
+        pane.pack2(content, True, False)
+
+        current = {"topic": None}
+
+        def show_topic(topic):
+            current["topic"] = topic
+            title_label.set_markup(f"<big><b>{GLib.markup_escape_text(topic.title)}"
+                                   "</b></big>")
+            body_label.set_text(topic.body)
+            source_button.set_label(f"⌁ Open the code — {topic.source_file}:"
+                                    f"{topic.source_line} {topic.symbol}()")
+
+        def fill(query=""):
+            topics_store.clear()
+            hits = {t.topic_id for t in rcm_help.search_topics(query)}
+            for section, topics in rcm_help.topics_by_section().items():
+                visible = [t for t in topics if t.topic_id in hits]
+                if not visible:
+                    continue
+                parent = topics_store.append(None, [section, ""])
+                for topic in visible:
+                    topics_store.append(parent, [topic.title, topic.topic_id])
+            topics_view.expand_all()
+
+        def on_select(selection):
+            model, it = selection.get_selected()
+            if it and model[it][1]:
+                show_topic(rcm_help.HELP_TOPICS[model[it][1]])
+        topics_view.get_selection().connect("changed", on_select)
+        search.connect("search-changed", lambda e: fill(e.get_text()))
+
+        def open_source(*_a):
+            topic = current["topic"]
+            if not topic:
+                return
+            status = rcm.open_in_editor(topic.source_file, topic.source_line)
+            if status:
+                self.say(status)
+                return
+            advice = Gtk.MessageDialog(
+                transient_for=d, modal=True, message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.NONE, text="No editor we recognise")
+            advice.format_secondary_text(
+                "To jump to a file and line, install a goto-capable editor "
+                "(VS Code, Sublime, gedit, Kate). Or open the file in a plain "
+                f"text editor — the topic lives at {topic.source_file} "
+                f"line {topic.source_line}.")
+            advice.add_buttons("Open with text editor", 1, Gtk.STOCK_CLOSE, 0)
+            if advice.run() == 1:
+                rcm.spawn_detached(["xdg-open",
+                                    str(rcm.APP / topic.source_file)])
+            advice.destroy()
+        source_button.connect("clicked", open_source)
+
+        fill()
+        if topic_id and topic_id in rcm_help.HELP_TOPICS:
+            show_topic(rcm_help.HELP_TOPICS[topic_id])
+        elif rcm_help.HELP_TOPICS:
+            show_topic(next(iter(rcm_help.HELP_TOPICS.values())))
+        d.show_all()
+        d.run()
+        d.destroy()
 
     def rebuild_buttons(self) -> None:
         """Redraw the Connect row from protocols.conf."""
@@ -2880,6 +2994,11 @@ def run() -> int:
     w = Win()
     install_css(protocols_safe(), w)
     w.reload()
+    # The offline guide regenerates whenever the registry grew or the code moved.
+    try:
+        rcm.dump_help_html()
+    except OSError:
+        pass
     if migrated:
         w.say("launchers.conf upgraded to protocols.conf")
     elif created:

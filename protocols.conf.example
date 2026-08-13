@@ -109,3 +109,5 @@ order = 60
 port = 443
 default = Browser
 launcher.Browser = xdg-open https://{host}:{port}/
+# Deliberately unmatchable: a browser tab is not ours to track as a session.
+detect.process = ^$

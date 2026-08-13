@@ -283,6 +283,9 @@ def creds_keys() -> list[str]:
     return sorted(creds_conf_table())
 
 
+@help_topic("credential-chain", "How passwords are resolved",
+            ("credentials", "keyring", "default", "precedence"),
+            section="Credentials")
 def creds_chain(sel: str, proto: str = "") -> list[str]:
     """Credential keys to try, most specific first.
 
@@ -822,6 +825,8 @@ order = 60
 port = 443
 default = Browser
 launcher.Browser = xdg-open https://{host}:{port}/
+# Deliberately unmatchable: a browser tab is not ours to track as a session.
+detect.process = ^$
 """,
     "creds.conf": """\
 # Credentials for rcm. Passwords are NOT stored here -- they live in the OS
@@ -1065,7 +1070,18 @@ def build_argv(c: Conn, proto: str, launcher: str = "") -> list[str]:
     return [tok.format(**vals) for tok in shlex.split(tmpl)]
 
 
+@help_topic("connecting", "Connecting", ("connect", "launch", "protocol"),
+            section="Connections")
 def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
+    """Connecting hands the connection to the protocol's configured program.
+
+    The Connect buttons use each protocol's default launcher; right-click a
+    row or a chip for the alternatives. A pre hook (rcm-pre) must exit 0
+    first or the launch stops; clients that refuse a password on the command
+    line get it typed into their prompt per the protocol's inject steps; the
+    MAC is learned after launch so ⚡ Wake works later; and every launch is
+    one line in the event log.
+    """
     p = protocol(proto or next(iter(load_protocols())))
     argv = build_argv(c, p.id, launcher)
     if not shutil.which(argv[0]) and not Path(argv[0]).is_file():
@@ -1556,6 +1572,77 @@ def export_phonebook(dest: Path, conns: list[Conn] | None = None,
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(bytes(head) + b"".join(out_recs))
     return len(out_recs)
+
+
+# --------------------------------------------------------------------------- #
+# help: generated guide + Open-code editor chain
+# --------------------------------------------------------------------------- #
+HELP_DIR = APP / "help"
+EDITOR_CANDIDATES = (
+    ("code", ["code", "--goto", "{file}:{line}"]),
+    ("subl", ["subl", "{file}:{line}"]),
+    ("gedit", ["gedit", "+{line}", "{file}"]),
+    ("kate", ["kate", "-l", "{line}", "{file}"]),
+    ("notepad++", ["notepad++", "-n{line}", "{file}"]),
+)
+
+
+def open_in_editor(file: str, line: int) -> str:
+    """Open a source location in a goto-capable editor. Returns a status.
+
+    The editor chosen in ui.conf wins; otherwise the first known editor on
+    PATH is used and remembered. With none found the caller shows the advice
+    dialog — this function never guesses at a plain text editor by itself.
+    """
+    state = load_ui_state()
+    target = str((APP / file).resolve()) if not Path(file).is_absolute() else file
+    chain = list(EDITOR_CANDIDATES)
+    if state.get("editor"):
+        chain.insert(0, (state["editor"].split()[0],
+                         state["editor"].split() + ["{file}:{line}"]))
+    for name, template in chain:
+        if shutil.which(name):
+            argv = [part.format(file=target, line=line) for part in template]
+            spawn_detached(argv)
+            if not state.get("editor"):
+                state["editor"] = name
+                save_ui_state(state)
+            return f"opened {file}:{line} in {name}"
+    return ""
+
+
+def dump_help_html() -> int:
+    """Write help/*.html from the registry: the offline guide, generated.
+
+    Behaviour text lives only in the source docstrings; this render adds
+    framing, never content. Regenerated whenever the topics change.
+    """
+    import html
+    HELP_DIR.mkdir(parents=True, exist_ok=True)
+    style = ("<style>body{font-family:sans-serif;margin:2em;max-width:46em}"
+             "pre{background:#f4f4f4;padding:1em}a{color:#1a5fb4}"
+             "small{color:#777}</style>")
+    index_lines = [f"<h1>Network Computing Hub — guide</h1>{style}",
+                   "<p><small>generated from the source at launch — the code "
+                   "is the manual</small></p>"]
+    from rcm_help import topics_by_section
+    for section, topics in topics_by_section().items():
+        index_lines.append(f"<h2>{html.escape(section)}</h2><ul>")
+        for topic in topics:
+            index_lines.append(
+                f'<li><a href="{topic.topic_id}.html">'
+                f"{html.escape(topic.title)}</a></li>")
+            body = "".join(f"<p>{html.escape(par)}</p>"
+                           for par in topic.body.split("\n\n"))
+            (HELP_DIR / f"{topic.topic_id}.html").write_text(
+                f"<h1>{html.escape(topic.title)}</h1>{style}{body}"
+                f"<hr><p><small>⌁ the source is the full manual: "
+                f"{html.escape(topic.source_file)}:{topic.source_line} "
+                f"{html.escape(topic.symbol)}()</small></p>"
+                f'<p><a href="index.html">← guide index</a></p>')
+        index_lines.append("</ul>")
+    (HELP_DIR / "index.html").write_text("\n".join(index_lines))
+    return len(HELP_TOPICS)
 
 
 # --------------------------------------------------------------------------- #
@@ -2520,8 +2607,10 @@ def main(argv: list[str]) -> int:
         return 1
 
     if cmd == "help":
-        # `rcm help` lists the registered topics; `--dump` (the generated HTML
-        # guide) arrives with the Help window itself.
+        if "--dump" in rest:
+            count = dump_help_html()
+            print(f"{count} topic(s) -> {HELP_DIR}/index.html")
+            return 0
         if not HELP_TOPICS:
             print("no help topics registered")
             return 0
