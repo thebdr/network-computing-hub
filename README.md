@@ -66,8 +66,10 @@ every host.
 
 ## How connections are stored
 
-`RDP/<GROUP>/<Name>.rdp` — ordinary RDP files, which are also the single source of
-truth for host and username. Two extra keys are ours; clients ignore keys they do not
+`RDP/<Group>/<Name>.rdp` — ordinary RDP files, which are also the single source of
+truth for host and username. **Groups nest as deeply as you like**: put a connection in
+`RDP/Plant/Line2/Cells/` and the tree follows the folders. Ticking or selecting a group
+takes everything beneath it, at any depth. Two extra keys are ours; clients ignore keys they do not
 recognise:
 
 ```
@@ -162,6 +164,13 @@ most-specific-first, and within a scope a protocol-specific entry beats the gene
 Group/Host@radmin → Group/Host → Group@radmin → Group → DEFAULT@radmin → DEFAULT
 ```
 
+Nested groups add a rung per level, so a password set on `Plant` covers everything
+under it unless something deeper overrides:
+
+```
+Plant/Line2/Cells/Cell A → Plant/Line2/Cells → Plant/Line2 → Plant → DEFAULT
+```
+
 ```bash
 rcm creds list          # where each password lives, never the value
 rcm creds set Group     # prompts without echo
@@ -246,8 +255,9 @@ records instead pack a literal `folder` marker straight after the name's termina
 it moves with the name length. Verified by rebuilding an existing phonebook from its own
 records byte-for-byte.
 
-Known limit: folder *membership* is not reconstructed, so exported hosts may land at the
-tree root. Names, hosts and usernames are correct.
+Known limits: folder *membership* is not reconstructed, so exported hosts may land at
+the tree root; and since the format has no nested folders, a sub-group becomes a folder
+named with its full path (`Plant/Line2`). Names, hosts and usernames are correct.
 
 ## Roadmap
 

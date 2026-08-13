@@ -130,7 +130,9 @@ def scan() -> list[Conn]:
             continue
         f = parse_rdp(p)
         conns.append(Conn(
-            group=rel.parts[0] if len(rel.parts) > 1 else "",
+            # Full relative parent path, so groups can nest arbitrarily:
+            # RDP/Plant/Line1/Host.rdp -> group "Plant/Line1".
+            group="/".join(rel.parts[:-1]),
             name=p.stem,
             path=p,
             host=f.get("full address", ""),
@@ -142,7 +144,19 @@ def scan() -> list[Conn]:
 
 
 def groups() -> list[str]:
-    return sorted({c.group for c in conns_cached() if c.group})
+    """Every group path, including intermediate levels of a nested tree."""
+    out: set[str] = set()
+    for c in conns_cached():
+        parts = c.group.split("/") if c.group else []
+        for i in range(1, len(parts) + 1):
+            out.add("/".join(parts[:i]))
+    return sorted(out)
+
+
+def group_members(group: str) -> list[Conn]:
+    """Connections in a group, including everything in its sub-groups."""
+    return [c for c in conns_cached()
+            if c.group == group or c.group.startswith(group + "/")]
 
 
 _cache: list[Conn] | None = None
@@ -255,8 +269,12 @@ def creds_chain(sel: str, proto: str = "") -> list[str]:
 
         Group/Host@radmin -> Group/Host -> Group@radmin -> Group -> DEFAULT@radmin -> DEFAULT
     """
+    # Walk up every level of a nested group, most specific first:
+    # Plant/Line1/Host -> Plant/Line1 -> Plant -> DEFAULT
+    parts = sel.split("/")
+    scopes = ["/".join(parts[:i]) for i in range(len(parts), 0, -1)] + ["DEFAULT"]
     chain = []
-    for scope in (sel, sel.split("/")[0], "DEFAULT"):
+    for scope in scopes:
         if not scope:
             continue
         if proto:
@@ -288,8 +306,7 @@ def creds_scopes() -> list[str]:
     Protocol-qualified keys ("Group@radmin") are scopes in their own right, so they
     show up in the editor next to the generic entry they refine.
     """
-    groups = sorted({c.group for c in conns_cached() if c.group})
-    base = ["DEFAULT"] + groups
+    base = ["DEFAULT"] + groups()
     extra = {k for k in _creds_table() if k not in base}
     extra |= {c.sel for c in conns_cached() if secret_get(c.sel)}
     for scope in list(base):
@@ -1230,8 +1247,11 @@ def import_csv(src: Path, overwrite: bool = False,
             except ValueError:
                 skipped.append(f"line {i}: bad port {row.get('port')!r}")
                 continue
-            if re.search(r"[/\\]", name) or re.search(r"[/\\]", group):
-                skipped.append(f"line {i}: '/' not allowed in group or name")
+            if re.search(r"[/\\]", name) or "\\" in group:
+                skipped.append(f"line {i}: '/' is only allowed in group, to nest it")
+                continue
+            if group.startswith("/") or ".." in group.split("/"):
+                skipped.append(f"line {i}: group must be a relative path")
                 continue
             target = (RDP_DIR / group / f"{name}.rdp") if group else RDP_DIR / f"{name}.rdp"
             if target.exists() and not overwrite:
@@ -1587,7 +1607,7 @@ def _dq(s: str) -> str:
 def gen_launcher() -> int:
     me = Path(__file__).resolve()
     cs = conns_cached(refresh=True)
-    gs = sorted({c.group for c in cs if c.group})
+    gs = groups()   # every level, so a nested tree still gets jump-list entries
     actions = ([_slug(c.sel) for c in cs[:MAX_JUMPLIST]]
                + [f"all-{_slug(g)}" for g in gs] + ["switcher"])
     L = ["[Desktop Entry]", "Type=Application", "Name=Remote Connections",
@@ -1708,7 +1728,7 @@ def main(argv: list[str]) -> int:
                 return 1
             targets = [c]
         else:
-            targets = [c for c in conns_cached() if c.group == rest[0]]
+            targets = group_members(rest[0])
             if not targets:
                 print(f"group '{rest[0]}' has no connections", file=sys.stderr)
                 return 1

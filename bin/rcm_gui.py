@@ -378,24 +378,29 @@ class Win(Gtk.Window):
         ticked = self.checked_sels()
         registry = protocols_safe()
         self.store.clear()
-        parents: dict[str, Gtk.TreeIter] = {}
+        nodes: dict[str, Gtk.TreeIter] = {}
+
+        def group_iter(path: str):
+            """Row for a group path, creating each missing level above it."""
+            if not path:
+                return None
+            if path not in nodes:
+                parent = group_iter(path.rsplit("/", 1)[0] if "/" in path else "")
+                # Field order follows the C_* constants, not the visual order.
+                nodes[path] = self.store.append(
+                    parent, [False, "", path.rsplit("/", 1)[-1], "", "", "", "", "",
+                             700, Pango.Style.ITALIC])
+            return nodes[path]
+
         for c in rcm.conns_cached():
-            it = None
-            if c.group:
-                if c.group not in parents:
-                    # Field order follows the C_* constants, not the visual order.
-                    parents[c.group] = self.store.append(
-                        None, [False, "", c.group, "", "", "", "", "",
-                               700, Pango.Style.ITALIC])
-                it = parents[c.group]
             labels = protocol_badges(c.protocols, registry, c.default_protocol)
-            self.store.append(it, [c.sel in ticked, "", c.name, c.host, c.username,
-                                   labels, pretty_key(keys.get(c.sel, "")), c.sel,
-                                   400, Pango.Style.NORMAL])
-        for group, it in parents.items():
-            kids = self._children(it)
-            self.store[it][C_CHECK] = bool(kids) and all(
-                self.store[k][C_CHECK] for k in kids)
+            self.store.append(group_iter(c.group),
+                              [c.sel in ticked, "", c.name, c.host, c.username,
+                               labels, pretty_key(keys.get(c.sel, "")), c.sel,
+                               400, Pango.Style.NORMAL])
+        # Deepest first, so a parent sees its sub-groups already reconciled.
+        for path in sorted(nodes, key=lambda p: p.count("/"), reverse=True):
+            self._sync_group_check(nodes[path])
         self.tree.expand_all()
         self.count_lbl.set_text(f"({len(rcm.conns_cached())})")
         self.refresh_live()
@@ -444,18 +449,28 @@ class Win(Gtk.Window):
             k = self.store.iter_next(k)
         return out
 
+    def _sync_group_check(self, it) -> None:
+        kids = self._children(it)
+        self.store[it][C_CHECK] = bool(kids) and all(
+            self.store[k][C_CHECK] for k in kids)
+
     def on_check_toggled(self, _renderer, path) -> None:
-        """Tick a row. A group carries its whole membership with it."""
+        """Tick a row. A group carries its whole subtree with it, at any depth."""
         it = self.store.get_iter(path)
         new = not self.store[it][C_CHECK]
-        self.store[it][C_CHECK] = new
-        for k in self._children(it):
-            self.store[k][C_CHECK] = new
+
+        def cascade(node, value):
+            self.store[node][C_CHECK] = value
+            for k in self._children(node):
+                cascade(k, value)
+        cascade(it, new)
+        # Walk back up: a parent is ticked only when all of its children are.
         parent = self.store.iter_parent(it)
-        if parent is not None:
-            kids = self._children(parent)
-            self.store[parent][C_CHECK] = bool(kids) and all(
-                self.store[k][C_CHECK] for k in kids)
+        while parent is not None:
+            self._sync_group_check(parent)
+            parent = self.store.iter_parent(parent)
+        n = len(self.checked_sels())
+        self.say(f"{n} connection(s) ticked" if n else "nothing ticked")
         n = len(self.checked_sels())
         self.say(f"{n} connection(s) ticked" if n else "nothing ticked")
 
@@ -498,8 +513,19 @@ class Win(Gtk.Window):
                 if c:
                     out.append(c)
             else:
-                group = model[it][C_LABEL]
-                out.extend(c for c in rcm.conns_cached() if c.group == group)
+                # A group row: take every connection beneath it, however deep.
+                def descend(node):
+                    while node:
+                        s = model[node][C_SEL]
+                        if s:
+                            c = rcm.find(s)
+                            if c:
+                                out.append(c)
+                        child = model.iter_children(node)
+                        if child:
+                            descend(child)
+                        node = model.iter_next(node)
+                descend(model.iter_children(it))
         seen, uniq = set(), []
         for c in out:
             if c.sel not in seen:
