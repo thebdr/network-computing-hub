@@ -1551,10 +1551,28 @@ class Win(Gtk.Window):
             self.on_credentials()   # a scope was added; redraw the list
 
 
+def set_window_icon() -> None:
+    """Icon for the window and the task switcher.
+
+    Prefer the theme name so it follows any later reinstall; fall back to the
+    file in the repo so a clone that has not run `rcm install-icon` still shows
+    the right icon.
+    """
+    if Gtk.IconTheme.get_default().has_icon(rcm.ICON_NAME):
+        Gtk.Window.set_default_icon_name(rcm.ICON_NAME)
+        return
+    if rcm.ICON_SVG.is_file():
+        try:
+            Gtk.Window.set_default_icon_from_file(str(rcm.ICON_SVG))
+        except Exception:
+            pass
+
+
 def run() -> int:
     # The GUI is the one place allowed to create config: opening the manager is a
     # deliberate setup step, so a fresh clone gets real editable files rather
     # than invisible in-code defaults.
+    set_window_icon()
     migrated = rcm.migrate_launchers()
     created = rcm.write_default_configs()
     w = Win()

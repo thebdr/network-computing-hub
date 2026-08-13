@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>Network Computing Hub</title>
+  <!-- A hub with three machines on it. The endpoint colours are the shipped
+       protocol colours (RDP green, VNC blue, Radmin orange), so the icon reads
+       the same way the connection list does. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a424b"/>
+      <stop offset="1" stop-color="#242a30"/>
+    </linearGradient>
+    <linearGradient id="hub" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#c9d1d9"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#bg)"/>
+
+  <!-- spokes, drawn first so the nodes sit on top -->
+  <g stroke="#8b949e" stroke-width="5" stroke-linecap="round">
+    <line x1="64" y1="64" x2="64" y2="30"/>
+    <line x1="64" y1="64" x2="96" y2="82"/>
+    <line x1="64" y1="64" x2="32" y2="82"/>
+  </g>
+
+  <!-- machines -->
+  <g>
+    <rect x="49" y="17" width="30" height="23" rx="5" fill="#4e9a25"/>
+    <rect x="53" y="21" width="22" height="11" rx="2" fill="#ffffff" opacity="0.35"/>
+
+    <rect x="82" y="72" width="30" height="23" rx="5" fill="#2b6cb0"/>
+    <rect x="86" y="76" width="22" height="11" rx="2" fill="#ffffff" opacity="0.35"/>
+
+    <rect x="16" y="72" width="30" height="23" rx="5" fill="#d97a1f"/>
+    <rect x="20" y="76" width="22" height="11" rx="2" fill="#ffffff" opacity="0.35"/>
+  </g>
+
+  <!-- the hub itself -->
+  <circle cx="64" cy="64" r="15" fill="url(#hub)"/>
+  <circle cx="64" cy="64" r="6" fill="#2b3138"/>
+</svg>

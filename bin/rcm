@@ -1610,6 +1610,54 @@ def _parse_gs_list(raw: str) -> list[str]:
 # --------------------------------------------------------------------------- #
 # .desktop jump list
 # --------------------------------------------------------------------------- #
+ICON_NAME = "network-computing-hub"
+ICON_SVG = APP / "assets" / f"{ICON_NAME}.svg"
+ICON_SVG_SMALL = APP / "assets" / f"{ICON_NAME}-small.svg"
+ICON_THEME_DIR = Path.home() / ".local/share/icons/hicolor"
+# Below 48px the detailed icon turns to mush, so the simplified variant is used
+# there -- that is exactly what per-size directories in an icon theme are for.
+ICON_SMALL_UPTO = 32
+ICON_SIZES = (16, 22, 24, 32, 48, 64, 128, 256)
+
+
+def icon_installed() -> bool:
+    return (ICON_THEME_DIR / "scalable/apps" / f"{ICON_NAME}.svg").is_file()
+
+
+def install_icon() -> list[str]:
+    """Install the app icon into the user's hicolor theme."""
+    if not ICON_SVG.is_file():
+        raise RuntimeError(f"missing {ICON_SVG}")
+    written = []
+    scalable = ICON_THEME_DIR / "scalable/apps"
+    scalable.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ICON_SVG, scalable / f"{ICON_NAME}.svg")
+    written.append(str(scalable / f"{ICON_NAME}.svg"))
+
+    try:
+        import gi
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf
+    except Exception:
+        return written  # SVG alone still works wherever librsvg is available
+
+    for size in ICON_SIZES:
+        src = ICON_SVG_SMALL if (size <= ICON_SMALL_UPTO
+                                 and ICON_SVG_SMALL.is_file()) else ICON_SVG
+        out = ICON_THEME_DIR / f"{size}x{size}/apps"
+        out.mkdir(parents=True, exist_ok=True)
+        dest = out / f"{ICON_NAME}.png"
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_size(str(src), size, size)
+            pb.savev(str(dest), "png", [], [])
+            written.append(str(dest))
+        except Exception:
+            continue
+    subprocess.run(["gtk-update-icon-cache", "-f", "-t", str(ICON_THEME_DIR)],
+                   capture_output=True)
+    return written
+
+
 def _slug(s: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]", "-", s.lower())).strip("-")
 
@@ -1630,14 +1678,23 @@ def _dq(s: str) -> str:
 
 def gen_launcher() -> int:
     me = Path(__file__).resolve()
+    # The .desktop is about to reference the icon by name, so make sure it exists.
+    if not icon_installed():
+        try:
+            install_icon()
+        except Exception:
+            pass
     cs = conns_cached(refresh=True)
     gs = groups()   # every level, so a nested tree still gets jump-list entries
     actions = ([_slug(c.sel) for c in cs[:MAX_JUMPLIST]]
                + [f"all-{_slug(g)}" for g in gs] + ["switcher"])
     L = ["[Desktop Entry]", "Type=Application", "Name=Remote Connections",
          f"Comment=RDP, VNC and Radmin sessions from {RDP_DIR}",
-         f"Exec={me} gui", "Icon=xsi-network-symbolic", "Terminal=false",
-         "Categories=Network;RemoteAccess;", "StartupNotify=false"]
+         f"Exec={me} gui", f"Icon={ICON_NAME}", "Terminal=false",
+         "Categories=Network;RemoteAccess;", "StartupNotify=false",
+         # Without this the panel cannot match a running window (WM_CLASS "rcm")
+         # to this launcher, and shows a generic icon for it instead.
+         "StartupWMClass=rcm"]
     # An empty "Actions=;" is a validation error, so omit it when nothing is listed.
     if actions:
         L.append("Actions=" + ";".join(actions) + ";")
@@ -1685,6 +1742,7 @@ USAGE = """rcm -- remote connection manager
   rcm export [file.csv]          default: export/connections.csv
   rcm phonebook [out.rpb]        experimental Radmin phonebook (never overwrites live)
   rcm gen-launcher               rebuild the .desktop jump list
+  rcm install-icon               install the app icon into your icon theme
 """
 
 
@@ -1945,6 +2003,16 @@ def main(argv: list[str]) -> int:
         print("\nDialog left open, nothing typed. The image shows which field holds "
               "the caret\nand whether the username is prefilled -- that is what sets "
               "inject_order.")
+        return 0
+
+    if cmd == "install-icon":
+        try:
+            written = install_icon()
+        except RuntimeError as e:
+            print(f"rcm: {e}", file=sys.stderr)
+            return 1
+        print(f"{len(written)} file(s) installed under {ICON_THEME_DIR}")
+        print(f"  .desktop and windows can now use Icon={ICON_NAME}")
         return 0
 
     if cmd == "gen-launcher":

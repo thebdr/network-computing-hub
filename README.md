@@ -44,6 +44,7 @@ sudo apt install python3-gi gir1.2-gtk-3.0 xdotool
 git clone https://github.com/thebdr/network-computing-hub.git ~/network-computing-hub
 cd ~/network-computing-hub
 ./bin/rcm init          # writes protocols.conf, creds.conf, shortcuts.conf
+./bin/rcm install-icon  # app icon into ~/.local/share/icons
 mkdir -p ~/bin && ln -s ~/network-computing-hub/bin/rcm ~/bin/rcm
 ```
 
@@ -213,7 +214,7 @@ rcm connect <sel> [--<protocol>] [--via <launcher>]
 rcm connect-all <group>
 rcm protocols | detect <protocol> [--write] | creds ... | shortcuts ...
 rcm import <csv> [--overwrite] [--dry-run] | export [csv] | phonebook [out.rpb]
-rcm calibrate <sel> [protocol] | gen-launcher
+rcm calibrate <sel> [protocol] | gen-launcher | install-icon
 ```
 
 ## Notes from building this
@@ -265,6 +266,14 @@ named with its full path (`Plant/Line2`). Names, hosts and usernames are correct
   place of libsecret, a tray agent owning `RegisterHotKey` (Windows has no per-command
   keybinding registry, and Win+W/Win+Q are shell-reserved), PyInstaller bundling GTK
 - VNC is implemented but has not been exercised against a real server
+
+## Icon
+
+`assets/` holds the icon in two variants: the detailed one, and a simplified one for
+16–32px where the screen shapes and their highlights turn to mush. `rcm install-icon`
+puts the SVG in `hicolor/scalable/apps` and renders PNGs for each size, picking the
+right variant per size. `rcm gen-launcher` installs it automatically if it is missing,
+since the `.desktop` it writes references the icon by name.
 
 ## License
 
