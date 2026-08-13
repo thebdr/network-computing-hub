@@ -7,6 +7,7 @@ creds.conf
 protocols.conf
 launchers.conf
 shortcuts.conf
+ui.conf
 
 # Generated output
 export/
