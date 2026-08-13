@@ -1,8 +1,10 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
   <title>Network Computing Hub</title>
-  <!-- A hub with three machines on it. The endpoint colours are the shipped
-       protocol colours (RDP green, VNC blue, Radmin orange), so the icon reads
-       the same way the connection list does. -->
+  <!-- A hub with three machines on it. Endpoint colours are the shipped protocol
+       colours (RDP green, VNC blue, Radmin orange), so the icon reads the way the
+       connection list does. The hub sits off to the right and the spokes differ in
+       length and angle on purpose: an evenly spaced fan looked like a diagram,
+       this looks like a network. -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#3a424b"/>
@@ -12,30 +14,37 @@
       <stop offset="0" stop-color="#ffffff"/>
       <stop offset="1" stop-color="#c9d1d9"/>
     </linearGradient>
+    <!-- the >_ prompt, one definition reused in every box -->
+    <g id="prompt" stroke="#ffffff" stroke-width="2.4" fill="none"
+       stroke-linecap="round" stroke-linejoin="round" opacity="0.92">
+      <polyline points="9,8 14,12 9,16"/>
+      <line x1="16.5" y1="16.6" x2="24" y2="16.6"/>
+    </g>
   </defs>
 
   <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#bg)"/>
 
   <!-- spokes, drawn first so the nodes sit on top -->
   <g stroke="#8b949e" stroke-width="5" stroke-linecap="round">
-    <line x1="64" y1="64" x2="64" y2="30"/>
-    <line x1="64" y1="64" x2="96" y2="82"/>
-    <line x1="64" y1="64" x2="32" y2="82"/>
+    <line x1="84" y1="70" x2="40" y2="30"/>
+    <line x1="84" y1="70" x2="34" y2="72"/>
+    <line x1="84" y1="70" x2="56" y2="104"/>
   </g>
 
-  <!-- machines -->
+  <!-- machines: far, near and mid, at three different angles -->
   <g>
-    <rect x="49" y="17" width="30" height="23" rx="5" fill="#4e9a25"/>
-    <rect x="53" y="21" width="22" height="11" rx="2" fill="#ffffff" opacity="0.35"/>
+    <rect x="24" y="18" width="32" height="24" rx="5" fill="#4e9a25"/>
+    <use href="#prompt" x="24" y="18"/>
 
-    <rect x="82" y="72" width="30" height="23" rx="5" fill="#2b6cb0"/>
-    <rect x="86" y="76" width="22" height="11" rx="2" fill="#ffffff" opacity="0.35"/>
+    <rect x="18" y="60" width="32" height="24" rx="5" fill="#d97a1f"/>
+    <use href="#prompt" x="18" y="60"/>
 
-    <rect x="16" y="72" width="30" height="23" rx="5" fill="#d97a1f"/>
-    <rect x="20" y="76" width="22" height="11" rx="2" fill="#ffffff" opacity="0.35"/>
+    <rect x="40" y="92" width="32" height="24" rx="5" fill="#2b6cb0"/>
+    <use href="#prompt" x="40" y="92"/>
   </g>
 
   <!-- the hub itself -->
-  <circle cx="64" cy="64" r="15" fill="url(#hub)"/>
-  <circle cx="64" cy="64" r="6" fill="#2b3138"/>
+  <polygon points="103,70 93.5,86.4 74.5,86.4 65,70 74.5,53.6 93.5,53.6"
+           fill="url(#hub)"/>
+  <polygon points="92,70 88,76.9 80,76.9 76,70 80,63.1 88,63.1" fill="#2b3138"/>
 </svg>
