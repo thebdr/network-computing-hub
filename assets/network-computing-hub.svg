@@ -2,10 +2,9 @@
   <title>Network Computing Hub</title>
   <!-- A hub with three machines on it. Endpoint colours are the shipped protocol
        colours (RDP green, VNC blue, Radmin orange), so the icon reads the way the
-       connection list does. The hexagon hub sits off to the right and the spokes
-       differ in length and angle on purpose: an evenly spaced fan looked like a
-       diagram, this looks like a network. Layout runs corner to corner to leave
-       as little dead space as the rounded plate allows. -->
+       connection list does. The hexagon stands on a vertical face, off to the
+       right; spokes differ in length and angle on purpose. The plate corners are
+       squarer than before (rx 20) so the enlarged boxes can reach into them. -->
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#3a424b"/>
@@ -16,36 +15,36 @@
       <stop offset="1" stop-color="#c9d1d9"/>
     </linearGradient>
     <!-- the >_ prompt, one definition reused in every box -->
-    <g id="prompt" stroke="#ffffff" stroke-width="2.6" fill="none"
+    <g id="prompt" stroke="#ffffff" stroke-width="3" fill="none"
        stroke-linecap="round" stroke-linejoin="round" opacity="0.92">
-      <polyline points="9.5,8.5 15,12.9 9.5,17.3"/>
-      <line x1="18" y1="17.8" x2="26" y2="17.8"/>
+      <polyline points="11,10 17.5,15.2 11,20.4"/>
+      <line x1="21" y1="20.9" x2="30" y2="20.9"/>
     </g>
   </defs>
 
-  <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#bg)"/>
+  <rect x="6" y="6" width="116" height="116" rx="20" fill="url(#bg)"/>
 
   <!-- spokes, drawn first so the nodes sit on top -->
-  <g stroke="#8b949e" stroke-width="6" stroke-linecap="round">
-    <line x1="91" y1="64" x2="29" y2="25"/>
-    <line x1="91" y1="64" x2="25" y2="73"/>
-    <line x1="91" y1="64" x2="47" y2="107"/>
+  <g stroke="#8b949e" stroke-width="7" stroke-linecap="round">
+    <line x1="92" y1="64" x2="32" y2="24"/>
+    <line x1="92" y1="64" x2="27" y2="71"/>
+    <line x1="92" y1="64" x2="50" y2="105"/>
   </g>
 
   <!-- machines: far, near and mid, at three different angles -->
   <g>
-    <rect x="12" y="12" width="34" height="26" rx="5.5" fill="#4e9a25"/>
-    <use href="#prompt" x="12" y="12"/>
+    <rect x="12" y="9" width="40" height="30" rx="6" fill="#4e9a25"/>
+    <use href="#prompt" x="12" y="9"/>
 
-    <rect x="8" y="60" width="34" height="26" rx="5.5" fill="#d97a1f"/>
-    <use href="#prompt" x="8" y="60"/>
+    <rect x="7" y="56" width="40" height="30" rx="6" fill="#d97a1f"/>
+    <use href="#prompt" x="7" y="56"/>
 
-    <rect x="30" y="94" width="34" height="26" rx="5.5" fill="#2b6cb0"/>
-    <use href="#prompt" x="30" y="94"/>
+    <rect x="30" y="90" width="40" height="30" rx="6" fill="#2b6cb0"/>
+    <use href="#prompt" x="30" y="90"/>
   </g>
 
-  <!-- the hub itself -->
-  <polygon points="116,64 103.5,85.65 78.5,85.65 66,64 78.5,42.35 103.5,42.35"
+  <!-- the hub: a hexagon standing on a vertical face -->
+  <polygon points="92,35 117.1,49.5 117.1,78.5 92,93 66.9,78.5 66.9,49.5"
            fill="url(#hub)"/>
-  <polygon points="101,64 96,72.66 86,72.66 81,64 86,55.34 96,55.34" fill="#2b3138"/>
+  <polygon points="92,52 102.4,58 102.4,70 92,76 81.6,70 81.6,58" fill="#2b3138"/>
 </svg>

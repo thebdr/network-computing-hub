@@ -1,18 +1,19 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
   <title>Network Computing Hub</title>
-  <!-- Small-size variant. Same composition (hexagon hub off to the right,
-       machines at three different distances and angles) but far fewer elements:
-       at 16-32px the box shapes and the prompts turn to mush, so the machines
+  <!-- Small-size variant. Same composition (vertical-faced hexagon off to the
+       right, machines at three distances and angles) but far fewer elements: at
+       16-32px the box shapes and the prompts turn to mush, so the machines
        become plain discs and the spokes get much heavier. -->
-  <rect x="4" y="4" width="120" height="120" rx="26" fill="#2f363e"/>
-  <g stroke="#9aa4ae" stroke-width="11" stroke-linecap="round">
+  <rect x="4" y="4" width="120" height="120" rx="20" fill="#2f363e"/>
+  <g stroke="#9aa4ae" stroke-width="12" stroke-linecap="round">
     <line x1="90" y1="64" x2="28" y2="24"/>
     <line x1="90" y1="64" x2="24" y2="72"/>
     <line x1="90" y1="64" x2="52" y2="102"/>
   </g>
-  <circle cx="28" cy="24" r="20" fill="#4e9a25"/>
-  <circle cx="24" cy="72" r="20" fill="#d97a1f"/>
-  <circle cx="52" cy="102" r="20" fill="#2b6cb0"/>
-  <polygon points="117,64 103.5,87.4 76.5,87.4 63,64 76.5,40.6 103.5,40.6" fill="#ffffff"/>
-  <polygon points="101,64 95.5,73.5 84.5,73.5 79,64 84.5,54.5 95.5,54.5" fill="#2f363e"/>
+  <circle cx="28" cy="24" r="21" fill="#4e9a25"/>
+  <circle cx="24" cy="72" r="21" fill="#d97a1f"/>
+  <circle cx="52" cy="102" r="21" fill="#2b6cb0"/>
+  <polygon points="90,34 116,49 116,79 90,94 64,79 64,49" fill="#ffffff"/>
+  <polygon points="90,51.5 100.8,57.75 100.8,70.25 90,76.5 79.2,70.25 79.2,57.75"
+           fill="#2f363e"/>
 </svg>
