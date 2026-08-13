@@ -421,8 +421,32 @@ def write_rdp(group: str, name: str, host: str, username: str,
     return dest
 
 
-def delete_conn(c: Conn) -> None:
+def prune_empty_parents(start: Path) -> list[str]:
+    """Remove group folders left empty, walking up from `start`.
+
+    Only the deleted connection's own ancestors, and only genuinely empty ones.
+    Sweeping the whole tree would also delete a folder you had just created to
+    put connections in, and a folder holding anything else -- notes, a stray
+    file -- is left alone.
+    """
+    removed = []
+    d = start
+    while d != RDP_DIR and RDP_DIR in d.parents:
+        try:
+            if any(d.iterdir()):
+                break
+            d.rmdir()
+        except OSError:
+            break
+        removed.append(str(d.relative_to(RDP_DIR)))
+        d = d.parent
+    return removed
+
+
+def delete_conn(c: Conn) -> list[str]:
+    """Delete a connection. Returns any group folders that emptied out with it."""
     c.path.unlink()
+    return prune_empty_parents(c.path.parent)
 
 
 def copy_conn(c: Conn, new_name: str) -> Path:

@@ -695,11 +695,15 @@ class Win(Gtk.Window):
         resp = d.run()
         d.destroy()
         if resp == Gtk.ResponseType.OK:
+            emptied = []
             for c in cs:
-                rcm.delete_conn(c)
+                emptied += rcm.delete_conn(c)
             rcm.gen_launcher()
             self.reload()
-            self.say(f"deleted {len(cs)} connection(s)")
+            msg = f"deleted {len(cs)} connection(s)"
+            if emptied:
+                msg += f"; removed empty group(s): {', '.join(sorted(set(emptied)))}"
+            self.say(msg)
 
     def _ask_text(self, title, label, initial="") -> str:
         d = Gtk.Dialog(title=title, transient_for=self, modal=True)
