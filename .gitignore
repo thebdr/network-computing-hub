@@ -4,6 +4,7 @@ RDP/
 # Machine-local config. Ship the .example files instead; `rcm init` or opening
 # the manager recreates these from documented defaults.
 creds.conf
+protocols.conf
 launchers.conf
 shortcuts.conf
 

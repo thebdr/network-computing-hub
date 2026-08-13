@@ -41,20 +41,10 @@ RDP_DIR = APP / "RDP"
 TEMPLATE = APP / "templates" / "default.rdp"
 EXPORT_DIR = APP / "export"
 CREDS = APP / "creds.conf"
-LAUNCHERS = APP / "launchers.conf"
+PROTOCOLS_FILE = APP / "protocols.conf"
+LEGACY_LAUNCHERS = APP / "protocols.conf"
 SHORTCUTS = APP / "shortcuts.conf"
 LEGACY_CREDS = Path.home() / ".config" / "radmin" / "creds.conf"
-
-PROTOCOLS = ("rdp", "vnc", "radmin")
-DEFAULT_VNC_PORT = 5900
-
-THINCAST = ["flatpak", "run", "com.thincast.client"]
-
-# Everything about Radmin lives in launchers.conf [radmin]; see radmin_config().
-# Nothing here is guessed from the code -- a missing or wrong value is an error,
-# not a silent fallback onto whatever happened to be true on the author's machine.
-RADMIN_KEYS = ("exe", "wine", "wineprefix", "port", "phonebook", "dialog_wait",
-               "settle", "type_delay", "window_class", "title_match", "inject_order")
 
 DESKTOP_FILE = Path.home() / ".local/share/applications/rdp-menu.desktop"
 MAX_JUMPLIST = 10
@@ -78,23 +68,36 @@ class Conn:
         return f"{self.group}/{self.name}" if self.group else self.name
 
     @property
-    def vnc_port(self) -> int:
-        try:
-            return int(self.extra.get("rcm-vnc-port") or DEFAULT_VNC_PORT)
-        except ValueError:
-            return DEFAULT_VNC_PORT
-
-    @property
     def protocols(self) -> tuple[str, ...]:
         """Which protocols this host offers. Absent key means "all of them"."""
+        known = protocol_ids()
         raw = (self.extra.get("rcm-protocols") or "").strip()
         if not raw:
-            return PROTOCOLS
+            return known
         want = [p.strip().lower() for p in raw.split(",") if p.strip()]
-        return tuple(p for p in PROTOCOLS if p in want) or PROTOCOLS
+        return tuple(p for p in known if p in want) or known
 
-    def port_for(self, proto: str) -> int:
-        return self.vnc_port if proto == "vnc" else self.port
+    def port_for(self, proto) -> int:
+        """Per-connection port for a protocol, else the protocol's default.
+
+        RDP keeps using the .rdp file's own `server port`; anything else is
+        stored as rcm-port-<id>, so a new protocol needs no code change.
+        """
+        pid = proto if isinstance(proto, str) else proto.id
+        if pid == "rdp":
+            return self.port
+        raw = self.extra.get(f"rcm-port-{pid}")
+        if raw:
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+        if not isinstance(proto, str):
+            return proto.port or self.port
+        try:
+            return protocol(pid).port or self.port
+        except ConfigError:
+            return self.port
 
 
 def parse_rdp(path: Path) -> dict:
@@ -281,7 +284,7 @@ def creds_scopes() -> list[str]:
     extra = {k for k in _creds_table() if k not in base}
     extra |= {c.sel for c in conns_cached() if secret_get(c.sel)}
     for scope in list(base):
-        for proto in PROTOCOLS:
+        for proto in protocol_ids():
             if secret_get(f"{scope}@{proto}"):
                 extra.add(f"{scope}@{proto}")
     return base + sorted(extra)
@@ -368,7 +371,7 @@ def creds_migrate() -> tuple[int, int]:
 # --------------------------------------------------------------------------- #
 def write_rdp(group: str, name: str, host: str, username: str,
               port: int = 3389, overwrite: bool = False,
-              vnc_port: int = DEFAULT_VNC_PORT,
+              ports: dict | None = None,
               protocols: str = "") -> Path:
     if not TEMPLATE.is_file():
         raise SystemExit(f"missing template: {TEMPLATE}")
@@ -381,7 +384,9 @@ def write_rdp(group: str, name: str, host: str, username: str,
     body = body.replace("{{HOST}}", host).replace("{{USERNAME}}", username)
     body = re.sub(r"^server port:i:.*$", f"server port:i:{port}", body, flags=re.M)
     # rcm-* keys are our own extensions. RDP clients ignore keys they don't know.
-    body = body.rstrip("\n") + f"\nrcm-vnc-port:i:{vnc_port}\n"
+    body = body.rstrip("\n") + "\n"
+    for pid, val in (ports or {}).items():
+        body += f"rcm-port-{pid}:i:{val}\n"
     if protocols:
         body += f"rcm-protocols:s:{protocols}\n"
     dest.write_text(body)
@@ -401,7 +406,7 @@ def copy_conn(c: Conn, new_name: str) -> Path:
 
 
 def set_fields(c: Conn, host: str | None = None, username: str | None = None,
-               port: int | None = None, vnc_port: int | None = None,
+               port: int | None = None, ports: dict | None = None,
                protocols: str | None = None) -> None:
     """Rewrite the per-host fields in place, leaving every other setting alone."""
     lines = c.path.read_text().splitlines()
@@ -420,8 +425,8 @@ def set_fields(c: Conn, host: str | None = None, username: str | None = None,
         repl("username", username)
     if port is not None:
         repl("server port", str(port))
-    if vnc_port is not None:
-        repl("rcm-vnc-port", str(vnc_port))
+    for pid, val in (ports or {}).items():
+        repl(f"rcm-port-{pid}", str(val))
     if protocols is not None:
         repl("rcm-protocols", protocols)
     c.path.write_text("\n".join(lines) + "\n")
@@ -438,85 +443,233 @@ def _spawn(argv: list[str], env: dict | None = None) -> None:
                      stderr=subprocess.DEVNULL, start_new_session=True)
 
 
-def load_launchers() -> dict[str, dict]:
-    """{proto: {"default": name, "items": {name: cmdline}}} from launchers.conf."""
-    cp = configparser.ConfigParser()
-    cp.optionxform = str  # keep launcher names case-sensitive
-    if LAUNCHERS.is_file():
-        cp.read(LAUNCHERS)
-    out: dict[str, dict] = {}
-    for proto in ("rdp", "vnc"):
-        items, dflt = {}, ""
-        if cp.has_section(proto):
-            for k, v in cp.items(proto):
-                if k == "default":
-                    dflt = v.strip()
-                elif v.strip():
-                    items[k] = v.strip()
-        if not dflt or dflt not in items:
-            dflt = next(iter(items), "")
-        out[proto] = {"default": dflt, "items": items}
-    # Radmin's command line is fixed -- it needs its own Wine prefix and the
-    # xdotool credential dance, so it is not user-configurable.
-    out["radmin"] = {"default": "Radmin Viewer", "items": {"Radmin Viewer": ""}}
-    return out
-
-
 class ConfigError(RuntimeError):
     """Configuration is missing or wrong. Always names the file and the key."""
+
+
+@dataclass
+class Protocol:
+    """One way of reaching a machine, defined entirely in protocols.conf.
+
+    Nothing about any particular protocol is special-cased in code: RDP, VNC and
+    Radmin are just three sections. Radmin's Wine wrapper is an `exe` plus an
+    `env.` entry; its credential dialog is an `inject.steps` sequence.
+    """
+    id: str
+    label: str = ""
+    color: str = "accent"
+    order: int = 100
+    port: int = 0
+    exe: str = ""
+    env: dict = field(default_factory=dict)
+    launchers: dict = field(default_factory=dict)
+    default: str = ""
+    detect_process: str = ""
+    detect_window: str = "{host}"
+    inject_class: str = ""
+    inject_title: str = ""
+    inject_wait: float = 20.0
+    inject_settle: float = 0.3
+    inject_delay: int = 40
+    inject_steps: list = field(default_factory=list)
+    extras: dict = field(default_factory=dict)
+
+    @property
+    def injects(self) -> bool:
+        return bool(self.inject_steps)
+
+
+def parse_steps(raw: str) -> list[tuple[str, str]]:
+    """'type:{user} | key:Tab' -> [('type','{user}'), ('key','Tab')]."""
+    steps = []
+    for chunk in raw.split("|"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        op, _, arg = chunk.partition(":")
+        op = op.strip().lower()
+        if op not in ("type", "key", "sleep", "activate", "clear"):
+            raise ConfigError(f"{PROTOCOLS_FILE}: unknown inject step {op!r} "
+                              "(use type, key, sleep, activate or clear)")
+        steps.append((op, arg.strip()))
+    return steps
+
+
+def load_protocols() -> dict[str, Protocol]:
+    """Every [protocol:*] section, ordered by `order`."""
+    if not PROTOCOLS_FILE.is_file():
+        raise ConfigError(f"no {PROTOCOLS_FILE} -- run `rcm init`, "
+                          "or open the manager once")
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    cp.read(PROTOCOLS_FILE)
+
+    out: dict[str, Protocol] = {}
+    for section in cp.sections():
+        if not section.startswith("protocol:"):
+            continue
+        pid = section.split(":", 1)[1].strip()
+        if not pid:
+            raise ConfigError(f"{PROTOCOLS_FILE}: a [protocol:] section has no id")
+        raw = {k: v.strip() for k, v in cp.items(section)}
+        p = Protocol(id=pid, label=raw.get("label", pid.upper()))
+
+        def num(key, cast, default):
+            v = raw.get(key, "")
+            if v == "":
+                return default
+            try:
+                return cast(v)
+            except ValueError:
+                raise ConfigError(f"{PROTOCOLS_FILE} [{section}] {key}={v!r} "
+                                  f"is not a valid {cast.__name__}") from None
+
+        p.color = raw.get("color", "accent")
+        p.order = num("order", int, 100)
+        p.port = num("port", int, 0)
+        p.exe = _expand(raw.get("exe", ""))
+        p.default = raw.get("default", "")
+        p.detect_process = raw.get("detect.process", "")
+        p.detect_window = raw.get("detect.window", "{host}")
+        p.inject_class = raw.get("inject.window_class", "")
+        p.inject_title = raw.get("inject.window_title", "")
+        p.inject_wait = num("inject.wait", float, 20.0)
+        p.inject_settle = num("inject.settle", float, 0.3)
+        p.inject_delay = num("inject.delay", int, 40)
+        if raw.get("inject.steps"):
+            p.inject_steps = parse_steps(raw["inject.steps"])
+        for k, v in raw.items():
+            if k.startswith("launcher."):
+                p.launchers[k[len("launcher."):]] = v
+            elif k.startswith("env."):
+                p.env[k[len("env."):]] = _expand(v)
+            elif k not in ("label", "color", "order", "port", "exe", "default") \
+                    and not k.startswith(("detect.", "inject.")):
+                p.extras[k] = _expand(v)
+        if p.default and p.default not in p.launchers:
+            raise ConfigError(f"{PROTOCOLS_FILE} [{section}] default={p.default!r} "
+                              "is not one of its launchers")
+        if not p.default and p.launchers:
+            p.default = next(iter(p.launchers))
+        out[pid] = p
+
+    if not out:
+        raise ConfigError(f"{PROTOCOLS_FILE} defines no [protocol:*] sections")
+    return dict(sorted(out.items(), key=lambda kv: (kv[1].order, kv[1].label)))
+
+
+def protocol(pid: str) -> Protocol:
+    protos = load_protocols()
+    if pid not in protos:
+        raise ConfigError(f"unknown protocol {pid!r} -- {PROTOCOLS_FILE} defines: "
+                          + ", ".join(protos))
+    return protos[pid]
+
+
+def protocol_ids() -> tuple[str, ...]:
+    try:
+        return tuple(load_protocols())
+    except ConfigError:
+        return ()
 
 
 # First-run defaults. These are written to disk as real, commented, hand-editable
 # files -- they are never used as invisible in-code fallbacks. That is what makes
 # "fail loudly on bad config" livable: a fresh clone gets files it can see.
 DEFAULT_CONFIGS: dict[str, str] = {
-    "launchers.conf": """\
-# Connection programs, per protocol.
+    "protocols.conf": r"""# Protocols.
 #
-# Each section is a protocol. Every other key is a launcher name mapped to its
-# command line. "default" names the launcher the toolbar buttons use; right-click
-# a connection in the manager to pick any of the others.
+# Each [protocol:<id>] section defines one way of reaching a machine: what its
+# button looks like, which programs can open it, how a live session is
+# recognised, and -- optionally -- how credentials get typed into a prompt.
+# Add as many as you like; nothing here is special-cased in the code.
 #
-# Placeholders, substituted per token (so paths with spaces stay one argument):
-#   {file}  full path to the .rdp file
-#   {host}  hostname or IP
-#   {user}  username
-#   {port}  protocol port (RDP: "server port", VNC: rcm-vnc-port, default 5900)
-#   {name}  connection name
+# Keys
+#   label            button text and display name
+#   color            button colour (#rrggbb), or "accent" for the theme accent
+#   order            sort order for buttons and menus (low first)
+#   port             default port; a connection can override it
+#   exe              optional path, available to commands as {exe}
+#   env.NAME         environment variable set when launching
+#   default          which launcher the button uses
+#   launcher.<Name>  a command line; several per protocol is normal
+#   detect.process   regex matched against process command lines to spot a session
+#   detect.window    window-title pattern used to find that session's window
+#
+# Credential typing (optional; omit the whole block if the client handles auth)
+#   inject.window_class  X11 class of the credential dialog
+#   inject.window_title  substring of its title
+#   inject.wait          seconds to wait for it to appear
+#   inject.settle        pause after focusing it, before typing
+#   inject.delay         milliseconds between keystrokes
+#   inject.steps         what to do, in order, separated by |
+#                          type:<text>   key:<keysym>   sleep:<seconds>
+#                          activate      clear
+#
+# Placeholders in commands and steps:
+#   {host} {port} {user} {password} {name} {file} {exe}
+# {file} is the connection's .rdp path. {password} is read from the keyring at
+# the moment it is typed and never written to disk.
 
-[rdp]
+[protocol:rdp]
+label = RDP
+color = accent
+order = 10
+port = 3389
 default = Thincast
-Thincast = flatpak run com.thincast.client {file}
-xfreerdp = xfreerdp3 /v:{host}:{port} /u:{user} +clipboard +fonts /dynamic-resolution /cert:ignore
-Remmina = remmina -c {file}
-mstsc = mstsc {file}
+launcher.Thincast = flatpak run com.thincast.client {file}
+launcher.xfreerdp = xfreerdp3 /v:{host}:{port} /u:{user} +clipboard +fonts /dynamic-resolution /cert:ignore
+launcher.Remmina = remmina -c {file}
+launcher.mstsc = mstsc {file}
+detect.process = (^|/)(rdc|xfreerdp3?|freerdp|mstsc(\.exe)?)\b
+detect.window = {host}
 
-[vnc]
+[protocol:vnc]
+label = VNC
+color = #2b6cb0
+order = 20
+port = 5900
 default = Remmina
-Remmina = remmina -c vnc://{host}:{port}
-TigerVNC = vncviewer {host}::{port}
+launcher.Remmina = remmina -c vnc://{host}:{port}
+launcher.TigerVNC = vncviewer {host}::{port}
+detect.process = vnc://|(^|/)(vncviewer|xtigervncviewer)\b
+detect.window = {host}
 
-# Radmin Viewer. Nothing here is guessed by the code -- if a value is missing or
-# points at something that does not exist, rcm says so instead of falling back.
-# Run `rcm radmin detect --write` to fill in `exe` automatically.
-[radmin]
-exe =
-# Wine binary. Leave EMPTY when Radmin runs natively (Windows, or a native build).
-wine =
-wineprefix =
+[protocol:radmin]
+label = Radmin
+color = #d97a1f
+order = 30
 port = 4899
-# Only `rcm phonebook` needs this; it uses the file as a structural template.
+exe =
+env.WINEPREFIX =
+default = Native
+launcher.Wine = wine-stable {exe} /connect:{host}:{port}
+launcher.Native = {exe} /connect:{host}:{port}
+detect.process = Radmin(\.exe)? .*/connect:
+detect.window = {host}
+# Radmin has no /password: switch by design, so the password must be typed.
+inject.window_class = [Rr]admin
+inject.window_title = security
+inject.wait = 20
+inject.settle = 0.3
+inject.delay = 40
+inject.steps = type:{user} | key:Tab | type:{password} | key:Return
+# Only `rcm phonebook` reads this; it uses the file as a structural template.
 phonebook =
 
-# Credential-dialog handling. Raise the delays if characters go missing.
-dialog_wait = 20
-settle = 0.3
-type_delay = 40
-window_class = [Rr]admin
-title_match = security
-#   user-tab-pass : username field focused on open -> user, Tab, pass, Enter
-#   pass-only     : password field focused, username prefilled -> pass, Enter
-inject_order = user-tab-pass
+# Example of adding your own. AnyDesk prompts for a password in its own window;
+# adjust inject.window_title to whatever your version actually shows.
+#
+# [protocol:anydesk]
+# label = AnyDesk
+# color = #ef443b
+# order = 40
+# default = AnyDesk
+# launcher.AnyDesk = anydesk {host}
+# detect.process = (^|/)anydesk\b
+# inject.window_title = Password
+# inject.wait = 20
+# inject.steps = type:{password} | key:Return
 """,
     "creds.conf": """\
 # Credentials for rcm. Passwords are NOT stored here -- they live in the OS
@@ -584,77 +737,13 @@ def _expand(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value.strip()))
 
 
-def radmin_config(require_exe: bool = True) -> dict:
-    """The [radmin] section of launchers.conf, expanded and validated.
-
-    Deliberately has no built-in defaults: if the section is absent or a value is
-    wrong, say so and name the file, rather than quietly using a path that only
-    happens to exist on one machine.
-    """
-    if not LAUNCHERS.is_file():
-        raise ConfigError(f"no {LAUNCHERS} -- run `rcm radmin detect`, "
-                          "or start the manager once to write a default")
-    cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
-    cp.optionxform = str
-    cp.read(LAUNCHERS)
-    if not cp.has_section("radmin"):
-        raise ConfigError(f"{LAUNCHERS} has no [radmin] section -- "
-                          "run `rcm radmin detect` to create one")
-
-    raw = {k: v.strip() for k, v in cp.items("radmin")}
-    missing = [k for k in RADMIN_KEYS if k not in raw and k not in ("phonebook",)]
-    if missing:
-        raise ConfigError(f"{LAUNCHERS} [radmin] is missing: {', '.join(missing)}")
-
-    def num(key, cast):
-        try:
-            return cast(raw[key])
-        except (KeyError, ValueError):
-            raise ConfigError(f"{LAUNCHERS} [radmin] {key}={raw.get(key)!r} "
-                              f"is not a valid {cast.__name__}") from None
-
-    cfg = {
-        "exe": Path(_expand(raw["exe"])),
-        "wine": raw["wine"],                      # empty = run the exe directly
-        "wineprefix": _expand(raw["wineprefix"]),
-        "port": num("port", int),
-        "phonebook": Path(_expand(raw["phonebook"])) if raw.get("phonebook") else None,
-        "dialog_wait": num("dialog_wait", float),
-        "settle": num("settle", float),
-        "type_delay": num("type_delay", int),
-        "window_class": raw["window_class"],
-        "title_match": raw["title_match"],
-        "inject_order": raw["inject_order"],
-    }
-    if cfg["inject_order"] not in ("user-tab-pass", "pass-only"):
-        raise ConfigError(f"{LAUNCHERS} [radmin] inject_order="
-                          f"{cfg['inject_order']!r} must be user-tab-pass or pass-only")
-    if not raw["exe"]:
-        raise ConfigError(f"{LAUNCHERS} [radmin] exe is not set -- "
-                          "run `rcm radmin detect --write`")
-    if require_exe and not cfg["exe"].is_file():
-        raise ConfigError(f"{LAUNCHERS} [radmin] exe does not exist: {cfg['exe']}\n"
-                          "  run `rcm radmin detect` to find an install")
-    if require_exe and cfg["wine"] and not shutil.which(cfg["wine"]):
-        raise ConfigError(f"{LAUNCHERS} [radmin] wine={cfg['wine']!r} is not installed "
-                          "(leave it empty for a native install)")
-    return cfg
-
-
-def radmin_argv(cfg: dict, host: str) -> tuple[list[str], dict]:
-    """(argv, env) to connect Radmin to a host, with or without Wine."""
-    target = [str(cfg["exe"]), f"/connect:{host}:{cfg['port']}"]
-    if cfg["wine"]:
-        return [cfg["wine"], *target], {"WINEPREFIX": cfg["wineprefix"]}
-    return target, {}
-
-
-def radmin_detect() -> list[Path]:
-    """Candidate Radmin.exe paths, best first.
+def protocol_detect(p: Protocol) -> list[Path]:
+    """Candidate paths for a protocol's `exe`, best first.
 
     Ranked, not first-hit: a machine can easily have a real install, an abandoned
     Wine prefix with no exe, and a couple of portable copies in Downloads.
     """
+    stem = Path(p.exe).name if p.exe else f"{p.id}.exe"
     home = Path.home()
     roots = [home / ".local/share/wineprefixes", home, home / "WindowsApps",
              home / "Downloads", Path("/opt")]
@@ -666,78 +755,215 @@ def radmin_detect() -> list[Path]:
         if not root.is_dir():
             continue
         try:
-            for p in root.glob("**/Radmin.exe"):
-                rp = p.resolve()
+            for hit in root.glob(f"**/{stem}"):
+                rp = hit.resolve()
                 if rp not in seen and rp.is_file():
                     seen.add(rp)
                     found.append(rp)
         except (OSError, PermissionError):
             continue
 
-    def rank(p: Path) -> tuple:
-        s = str(p)
-        return (
-            0 if "wineprefixes" in s or "Program Files" in s else 1,  # installed first
-            0 if "Downloads" not in s else 1,                          # not a download
-            -p.stat().st_size,
-            s,
-        )
+    def rank(f: Path) -> tuple:
+        s = str(f)
+        return (0 if "wineprefixes" in s or "Program Files" in s else 1,
+                0 if "Downloads" not in s else 1, -f.stat().st_size, s)
     return sorted(found, key=rank)
 
 
-def save_launchers(reg: dict, radmin: dict) -> None:
-    """Rewrite launchers.conf from the GUI.
+def save_protocols(protos: dict[str, Protocol]) -> None:
+    """Rewrite protocols.conf.
 
-    Regenerates the documentation comments rather than round-tripping arbitrary
-    ones -- configparser cannot preserve comments, and a silently de-commented
-    config is worse than a re-commented one. Hand edits to *values* survive,
-    because the GUI reads the file before it writes it.
+    Regenerates the documentation header rather than round-tripping arbitrary
+    comments -- configparser cannot preserve them, and a silently de-commented
+    config is worse than a re-commented one.
     """
-    head, _, _ = DEFAULT_CONFIGS["launchers.conf"].partition("\n[rdp]")
+    head, _, _ = DEFAULT_CONFIGS["protocols.conf"].partition("\n[protocol:")
     L = [head.rstrip("\n"), ""]
-    for proto in ("rdp", "vnc"):
-        d = reg.get(proto, {})
-        L.append(f"[{proto}]")
-        if d.get("default"):
-            L.append(f"default = {d['default']}")
-        for name, cmd in d.get("items", {}).items():
-            L.append(f"{name} = {cmd}")
+    for p in protos.values():
+        L.append(f"[protocol:{p.id}]")
+        L.append(f"label = {p.label}")
+        L.append(f"color = {p.color}")
+        L.append(f"order = {p.order}")
+        if p.port:
+            L.append(f"port = {p.port}")
+        if p.exe:
+            L.append(f"exe = {p.exe}")
+        for k, v in p.env.items():
+            L.append(f"env.{k} = {v}")
+        if p.default:
+            L.append(f"default = {p.default}")
+        for name, cmd in p.launchers.items():
+            L.append(f"launcher.{name} = {cmd}")
+        if p.detect_process:
+            L.append(f"detect.process = {p.detect_process}")
+        if p.detect_window:
+            L.append(f"detect.window = {p.detect_window}")
+        if p.inject_steps:
+            if p.inject_class:
+                L.append(f"inject.window_class = {p.inject_class}")
+            if p.inject_title:
+                L.append(f"inject.window_title = {p.inject_title}")
+            L.append(f"inject.wait = {p.inject_wait}")
+            L.append(f"inject.settle = {p.inject_settle}")
+            L.append(f"inject.delay = {p.inject_delay}")
+            L.append("inject.steps = " + " | ".join(
+                op if not arg else f"{op}:{arg}" for op, arg in p.inject_steps))
+        for k, v in p.extras.items():
+            L.append(f"{k} = {v}")
         L.append("")
-    L += ["# Radmin Viewer. `rcm radmin detect --write` fills in `exe` for you.",
-          "# Leave `wine` empty when Radmin runs natively (Windows).",
-          "[radmin]"]
-    for key in RADMIN_KEYS:
-        val = radmin.get(key, "")
-        L.append(f"{key} = {'' if val is None else val}")
-    LAUNCHERS.write_text("\n".join(L) + "\n")
+    PROTOCOLS_FILE.write_text("\n".join(L) + "\n")
+
+
+def migrate_launchers() -> bool:
+    """Turn a pre-protocols launchers.conf into protocols.conf. One-way."""
+    if PROTOCOLS_FILE.is_file() or not LEGACY_LAUNCHERS.is_file():
+        return False
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    cp.read(LEGACY_LAUNCHERS)
+    write_default_configs(["protocols.conf"])
+    protos = load_protocols()
+    for pid in ("rdp", "vnc"):
+        if cp.has_section(pid):
+            items = {k: v.strip() for k, v in cp.items(pid) if k != "default" and v.strip()}
+            if items:
+                protos[pid].launchers = items
+            dflt = cp.get(pid, "default", fallback="").strip()
+            if dflt in protos[pid].launchers:
+                protos[pid].default = dflt
+    if cp.has_section("radmin") and "radmin" in protos:
+        r, p = dict(cp.items("radmin")), protos["radmin"]
+        if r.get("exe"):
+            p.exe = _expand(r["exe"])
+        if r.get("wineprefix"):
+            p.env["WINEPREFIX"] = _expand(r["wineprefix"])
+        p.default = "Native" if not r.get("wine", "").strip() else "Wine"
+        if r.get("wine", "").strip():
+            p.launchers["Wine"] = f"{r['wine'].strip()} {{exe}} /connect:{{host}}:{{port}}"
+        if r.get("phonebook"):
+            p.extras["phonebook"] = _expand(r["phonebook"])
+        for src, dst in (("port", "port"), ("dialog_wait", "inject_wait"),
+                         ("settle", "inject_settle"), ("type_delay", "inject_delay")):
+            if r.get(src):
+                try:
+                    setattr(p, dst, type(getattr(p, dst))(r[src]))
+                except ValueError:
+                    pass
+        if r.get("window_class"):
+            p.inject_class = r["window_class"]
+        if r.get("title_match"):
+            p.inject_title = r["title_match"]
+        if r.get("inject_order") == "pass-only":
+            p.inject_steps = parse_steps("type:{password} | key:Return")
+    save_protocols(protos)
+    LEGACY_LAUNCHERS.rename(LEGACY_LAUNCHERS.with_suffix(".conf.migrated"))
+    return True
 
 
 def launcher_names(proto: str) -> list[str]:
-    return list(load_launchers().get(proto, {}).get("items", {}))
+    try:
+        return list(protocol(proto).launchers)
+    except ConfigError:
+        return []
+
+
+def _subst(c: Conn, p: Protocol, password: str = "") -> dict[str, str]:
+    return {"file": str(c.path), "host": c.host, "user": c.username,
+            "port": str(c.port_for(p)), "name": c.name, "exe": p.exe,
+            "password": password}
 
 
 def build_argv(c: Conn, proto: str, launcher: str = "") -> list[str]:
-    reg = load_launchers().get(proto, {})
-    name = launcher or reg.get("default", "")
-    tmpl = reg.get("items", {}).get(name, "")
+    p = protocol(proto)
+    name = launcher or p.default
+    tmpl = p.launchers.get(name, "")
     if not tmpl:
-        raise RuntimeError(f"no launcher configured for {proto}"
+        raise RuntimeError(f"{PROTOCOLS_FILE}: protocol {proto!r} has no launcher"
                            + (f" named {name!r}" if name else ""))
-    vals = {"file": str(c.path), "host": c.host, "user": c.username,
-            "port": str(c.port_for(proto)), "name": c.name}
+    vals = _subst(c, p)
     # Substitute per token so a path with spaces stays a single argument.
     return [tok.format(**vals) for tok in shlex.split(tmpl)]
 
 
-def launch(c: Conn, proto: str = "rdp", launcher: str = "") -> str:
-    if proto == "radmin":
-        return launch_radmin(c)
-    argv = build_argv(c, proto, launcher)
-    if not shutil.which(argv[0]):
-        raise RuntimeError(f"{argv[0]} is not installed (launcher "
-                           f"{launcher or load_launchers()[proto]['default']!r})")
-    _spawn(argv)
-    return f"{proto.upper()} -> {c.sel} ({c.host}) via {argv[0]}"
+def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
+    p = protocol(proto or next(iter(load_protocols())))
+    argv = build_argv(c, p.id, launcher)
+    if not shutil.which(argv[0]) and not Path(argv[0]).is_file():
+        raise RuntimeError(f"{argv[0]} is not installed "
+                           f"(launcher {launcher or p.default!r} for {p.label})")
+    if p.injects:
+        return inject_credentials(c, p, argv)
+    _spawn(argv, env=p.env or None)
+    return f"{p.label} -> {c.sel} ({c.host}) via {Path(argv[0]).name}"
+
+
+def inject_credentials(c: Conn, p: Protocol, argv: list[str]) -> str:
+    """Launch, wait for the credential prompt, then perform inject.steps.
+
+    Generic on purpose: any client that insists on typing (Radmin has no
+    /password: switch by design, and others are the same) is handled by a step
+    list in protocols.conf rather than bespoke code.
+    """
+    # xdotool cannot inject under Wayland; without this it fails silently.
+    if os.environ.get("XDG_SESSION_TYPE", "x11") != "x11":
+        raise RuntimeError(
+            f"session is {os.environ.get('XDG_SESSION_TYPE')}, not X11 -- "
+            "credential typing will not work (ydotool is the fallback)")
+
+    user, pw = creds_lookup(c.sel, c.username, proto=p.id)
+    win, _ = open_prompt(p, c.host, argv)
+    if not pw or pw == "CHANGEME":
+        return f"prompt open on {c.host}; no password set -- type it manually"
+
+    vals = _subst(c, p, password=pw)
+    vals["user"] = user
+    # xdotool type --window uses XSendEvent, which Wine ignores outright.
+    # Always activate first, then type to the focused window via XTEST.
+    x("windowactivate", "--sync", win)
+    time.sleep(p.inject_settle)
+    for op, arg in p.inject_steps:
+        if op == "type":
+            x("type", "--delay", str(p.inject_delay), "--", arg.format(**vals))
+        elif op == "key":
+            x("key", arg)
+        elif op == "sleep":
+            time.sleep(float(arg or 0))
+        elif op == "activate":
+            x("windowactivate", "--sync", win)
+        elif op == "clear":
+            x("key", "ctrl+a")
+            x("key", "Delete")
+    return f"{p.label} -> {c.sel} ({c.host}) as {user}"
+
+
+def open_prompt(p: Protocol, host: str, argv: list[str]) -> tuple[str, list[str]]:
+    """Launch and wait for the credential window. (chosen window, all new)."""
+    before = _windows_of(p)
+    _spawn(argv, env=p.env or None)
+    deadline = time.time() + p.inject_wait
+    new: list[str] = []
+    while time.time() < deadline:
+        new = sorted(_windows_of(p) - before)
+        if new:
+            break
+        time.sleep(0.25)
+    if not new:
+        raise RuntimeError(f"no {p.label} window appeared within {p.inject_wait:.0f}s")
+    # Prefer the prompt by title, falling back to the newest window if the
+    # wording ever changes.
+    for w in new:
+        nm = x("getwindowname", w)
+        if p.inject_title.lower() in nm.lower() and host in nm:
+            return w, new
+    return new[-1], new
+
+
+def _windows_of(p: Protocol) -> set[str]:
+    if p.inject_class:
+        out = x("search", "--onlyvisible", "--class", p.inject_class)
+    else:
+        out = x("search", "--onlyvisible", "--name", p.inject_title or p.label)
+    return {w for w in out.splitlines() if w.strip()}
 
 
 def launch_rdp(c: Conn) -> None:
@@ -791,82 +1017,6 @@ def capture_window(win: str, dest: Path) -> Path | None:
         full.unlink(missing_ok=True)
 
 
-def _radmin_windows(wclass: str) -> set[str]:
-    out = x("search", "--onlyvisible", "--class", wclass)
-    return {w for w in out.splitlines() if w.strip()}
-
-
-def launch_radmin(c: Conn, inject: bool = True) -> str:
-    """Connect via Radmin, injecting credentials into the auth dialog.
-
-    Returns a status string. Raises RuntimeError on a hard failure.
-    """
-    cfg = radmin_config()
-    # xdotool cannot inject under Wayland; without this it fails silently.
-    if os.environ.get("XDG_SESSION_TYPE", "x11") != "x11":
-        raise RuntimeError(
-            f"session is {os.environ.get('XDG_SESSION_TYPE')}, not X11 -- "
-            "injection will not work (ydotool is the fallback)")
-
-    user, pw = creds_lookup(c.sel, c.username, proto="radmin")
-    win = _open_radmin_dialog(cfg, c.host)[0]
-
-    if not inject:
-        return "launched (no injection requested)"
-    if not pw or pw == "CHANGEME":
-        return f"dialog open on {c.host}; no password set -- type it manually"
-
-    # xdotool type --window uses XSendEvent, which Wine ignores outright.
-    # Always activate first, then type to the focused window via XTEST.
-    x("windowactivate", "--sync", win)
-    time.sleep(cfg["settle"])
-    delay = str(cfg["type_delay"])
-    if cfg["inject_order"] == "user-tab-pass":
-        x("type", "--delay", delay, "--", user)
-        x("key", "Tab")
-    x("type", "--delay", delay, "--", pw)
-    x("key", "Return")
-    return f"connected {c.sel} ({c.host}) as {user}"
-
-
-def _open_radmin_dialog(cfg: dict, host: str) -> tuple[str, list[str]]:
-    """Launch Radmin at a host and wait for its auth dialog. (window, all new)."""
-    before = _radmin_windows(cfg["window_class"])
-    argv, env = radmin_argv(cfg, host)
-    _spawn(argv, env=env)
-
-    deadline = time.time() + cfg["dialog_wait"]
-    new: list[str] = []
-    while time.time() < deadline:
-        new = sorted(_radmin_windows(cfg["window_class"]) - before)
-        if new:
-            break
-        time.sleep(0.25)
-    if not new:
-        raise RuntimeError(
-            f"no Radmin window appeared within {cfg['dialog_wait']:.0f}s")
-
-    # Prefer the auth dialog by title -- "Radmin security: <host>" -- and fall
-    # back to the newest window if the wording ever changes.
-    for w in new:
-        nm = x("getwindowname", w)
-        if cfg["title_match"].lower() in nm.lower() and host in nm:
-            return w, new
-    return new[-1], new
-
-
-# --------------------------------------------------------------------------- #
-# active sessions
-# --------------------------------------------------------------------------- #
-@dataclass
-class Session:
-    proto: str      # "RDP" | "Radmin"
-    label: str
-    host: str
-    pid: int
-    window: str = ""
-
-
 def _ps() -> list[tuple[int, str]]:
     out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
                          text=True).stdout
@@ -883,24 +1033,35 @@ def _ps() -> list[tuple[int, str]]:
     return rows
 
 
-def _classify(args: str) -> str | None:
-    """Which protocol a command line represents, or None if it isn't a session."""
+def launcher_exe(p: Protocol, tmpl: str) -> str:
+    """The program a launcher command runs, for the 'is it installed' check.
+
+    {exe} is substituted whole rather than through shlex: a Windows-style path
+    under Wine ("Program Files/Radmin Viewer 3") contains spaces and would
+    otherwise be split into fragments that exist nowhere.
+    """
+    tmpl = tmpl.strip()
+    if tmpl.startswith("{exe}"):
+        return p.exe
+    try:
+        return shlex.split(tmpl)[0]
+    except (ValueError, IndexError):
+        return ""
+
+
+def _classify(args: str, protos: dict[str, Protocol] | None = None) -> Protocol | None:
+    """Which protocol a command line represents, from each detect.process regex."""
     # A shell invoked with -c carries its whole script in argv, so a command that
     # merely mentions a host or a .rdp path would otherwise register as a session.
     if re.match(r"^\S*(ba|z|k)?sh\s+-c\b", args):
         return None
-    if "Radmin.exe" in args and "/connect:" in args:
-        return "Radmin"
-    if re.search(r"vnc://", args) or re.search(r"(^|/)(vncviewer|xtigervncviewer)\b", args):
-        return "VNC"
-    # Thincast execs into "rdc <path>.rdp" inside its flatpak sandbox; bwrap is the
-    # sandbox wrapper around the same argv, so counting it would double every row.
-    if re.search(r"(^|/)rdc\s", args) and ".rdp" in args and "bwrap" not in args:
-        return "RDP"
-    if re.search(r"(^|/)(xfreerdp3?|freerdp)\b", args):
-        return "RDP"
-    if re.search(r"(^|/)remmina\b", args) and "-c" in args:
-        return "VNC" if "vnc" in args.lower() else "RDP"
+    # Thincast execs into "rdc <path>.rdp" inside its flatpak sandbox; bwrap is
+    # the sandbox wrapper around the same argv, so counting it would double rows.
+    if "bwrap" in args:
+        return None
+    for p in (protos or load_protocols()).values():
+        if p.detect_process and re.search(p.detect_process, args):
+            return p
     return None
 
 
@@ -910,13 +1071,18 @@ def sessions() -> list[Session]:
     by_path = {str(c.path): c for c in conns_cached()}
     seen: set[tuple[str, str, str]] = set()
 
+    try:
+        protos = load_protocols()
+    except ConfigError:
+        return out
     mine = {os.getpid(), os.getppid()}
     for pid, args in _ps():
         if pid in mine:
             continue
-        proto = _classify(args)
-        if not proto:
+        p = _classify(args, protos)
+        if not p:
             continue
+        proto = p.label
 
         # Match the full .rdp path as a substring. A regex like (\S+\.rdp) breaks
         # the moment a connection is named "Line 1.rdp" -- it captures "1.rdp".
@@ -941,12 +1107,8 @@ def sessions() -> list[Session]:
 
         win = ""
         if host:
-            for w in x("search", "--name", host).splitlines():
-                if w.strip():
-                    win = w.strip()
-                    break
-        if not win and host:
-            for w in x("search", "--name", f"on {host}").splitlines():
+            pattern = (p.detect_window or "{host}").format(host=host, name=label)
+            for w in x("search", "--name", pattern).splitlines():
                 if w.strip():
                     win = w.strip()
                     break
@@ -1083,10 +1245,15 @@ def _pb_patch(rec: bytearray, off: int, value: str, marker: str = "") -> None:
 
 def export_phonebook(dest: Path, conns: list[Conn] | None = None,
                      source: Path | None = None) -> int:
-    src = source or radmin_config(require_exe=False)["phonebook"]
-    if not src:
-        raise RuntimeError(f"{LAUNCHERS} [radmin] has no phonebook path; "
-                           "the export needs one as a structural template")
+    if source is None:
+        pb = protocol("radmin").extras.get("phonebook", "")
+        if not pb:
+            raise RuntimeError(f"{PROTOCOLS_FILE} [protocol:radmin] has no "
+                               "phonebook path; the export needs one as a "
+                               "structural template")
+        src = Path(pb)
+    else:
+        src = source
     if not src.is_file():
         raise RuntimeError(f"no source phonebook to use as a template: {src}")
     if dest.resolve() == src.resolve():
@@ -1168,7 +1335,7 @@ def goto(sel: str) -> str:
         if s.label == sel and s.window:
             x("windowactivate", "--sync", s.window)
             return f"focused {sel} ({s.proto})"
-    proto = next((p for p in PROTOCOLS if p in c.protocols), "rdp")
+    proto = next(iter(c.protocols), "")
     try:
         return launch(c, proto)
     except RuntimeError as e:
@@ -1374,7 +1541,7 @@ def gen_launcher() -> int:
         L += ["", f"[Desktop Action {_slug(c.sel)}]",
               f"Name={c.sel.replace('_', ' ').replace('/', ' / ')}",
               # Absolute paths only -- Exec= does not expand ~ and fails silently.
-              f"Exec={' '.join(THINCAST)} {_dq(str(c.path))}"]
+              f"Exec={_dq(str(me))} connect {_dq(c.sel)}"]
     for g in gs:
         L += ["", f"[Desktop Action all-{_slug(g)}]", f"Name=Connect all ({g})",
               f"Exec={_dq(str(me))} connect-all {_dq(g)}"]
@@ -1398,10 +1565,10 @@ USAGE = """rcm -- remote connection manager
   rcm init                       write any missing config file from its default
   rcm list                       list connections
   rcm sessions                   show active sessions (RDP / VNC / Radmin)
-  rcm connect <sel> [--rdp|--vnc|--radmin] [--via <launcher>]
-  rcm connect-all <group> [--rdp|--vnc|--radmin] [--via <launcher>]
-  rcm launchers                  show configured connection programs
-  rcm radmin show|detect [--write]   Radmin config from launchers.conf [radmin]
+  rcm connect <sel> [--<protocol>] [--via <launcher>]
+  rcm connect-all <group> [--<protocol>] [--via <launcher>]
+  rcm protocols                  show configured protocols and their programs
+  rcm detect <protocol> [--write]    find a protocol's exe and record it
   rcm creds list|set|clear|migrate   credentials (passwords live in the keyring)
   rcm gui                        open the manager window
   rcm focus                      raise the manager (starts it if needed)
@@ -1409,7 +1576,7 @@ USAGE = """rcm -- remote connection manager
   rcm next | rcm prev            focus the next/previous active session
   rcm goto <sel>                 focus that session, or connect it if it isn't up
   rcm shortcuts list|install|remove   system-wide keys, from shortcuts.conf
-  rcm calibrate <sel>            open Radmin's auth dialog, report it, type nothing
+  rcm calibrate <sel> [proto]    open a credential prompt, report it, type nothing
   rcm import <file.csv> [--overwrite] [--dry-run]
   rcm export [file.csv]          default: export/connections.csv
   rcm phonebook [out.rpb]        experimental Radmin phonebook (never overwrites live)
@@ -1453,11 +1620,13 @@ def main(argv: list[str]) -> int:
         return 0
 
     if cmd in ("connect", "connect-all"):
-        proto = "rdp"
-        for flag, p in (("--radmin", "radmin"), ("--vnc", "vnc"), ("--rdp", "rdp")):
-            if flag in rest:
-                proto = p
-                rest = [a for a in rest if a != flag]
+        # Any configured protocol is a flag: --rdp, --vnc, --radmin, --anydesk...
+        ids = protocol_ids()
+        proto = ids[0] if ids else ""
+        for pid in ids:
+            if f"--{pid}" in rest:
+                proto = pid
+                rest = [a for a in rest if a != f"--{pid}"]
         via = ""
         if "--via" in rest:
             i = rest.index("--via")
@@ -1467,8 +1636,9 @@ def main(argv: list[str]) -> int:
             via = rest[i + 1]
             rest = rest[:i] + rest[i + 2:]
         if not rest:
+            flags = "|".join(f"--{i}" for i in ids) or "--<protocol>"
             print(f"usage: rcm {cmd} <{'group' if cmd=='connect-all' else 'group/name'}>"
-                  " [--rdp|--vnc|--radmin] [--via <launcher>]", file=sys.stderr)
+                  f" [{flags}] [--via <launcher>]", file=sys.stderr)
             return 2
 
         if cmd == "connect":
@@ -1496,75 +1666,54 @@ def main(argv: list[str]) -> int:
                 rc = 1
         return rc
 
-    if cmd == "launchers":
-        reg = load_launchers()
-        for proto in PROTOCOLS:
-            d = reg.get(proto, {})
-            print(f"[{proto}]  default: {d.get('default') or '(none)'}")
-            for nm, tmpl in d.get("items", {}).items():
-                mark = "*" if nm == d.get("default") else " "
-                have = "" if not tmpl else ("" if shutil.which(shlex.split(tmpl)[0])
-                                            else "   (not installed)")
-                print(f"  {mark} {nm:14} {tmpl}{have}")
+    if cmd in ("protocols", "launchers"):
+        try:
+            protos = load_protocols()
+        except ConfigError as e:
+            print(f"rcm: {e}", file=sys.stderr)
+            return 1
+        for p in protos.values():
+            bits = [f"port {p.port}" if p.port else "", f"colour {p.color}",
+                    "types credentials" if p.injects else ""]
+            print(f"[{p.id}] {p.label}  ({', '.join(b for b in bits if b)})")
+            if p.exe:
+                mark = "" if Path(p.exe).is_file() else "   <-- does not exist"
+                print(f"    exe {p.exe}{mark}")
+            for nm, tmpl in p.launchers.items():
+                star = "*" if nm == p.default else " "
+                exe0 = launcher_exe(p, tmpl)
+                have = "" if (exe0 and (shutil.which(exe0) or Path(exe0).is_file())) \
+                    else "   (not installed)"
+                print(f"  {star} {nm:12} {tmpl}{have}")
         return 0
 
-    if cmd == "radmin":
-        sub = rest[0] if rest else "show"
-        if sub == "show":
-            try:
-                cfg = radmin_config(require_exe=False)
-            except ConfigError as e:
-                print(f"rcm: {e}", file=sys.stderr)
-                return 1
-            for k in RADMIN_KEYS:
-                v = cfg.get(k)
-                note = ""
-                if k == "exe":
-                    note = "" if v and Path(v).is_file() else "   <-- does not exist"
-                if k == "wine" and not v:
-                    note = "   (native, no Wine)"
-                print(f"  {k:12} {v}{note}")
+    if cmd == "detect":
+        if not rest:
+            print("usage: rcm detect <protocol> [--write]", file=sys.stderr)
+            return 2
+        try:
+            p = protocol(rest[0])
+        except ConfigError as e:
+            print(f"rcm: {e}", file=sys.stderr)
+            return 1
+        found = protocol_detect(p)
+        if not found:
+            print(f"no {Path(p.exe).name if p.exe else p.id} found", file=sys.stderr)
+            return 1
+        print(f"{p.label} installs found, best first:")
+        for i, f in enumerate(found):
+            print(f"  [{i}] {f}")
+        if "--write" not in rest:
+            print(f"\nre-run with --write to put [0] into {PROTOCOLS_FILE}")
             return 0
-        if sub == "detect":
-            found = radmin_detect()
-            if not found:
-                print("no Radmin.exe found", file=sys.stderr)
-                return 1
-            print("Radmin installs found, best first:")
-            for i, p in enumerate(found):
-                print(f"  [{i}] {p}")
-            if "--write" not in rest:
-                print(f"\nre-run with --write to put [0] into {LAUNCHERS}")
-                return 0
-            best = found[0]
-            cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
-            cp.optionxform = str
-            if LAUNCHERS.is_file():
-                cp.read(LAUNCHERS)
-            if not cp.has_section("radmin"):
-                cp.add_section("radmin")
-            cp.set("radmin", "exe", str(best))
-            # A Wine prefix path implies Wine; a native path implies none.
-            parts = best.parts
-            if "drive_c" in parts:
-                prefix = Path(*parts[:parts.index("drive_c")])
-                cp.set("radmin", "wine", cp.get("radmin", "wine", fallback="wine-stable"))
-                cp.set("radmin", "wineprefix", str(prefix))
-            else:
-                cp.set("radmin", "wine", "")
-            for k, v in (("port", "4899"), ("dialog_wait", "20"), ("settle", "0.3"),
-                         ("type_delay", "40"), ("window_class", "[Rr]admin"),
-                         ("title_match", "security"),
-                         ("inject_order", "user-tab-pass")):
-                if not cp.has_option("radmin", k):
-                    cp.set("radmin", k, v)
-            with LAUNCHERS.open("w") as fh:
-                cp.write(fh)
-            print(f"\nwrote exe={best} to {LAUNCHERS}")
-            print("note: comments in that file are not preserved by this write")
-            return 0
-        print(f"unknown radmin subcommand: {sub}", file=sys.stderr)
-        return 2
+        protos = load_protocols()
+        protos[p.id].exe = str(found[0])
+        parts = found[0].parts
+        if "drive_c" in parts:
+            protos[p.id].env["WINEPREFIX"] = str(Path(*parts[:parts.index("drive_c")]))
+        save_protocols(protos)
+        print(f"\nwrote exe={found[0]} to {PROTOCOLS_FILE}")
+        return 0
 
     if cmd == "creds":
         sub = rest[0] if rest else "list"
@@ -1643,34 +1792,40 @@ def main(argv: list[str]) -> int:
         print(f"{n} record(s) -> {dest}")
         print("EXPERIMENTAL. Test without touching your real phonebook:")
         try:
-            cfg = radmin_config(require_exe=False)
-            pre = f'WINEPREFIX="{cfg["wineprefix"]}" {cfg["wine"]} ' if cfg["wine"] else ""
-            print(f'  {pre}"{cfg["exe"]}" /pbpath:"{dest}"')
+            p = protocol("radmin")
+            env = " ".join(f'{k}="{v}"' for k, v in p.env.items())
+            print(f'  {env} "{p.exe}" /pbpath:"{dest}"'.strip())
         except ConfigError:
             print(f'  <radmin exe> /pbpath:"{dest}"')
         return 0
 
     if cmd == "calibrate":
-        # Kept from the standalone radmin-menu: opens the auth dialog, reports what
-        # it is, and types nothing. Use it if Radmin's dialog ever changes.
+        # Opens a protocol's credential prompt, reports exactly what it is, and
+        # types nothing. Use it when writing inject.steps for a new protocol.
         if not rest:
-            print("usage: rcm calibrate <group/name>", file=sys.stderr)
+            print("usage: rcm calibrate <group/name> [protocol]", file=sys.stderr)
             return 2
         c = find(rest[0])
         if not c:
             print(f"no such connection: {rest[0]}", file=sys.stderr)
             return 1
         try:
-            cfg = radmin_config()
-        except ConfigError as e:
+            pid = rest[1] if len(rest) > 1 else next(
+                (q.id for q in load_protocols().values() if q.injects), "")
+            if not pid:
+                print("rcm: no protocol defines inject.steps", file=sys.stderr)
+                return 1
+            p = protocol(pid)
+            argv = build_argv(c, p.id)
+        except (ConfigError, RuntimeError) as e:
             print(f"rcm: {e}", file=sys.stderr)
             return 1
-        user, pw = creds_lookup(c.sel, c.username, proto="radmin")
+        user, pw = creds_lookup(c.sel, c.username, proto=p.id)
         # Never interpolate the password: "${pw:-X}" style masking prints the value.
-        print(f"host={c.host} user={user} password: "
+        print(f"protocol={p.label} host={c.host} user={user} password: "
               f"{'set (%d chars)' % len(pw) if pw and pw != 'CHANGEME' else 'NOT SET'}")
         try:
-            _, new = _open_radmin_dialog(cfg, c.host)
+            _, new = open_prompt(p, c.host, argv)
         except RuntimeError as e:
             print(f"rcm: {e}", file=sys.stderr)
             return 1

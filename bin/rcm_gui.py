@@ -21,14 +21,42 @@ REFRESH_SECONDS = 4
 STAGGER = 2  # seconds between launches when several are selected
 
 # background-image:none is needed or the theme's gradient paints over the colour.
-CSS = b"""
-button.rcm-vnc { background-image: none; background-color: #2b6cb0;
-                 color: #ffffff; border-color: #24578f; }
-button.rcm-vnc:hover { background-image: none; background-color: #3980c6; }
-button.rcm-radmin { background-image: none; background-color: #d97a1f;
-                    color: #ffffff; border-color: #b3631a; }
-button.rcm-radmin:hover { background-image: none; background-color: #e88d38; }
+CSS_TEMPLATE = """
+button.{cls} {{ background-image: none; background-color: {bg};
+                color: #ffffff; border-color: {edge}; }}
+button.{cls}:hover {{ background-image: none; background-color: {hover}; }}
 """
+
+
+def _shift(hex_colour: str, factor: float) -> str:
+    try:
+        r, g, b = (int(hex_colour[i:i + 2], 16) for i in (1, 3, 5))
+    except (ValueError, IndexError):
+        return hex_colour
+    f = lambda v: max(0, min(255, int(v * factor)))
+    return f"#{f(r):02x}{f(g):02x}{f(b):02x}"
+
+
+def protocol_css_class(pid: str) -> str:
+    return "rcm-proto-" + re.sub(r"[^a-z0-9]+", "-", pid.lower()).strip("-")
+
+
+def build_protocol_css(protos) -> bytes:
+    """One CSS rule per protocol that defines its own colour.
+
+    Colours are config, so the stylesheet has to be generated rather than
+    written: a user adding [protocol:anydesk] gets a coloured button with no
+    code change. "accent" means fall through to the theme's suggested-action.
+    """
+    out = []
+    for pr in protos.values():
+        colour = (pr.color or "").strip()
+        if not colour or colour == "accent" or not colour.startswith("#"):
+            continue
+        out.append(CSS_TEMPLATE.format(cls=protocol_css_class(pr.id), bg=colour,
+                                       edge=_shift(colour, 0.8),
+                                       hover=_shift(colour, 1.18)))
+    return "".join(out).encode()
 
 
 def pretty_key(binding: str) -> str:
@@ -40,9 +68,9 @@ def pretty_key(binding: str) -> str:
     return "+".join([m.replace("Primary", "Ctrl") for m in mods] + [key])
 
 
-def install_css() -> None:
+def install_css(protos=None) -> None:
     prov = Gtk.CssProvider()
-    prov.load_from_data(CSS)
+    prov.load_from_data(build_protocol_css(protos or {}))
     screen = Gdk.Screen.get_default()
     if screen:
         Gtk.StyleContext.add_provider_for_screen(
@@ -51,7 +79,21 @@ def install_css() -> None:
 # TreeStore columns
 C_LABEL, C_HOST, C_USER, C_KEY, C_SEL, C_MARK, C_WEIGHT = range(7)
 
-PROTO_LABEL = {"rdp": "RDP", "vnc": "VNC", "radmin": "Radmin"}
+def protocols_safe() -> dict:
+    """The protocol registry, or {} if the config is broken.
+
+    The window must still open when protocols.conf is wrong -- otherwise the
+    only tool for fixing it is unreachable.
+    """
+    try:
+        return rcm.load_protocols()
+    except rcm.ConfigError:
+        return {}
+
+
+def proto_label(pid: str) -> str:
+    pr = protocols_safe().get(pid)
+    return pr.label if pr else pid
 
 
 class ShortcutButton(Gtk.Button):
@@ -129,7 +171,7 @@ class Win(Gtk.Window):
         menu_btn.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
         menu = Gtk.Menu()
         for label, cb in (("Credentials…", self.on_credentials),
-                          ("Launchers…", self.on_launchers),
+                          ("Protocols…", self.on_protocols),
                           ("Keyboard shortcuts…", self.on_shortcuts),
                           (None, None),
                           ("Import from CSV…", self.on_import),
@@ -201,14 +243,16 @@ class Win(Gtk.Window):
         left.pack_start(hint, False, False, 0)
 
         # Edit / Duplicate / Delete live in the right-click menu, not here.
-        row1 = Gtk.Box(spacing=6, homogeneous=True)
-        left.pack_start(row1, False, False, 0)
-        for proto, css in (("rdp", "suggested-action"), ("vnc", "rcm-vnc"),
-                           ("radmin", "rcm-radmin")):
-            b = Gtk.Button(label=f"Connect {PROTO_LABEL[proto]}")
-            b.get_style_context().add_class(css)
-            b.connect("clicked", lambda _w, p=proto: self.connect_selected(p))
-            row1.pack_start(b, True, True, 0)
+        # One button per configured protocol; a FlowBox so ten of them wrap
+        # instead of squeezing into an unreadable row.
+        self.button_box = Gtk.FlowBox()
+        self.button_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.button_box.set_max_children_per_line(4)
+        self.button_box.set_row_spacing(6)
+        self.button_box.set_column_spacing(6)
+        self.button_box.set_homogeneous(True)
+        left.pack_start(self.button_box, False, False, 0)
+        self.rebuild_buttons()
 
         # ---- right: active sessions ----------------------------------------- #
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -255,6 +299,24 @@ class Win(Gtk.Window):
 
         self.reload()
         GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
+
+    def rebuild_buttons(self) -> None:
+        """Redraw the Connect row from protocols.conf."""
+        for child in self.button_box.get_children():
+            child.destroy()
+        protos = protocols_safe()
+        if not protos:
+            lbl = Gtk.Label()
+            lbl.set_markup("<small>no protocols configured — see Protocols…</small>")
+            self.button_box.add(lbl)
+        for pr in protos.values():
+            b = Gtk.Button(label=f"Connect {pr.label}")
+            css = "suggested-action" if pr.color in ("", "accent") \
+                else protocol_css_class(pr.id)
+            b.get_style_context().add_class(css)
+            b.connect("clicked", lambda _w, pid=pr.id: self.connect_selected(pid))
+            self.button_box.add(b)
+        self.button_box.show_all()
 
     # ---- helpers ----------------------------------------------------------- #
     def say(self, msg: str) -> None:
@@ -374,10 +436,10 @@ class Win(Gtk.Window):
         skipped = [c.sel for c in cs if proto not in c.protocols]
         cs = [c for c in cs if proto in c.protocols]
         if not cs:
-            self.say(f"none of the selected connections offer {PROTO_LABEL[proto]}")
+            self.say(f"none of the selected connections offer {proto_label(proto)}")
             return
         what = cs[0].sel if len(cs) == 1 else f"{len(cs)} connections"
-        self.say(f"connecting {what} over {PROTO_LABEL[proto]}"
+        self.say(f"connecting {what} over {proto_label(proto)}"
                  + (f" via {launcher}" if launcher else "") + "…"
                  + (f"  (skipped {', '.join(skipped)})" if skipped else ""))
 
@@ -392,7 +454,7 @@ class Win(Gtk.Window):
                     last = f"{c.sel}: {e}"
                     GLib.idle_add(self.say, last)
             GLib.idle_add(self.say, last if len(cs) == 1
-                          else f"launched {len(cs)} {PROTO_LABEL[proto]} session(s)")
+                          else f"launched {len(cs)} {proto_label(proto)} session(s)")
             GLib.idle_add(self.refresh_live)
 
         threading.Thread(target=work, daemon=True).start()
@@ -415,22 +477,19 @@ class Win(Gtk.Window):
     def popup(self, event) -> None:
         cs = self._selected_conns()
         menu = Gtk.Menu()
-        reg = rcm.load_launchers()
         offered = set().union(*(set(c.protocols) for c in cs)) if cs else set()
 
-        for proto in rcm.PROTOCOLS:
-            items = reg.get(proto, {}).get("items", {})
-            dflt = reg.get(proto, {}).get("default", "")
-            top = Gtk.MenuItem(label=f"Connect {PROTO_LABEL[proto]}")
-            top.set_sensitive(bool(cs) and proto in offered and bool(items))
-            if proto == "radmin":
-                top.connect("activate", lambda _m: self.connect_selected("radmin"))
+        for pr in protocols_safe().values():
+            top = Gtk.MenuItem(label=f"Connect {pr.label}")
+            top.set_sensitive(bool(cs) and pr.id in offered and bool(pr.launchers))
+            if len(pr.launchers) <= 1:
+                top.connect("activate", lambda _m, pid=pr.id: self.connect_selected(pid))
             else:
                 sub = Gtk.Menu()
-                for nm in items:
-                    mi = Gtk.MenuItem(label=f"{nm}  (default)" if nm == dflt else nm)
+                for nm in pr.launchers:
+                    mi = Gtk.MenuItem(label=f"{nm}  (default)" if nm == pr.default else nm)
                     mi.connect("activate",
-                               lambda _m, p=proto, n=nm: self.connect_selected(p, n))
+                               lambda _m, pid=pr.id, n=nm: self.connect_selected(pid, n))
                     sub.append(mi)
                 top.set_submenu(sub)
             menu.append(top)
@@ -513,10 +572,17 @@ class Win(Gtk.Window):
                       Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
         grid = Gtk.Grid(row_spacing=6, column_spacing=8, border_width=12)
         d.get_content_area().add(grid)
+        registry = protocols_safe()
         rows = [("Group", c.group if c else ""), ("Name", c.name if c else ""),
-                ("Host", c.host if c else ""), ("Username", c.username if c else ""),
-                ("RDP port", str(c.port) if c else "3389"),
-                ("VNC port", str(c.vnc_port) if c else str(rcm.DEFAULT_VNC_PORT))]
+                ("Host", c.host if c else ""), ("Username", c.username if c else "")]
+        # One port field per protocol that uses one, straight from the registry.
+        port_ids = []
+        for pr in registry.values():
+            if not pr.port:
+                continue
+            port_ids.append(pr.id)
+            rows.append((f"{pr.label} port",
+                         str(c.port_for(pr.id)) if c else str(pr.port)))
         fields = {}
         for i, (label, val) in enumerate(rows):
             grid.attach(Gtk.Label(label=label, xalign=1), 0, i, 1, 1)
@@ -531,11 +597,11 @@ class Win(Gtk.Window):
         grid.attach(Gtk.Label(label="Protocols", xalign=1), 0, len(rows), 1, 1)
         pbox = Gtk.Box(spacing=10)
         checks = {}
-        have = c.protocols if c else rcm.PROTOCOLS
-        for proto in rcm.PROTOCOLS:
-            cb = Gtk.CheckButton(label=PROTO_LABEL[proto])
-            cb.set_active(proto in have)
-            checks[proto] = cb
+        have = c.protocols if c else tuple(registry)
+        for pr in registry.values():
+            cb = Gtk.CheckButton(label=pr.label)
+            cb.set_active(pr.id in have)
+            checks[pr.id] = cb
             pbox.pack_start(cb, False, False, 0)
         grid.attach(pbox, 1, len(rows), 1, 1)
 
@@ -598,10 +664,11 @@ class Win(Gtk.Window):
             except ValueError:
                 return fallback
 
-        p = as_int("RDP port", 3389)
-        vp = as_int("VNC port", rcm.DEFAULT_VNC_PORT)
-        chosen = [k for k, cb in checks.items() if cb.get_active()] or list(rcm.PROTOCOLS)
-        protos = "" if len(chosen) == len(rcm.PROTOCOLS) else ",".join(chosen)
+        ports = {pid: as_int(f"{registry[pid].label} port", registry[pid].port)
+                 for pid in port_ids}
+        p = ports.pop("rdp", 3389)
+        chosen = [k for k, cb in checks.items() if cb.get_active()] or list(registry)
+        protos = "" if len(chosen) == len(registry) else ",".join(chosen)
         new_pw = epw.get_text()
         drop_pw = clear_pw.get_active()
         new_binding = sc_btn.binding
@@ -612,13 +679,13 @@ class Win(Gtk.Window):
             return
         if new:
             try:
-                rcm.write_rdp(g, n, h, u, p, vnc_port=vp, protocols=protos)
+                rcm.write_rdp(g, n, h, u, p, ports=ports, protocols=protos)
             except FileExistsError:
                 self._dialog(Gtk.MessageType.ERROR, "That connection already exists")
                 return
             self.say(f"created {g}/{n}" if g else f"created {n}")
         else:
-            rcm.set_fields(c, host=h, username=u, port=p, vnc_port=vp, protocols=protos)
+            rcm.set_fields(c, host=h, username=u, port=p, ports=ports, protocols=protos)
             self.say(f"saved {c.sel}")
 
         sel = f"{g}/{n}" if g else n
@@ -747,178 +814,243 @@ class Win(Gtk.Window):
     def on_genlauncher(self, *_):
         self.say(f"jump list rebuilt for {rcm.gen_launcher()} connection(s)")
 
-    # ---- launchers ----------------------------------------------------------- #
-    def on_launchers(self, *_):
-        d = Gtk.Dialog(title="Launchers", transient_for=self, modal=True)
+    # ---- protocols ----------------------------------------------------------- #
+    def on_protocols(self, *_):
+        """Edit protocols.conf: buttons, commands, detection and credential typing."""
+        d = Gtk.Dialog(title="Protocols", transient_for=self, modal=True)
         d.add_buttons(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
-        d.set_default_size(680, -1)
+        d.set_default_size(760, 620)
         box = d.get_content_area()
         box.set_spacing(8)
         box.set_border_width(12)
 
         head = Gtk.Label(xalign=0)
-        head.set_markup("Which program connects each protocol. The buttons use "
-                        "<b>default</b>; right-click a connection for the others.\n"
-                        "Placeholders: <tt>{file} {host} {user} {port} {name}</tt>")
+        head.set_markup(
+            "A protocol is a button, one or more commands, and optionally a "
+            "credential prompt to type into.\n"
+            "Placeholders: <tt>{host} {port} {user} {password} {name} {file} "
+            "{exe}</tt>")
         box.pack_start(head, False, False, 0)
 
-        reg = rcm.load_launchers()
-        rows: dict[str, list] = {"rdp": [], "vnc": []}
-        defaults: dict[str, Gtk.ComboBoxText] = {}
-        grids: dict[str, Gtk.Grid] = {}
+        nb = Gtk.Notebook()
+        nb.set_scrollable(True)
+        box.pack_start(nb, True, True, 0)
 
-        def add_launcher_row(proto: str, name: str, cmd: str):
-            grid = grids[proto]
-            r = len(rows[proto])
-            e_name = Gtk.Entry(text=name)
-            e_name.set_width_chars(12)
-            e_cmd = Gtk.Entry(text=cmd)
-            e_cmd.set_width_chars(46)
-            e_cmd.set_hexpand(True)
-            state = Gtk.Label(xalign=0)
-            xb = Gtk.Button.new_from_icon_name("window-close-symbolic", Gtk.IconSize.BUTTON)
-            xb.set_relief(Gtk.ReliefStyle.NONE)
-            xb.set_tooltip_text("Remove this launcher")
-
-            def refresh_state(*_a):
-                tmpl = e_cmd.get_text().strip()
-                try:
-                    exe = shlex.split(tmpl)[0] if tmpl else ""
-                except ValueError:
-                    exe = ""
-                ok = bool(exe) and bool(shutil.which(exe))
-                state.set_markup("<small>ok</small>" if ok else
-                                 "<small>not installed</small>" if exe else "")
-            e_cmd.connect("changed", refresh_state)
-            refresh_state()
-
-            def drop(*_a):
-                for w in (e_name, e_cmd, state, xb):
-                    w.destroy()
-                rows[proto] = [t for t in rows[proto] if t[0] is not e_name]
-                refresh_defaults(proto)
-            xb.connect("clicked", drop)
-
-            grid.attach(e_name, 0, r, 1, 1)
-            grid.attach(e_cmd, 1, r, 1, 1)
-            grid.attach(state, 2, r, 1, 1)
-            grid.attach(xb, 3, r, 1, 1)
-            rows[proto].append((e_name, e_cmd))
-            e_name.connect("changed", lambda *_a, p=proto: refresh_defaults(p))
-            grid.show_all()
-
-        def refresh_defaults(proto: str):
-            combo = defaults[proto]
-            cur = combo.get_active_text()
-            combo.remove_all()
-            names = [n.get_text().strip() for n, _ in rows[proto] if n.get_text().strip()]
-            for n in names:
-                combo.append_text(n)
-            if cur in names:
-                combo.set_active(names.index(cur))
-            elif names:
-                combo.set_active(0)
-
-        for proto in ("rdp", "vnc"):
-            lb = Gtk.Label(xalign=0)
-            lb.set_markup(f"<b>{PROTO_LABEL[proto]}</b>")
-            lb.set_margin_top(6)
-            box.pack_start(lb, False, False, 0)
-
-            grid = Gtk.Grid(row_spacing=4, column_spacing=8)
-            grids[proto] = grid
-            box.pack_start(grid, False, False, 0)
-            for name, cmd in reg.get(proto, {}).get("items", {}).items():
-                add_launcher_row(proto, name, cmd)
-
-            bar = Gtk.Box(spacing=6)
-            box.pack_start(bar, False, False, 0)
-            bar.pack_start(Gtk.Label(label="default:"), False, False, 0)
-            combo = Gtk.ComboBoxText()
-            defaults[proto] = combo
-            bar.pack_start(combo, False, False, 0)
-            addb = Gtk.Button(label="Add")
-            addb.connect("clicked", lambda _w, p=proto: add_launcher_row(p, "", ""))
-            bar.pack_end(addb, False, False, 0)
-            refresh_defaults(proto)
-            cur = reg.get(proto, {}).get("default", "")
-            names = [n.get_text().strip() for n, _ in rows[proto]]
-            if cur in names:
-                combo.set_active(names.index(cur))
-
-        # ---- Radmin block ---------------------------------------------------- #
-        lb = Gtk.Label(xalign=0)
-        lb.set_markup("<b>Radmin</b>")
-        lb.set_margin_top(10)
-        box.pack_start(lb, False, False, 0)
-
-        rgrid = Gtk.Grid(row_spacing=4, column_spacing=8)
-        box.pack_start(rgrid, False, False, 0)
-        try:
-            rcfg = rcm.radmin_config(require_exe=False)
-            rvals = {k: ("" if rcfg.get(k) is None else str(rcfg.get(k))) for k in rcm.RADMIN_KEYS}
-        except rcm.ConfigError:
-            rvals = {k: "" for k in rcm.RADMIN_KEYS}
-        rfields: dict[str, Gtk.Entry] = {}
-        hints = {"wine": "empty = native, no Wine", "exe": "path to Radmin.exe",
-                 "inject_order": "user-tab-pass | pass-only"}
-        for i, key in enumerate(rcm.RADMIN_KEYS):
-            rgrid.attach(Gtk.Label(label=key, xalign=1), 0, i, 1, 1)
-            e = Gtk.Entry(text=rvals.get(key, ""))
-            e.set_width_chars(52)
-            e.set_hexpand(True)
-            if key in hints:
-                e.set_placeholder_text(hints[key])
-            rgrid.attach(e, 1, i, 1, 1)
-            rfields[key] = e
-
-        rbar = Gtk.Box(spacing=6)
-        box.pack_start(rbar, False, False, 0)
-        detect = Gtk.Button(label="Detect installs")
-        rbar.pack_start(detect, False, False, 0)
         status = Gtk.Label(xalign=0)
         status.get_style_context().add_class("dim-label")
         box.pack_start(status, False, False, 0)
 
-        def do_detect(*_a):
-            found = rcm.radmin_detect()
-            if not found:
-                status.set_markup("<small>no Radmin.exe found</small>")
-                return
-            best = found[0]
-            rfields["exe"].set_text(str(best))
-            parts = best.parts
-            if "drive_c" in parts:
-                rfields["wineprefix"].set_text(str(Path(*parts[:parts.index("drive_c")])))
-                if not rfields["wine"].get_text().strip():
-                    rfields["wine"].set_text("wine-stable")
-            else:
-                rfields["wine"].set_text("")
-            status.set_markup(f"<small>found {len(found)}; using {best}</small>")
-        detect.connect("clicked", do_detect)
+        pages: dict[str, dict] = {}
 
+        def add_page(pr):
+            grid = Gtk.Grid(row_spacing=5, column_spacing=8, border_width=10)
+            sw = Gtk.ScrolledWindow()
+            sw.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            sw.add(grid)
+            fields, r = {}, 0
+
+            def entry(key, label, value, width=44, hint=""):
+                nonlocal r
+                grid.attach(Gtk.Label(label=label, xalign=1), 0, r, 1, 1)
+                e = Gtk.Entry(text=str(value))
+                e.set_width_chars(width)
+                e.set_hexpand(True)
+                if hint:
+                    e.set_placeholder_text(hint)
+                grid.attach(e, 1, r, 2, 1)
+                fields[key] = e
+                r += 1
+                return e
+
+            entry("label", "label", pr.label, 20)
+            entry("color", "colour", pr.color, 20, "#rrggbb or accent")
+            entry("order", "order", pr.order, 8)
+            entry("port", "port", pr.port or "", 8, "blank = none")
+            e_exe = entry("exe", "exe", pr.exe, 44, "optional; used as {exe}")
+            det = Gtk.Button(label="Detect")
+            grid.attach(det, 3, r - 1, 1, 1)
+            entry("env", "env", " ".join(f"{k}={v}" for k, v in pr.env.items()),
+                  44, "NAME=value NAME2=value2")
+
+            # launchers
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup("<b>Commands</b>")
+            lbl.set_margin_top(6)
+            grid.attach(lbl, 0, r, 3, 1)
+            r += 1
+            lrows: list[tuple] = []
+
+            def add_launcher(name="", cmd=""):
+                nonlocal r
+                e_n = Gtk.Entry(text=name)
+                e_n.set_width_chars(12)
+                e_c = Gtk.Entry(text=cmd)
+                e_c.set_width_chars(40)
+                e_c.set_hexpand(True)
+                xb = Gtk.Button.new_from_icon_name("window-close-symbolic",
+                                                   Gtk.IconSize.BUTTON)
+                xb.set_relief(Gtk.ReliefStyle.NONE)
+                row_widgets = (e_n, e_c, xb)
+                grid.attach(e_n, 0, r, 1, 1)
+                grid.attach(e_c, 1, r, 2, 1)
+                grid.attach(xb, 3, r, 1, 1)
+
+                def drop(*_a):
+                    for w in row_widgets:
+                        w.destroy()
+                    lrows[:] = [t for t in lrows if t[0] is not e_n]
+                xb.connect("clicked", drop)
+                lrows.append((e_n, e_c))
+                r += 1
+                grid.show_all()
+
+            for name, cmd in pr.launchers.items():
+                add_launcher(name, cmd)
+            addb = Gtk.Button(label="Add command")
+            grid.attach(addb, 0, r, 2, 1)
+            addb.connect("clicked", lambda *_a: add_launcher())
+            r += 1
+            entry("default", "default", pr.default, 20, "one of the names above")
+
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup("<b>Session detection</b>")
+            lbl.set_margin_top(6)
+            grid.attach(lbl, 0, r, 3, 1)
+            r += 1
+            entry("detect.process", "process regex", pr.detect_process, 44)
+            entry("detect.window", "window title", pr.detect_window, 44, "{host}")
+
+            lbl = Gtk.Label(xalign=0)
+            lbl.set_markup("<b>Credential typing</b>  "
+                           "<small>(leave steps empty if the client handles auth)"
+                           "</small>")
+            lbl.set_margin_top(6)
+            grid.attach(lbl, 0, r, 3, 1)
+            r += 1
+            entry("inject.window_class", "window class", pr.inject_class, 24)
+            entry("inject.window_title", "window title", pr.inject_title, 24)
+            entry("inject.wait", "wait (s)", pr.inject_wait, 8)
+            entry("inject.settle", "settle (s)", pr.inject_settle, 8)
+            entry("inject.delay", "key delay (ms)", pr.inject_delay, 8)
+            entry("inject.steps", "steps",
+                  " | ".join(op if not arg else f"{op}:{arg}"
+                             for op, arg in pr.inject_steps), 44,
+                  "type:{user} | key:Tab | type:{password} | key:Return")
+            for extra_k, extra_v in pr.extras.items():
+                entry(f"extra:{extra_k}", extra_k, extra_v, 44)
+
+            rm = Gtk.Button(label="Remove this protocol")
+            rm.get_style_context().add_class("destructive-action")
+            rm.set_margin_top(10)
+            grid.attach(rm, 0, r, 2, 1)
+
+            def do_detect(*_a):
+                pr2 = rcm.Protocol(id=pr.id, exe=fields["exe"].get_text().strip())
+                found = rcm.protocol_detect(pr2)
+                if not found:
+                    status.set_markup("<small>nothing found</small>")
+                    return
+                fields["exe"].set_text(str(found[0]))
+                parts = found[0].parts
+                if "drive_c" in parts:
+                    prefix = Path(*parts[:parts.index("drive_c")])
+                    fields["env"].set_text(f"WINEPREFIX={prefix}")
+                status.set_markup(f"<small>found {len(found)}; using {found[0]}</small>")
+            det.connect("clicked", do_detect)
+
+            def do_remove(*_a):
+                pages.pop(pr.id, None)
+                nb.remove_page(nb.page_num(sw))
+                status.set_markup(f"<small>{pr.id} removed — Save to apply</small>")
+            rm.connect("clicked", do_remove)
+
+            nb.append_page(sw, Gtk.Label(label=pr.label or pr.id))
+            pages[pr.id] = {"fields": fields, "launchers": lrows, "page": sw}
+            nb.show_all()
+
+        for pr in protocols_safe().values():
+            add_page(pr)
+
+        bar = Gtk.Box(spacing=6)
+        box.pack_start(bar, False, False, 0)
+        newb = Gtk.Button(label="Add protocol")
+        bar.pack_start(newb, False, False, 0)
         save = Gtk.Button(label="Save")
         save.get_style_context().add_class("suggested-action")
-        rbar.pack_end(save, False, False, 0)
+        bar.pack_end(save, False, False, 0)
+
+        def do_new(*_a):
+            name = self._ask_text("New protocol", "Protocol id (lowercase, no spaces):",
+                                  "anydesk")
+            pid = re.sub(r"[^a-z0-9_-]+", "", name.lower())
+            if not pid:
+                return
+            if pid in pages:
+                status.set_markup(f"<small>{pid} already exists</small>")
+                return
+            add_page(rcm.Protocol(id=pid, label=pid.title(), color="#777777",
+                                  order=max((int(v["fields"]["order"].get_text() or 0)
+                                             for v in pages.values()), default=0) + 10))
+            nb.set_current_page(nb.get_n_pages() - 1)
+        newb.connect("clicked", do_new)
 
         def do_save(*_a):
-            new_reg = {}
-            for proto in ("rdp", "vnc"):
-                items = {}
-                for e_name, e_cmd in rows[proto]:
-                    n, cmdtxt = e_name.get_text().strip(), e_cmd.get_text().strip()
-                    if n and cmdtxt:
-                        items[n] = cmdtxt
-                new_reg[proto] = {"default": defaults[proto].get_active_text() or "",
-                                  "items": items}
-            radmin = {k: rfields[k].get_text().strip() for k in rcm.RADMIN_KEYS}
-            rcm.save_launchers(new_reg, radmin)
-            try:
-                rcm.radmin_config(require_exe=False)
-                status.set_markup("<small>saved</small>")
-            except rcm.ConfigError as e:
-                status.set_markup(f"<small>saved, but: {GLib.markup_escape_text(str(e))}</small>")
-            self.say(f"launchers saved to {rcm.LAUNCHERS}")
+            out: dict[str, rcm.Protocol] = {}
+            for pid, data in pages.items():
+                f = data["fields"]
+                pr = rcm.Protocol(id=pid, label=f["label"].get_text().strip() or pid)
+                pr.color = f["color"].get_text().strip() or "accent"
+                for key, cast, attr in (("order", int, "order"), ("port", int, "port"),
+                                        ("inject.wait", float, "inject_wait"),
+                                        ("inject.settle", float, "inject_settle"),
+                                        ("inject.delay", int, "inject_delay")):
+                    raw = f[key].get_text().strip()
+                    if raw:
+                        try:
+                            setattr(pr, attr, cast(raw))
+                        except ValueError:
+                            status.set_markup(
+                                f"<small>{pid}: {key}={raw!r} is not a number</small>")
+                            return
+                pr.exe = f["exe"].get_text().strip()
+                for pair in f["env"].get_text().split():
+                    k, _, v = pair.partition("=")
+                    if k:
+                        pr.env[k] = v
+                pr.launchers = {n.get_text().strip(): c.get_text().strip()
+                                for n, c in data["launchers"]
+                                if n.get_text().strip() and c.get_text().strip()}
+                pr.default = f["default"].get_text().strip()
+                if pr.default and pr.default not in pr.launchers:
+                    status.set_markup(f"<small>{pid}: default "
+                                      f"{pr.default!r} is not one of its commands</small>")
+                    return
+                pr.detect_process = f["detect.process"].get_text().strip()
+                pr.detect_window = f["detect.window"].get_text().strip() or "{host}"
+                pr.inject_class = f["inject.window_class"].get_text().strip()
+                pr.inject_title = f["inject.window_title"].get_text().strip()
+                steps = f["inject.steps"].get_text().strip()
+                if steps:
+                    try:
+                        pr.inject_steps = rcm.parse_steps(steps)
+                    except rcm.ConfigError as e:
+                        status.set_markup(
+                            f"<small>{GLib.markup_escape_text(str(e))}</small>")
+                        return
+                for key, ent in f.items():
+                    if key.startswith("extra:") and ent.get_text().strip():
+                        pr.extras[key[6:]] = ent.get_text().strip()
+                out[pid] = pr
+            if not out:
+                status.set_markup("<small>at least one protocol is required</small>")
+                return
+            rcm.save_protocols(dict(sorted(out.items(),
+                                           key=lambda kv: kv[1].order)))
+            install_css(protocols_safe())
+            self.rebuild_buttons()
+            self.reload()
+            status.set_markup("<small>saved</small>")
+            self.say(f"protocols saved to {rcm.PROTOCOLS_FILE}")
         save.connect("clicked", do_save)
 
         d.show_all()
@@ -1125,8 +1257,8 @@ class Win(Gtk.Window):
         scope_combo.set_active(0)
         addbar.pack_start(scope_combo, False, False, 0)
         proto_combo = Gtk.ComboBoxText()
-        for p in rcm.PROTOCOLS:
-            proto_combo.append_text(p)
+        for pid in protocols_safe():
+            proto_combo.append_text(pid)
         proto_combo.set_active(0)
         addbar.pack_start(proto_combo, False, False, 0)
         addb = Gtk.Button(label="Add")
@@ -1198,14 +1330,17 @@ class Win(Gtk.Window):
 
 
 def run() -> int:
-    install_css()
     # The GUI is the one place allowed to create config: opening the manager is a
     # deliberate setup step, so a fresh clone gets real editable files rather
     # than invisible in-code defaults.
+    migrated = rcm.migrate_launchers()
     created = rcm.write_default_configs()
+    install_css(protocols_safe())
     w = Win()
-    if created:
-        w.say("created " + ", ".join(created) + " — see Launchers… to finish setup")
+    if migrated:
+        w.say("launchers.conf upgraded to protocols.conf")
+    elif created:
+        w.say("created " + ", ".join(created) + " — see Protocols… to finish setup")
     w.connect("destroy", Gtk.main_quit)
     w.show_all()
     Gtk.main()

@@ -5,11 +5,18 @@ use, with credentials in the OS keyring instead of a text file.
 
 The command is `rcm`.
 
-It is a **manager and launcher**, not a protocol implementation. RDP, VNC and Radmin
-sessions are opened by external programs you configure — Thincast, `mstsc`, xfreerdp,
-Remmina, TigerVNC, Radmin Viewer — so you keep the client you like and get grouping,
-batch import, live session tracking and global shortcuts on top.
+It is a **manager and launcher**, not a protocol implementation. Sessions are opened by
+external programs you configure — Thincast, `mstsc`, xfreerdp, Remmina, TigerVNC,
+Radmin Viewer, AnyDesk, anything with a command line — so you keep the clients you like
+and get grouping, batch import, live session tracking and global shortcuts on top.
 
+**Protocols are configuration, not code.** RDP, VNC and Radmin ship as three sections in
+`protocols.conf`; adding a fourth needs no changes to the program. A protocol defines its
+own button label and colour, its commands, how a live session is recognised, and — if the
+client insists on a password prompt — the keystrokes to fill it in.
+
+- **Any protocol you can launch**, defined in config: label, colour, commands,
+  session detection, and optional credential typing
 - **Connections in one tree**, grouped, defined by ordinary `.rdp` files
 - **Credentials in the OS keyring** (libsecret / GNOME Keyring), never on disk, with a
   precedence chain from per-connection down to a global default, and per-protocol
@@ -18,7 +25,6 @@ batch import, live session tracking and global shortcuts on top.
 - **Live session list** — see what is connected, focus it, disconnect it
 - **System-wide shortcuts** and an Alt-Tab-style switcher across active sessions
 - **Batch CSV import/export**, and an experimental Radmin phonebook export
-- **Radmin credential injection**, because Radmin refuses to save passwords by design
 
 Linux/X11 (developed on Cinnamon). A Windows port is planned — see [Roadmap](#roadmap).
 
@@ -34,7 +40,7 @@ sudo apt install python3-gi gir1.2-gtk-3.0 xdotool
 
 git clone https://github.com/thebdr/network-computing-hub.git ~/network-computing-hub
 cd ~/network-computing-hub
-./bin/rcm init          # writes launchers.conf, creds.conf, shortcuts.conf
+./bin/rcm init          # writes protocols.conf, creds.conf, shortcuts.conf
 mkdir -p ~/bin && ln -s ~/network-computing-hub/bin/rcm ~/bin/rcm
 ```
 
@@ -44,7 +50,7 @@ Open the manager once (`rcm gui`) and it will create any missing config for you.
 
 ```bash
 rcm init                       # create config files
-rcm radmin detect --write      # find Radmin, if you use it
+rcm detect radmin --write      # find Radmin, if you use it
 rcm import hosts.csv           # or add connections in the GUI
 rcm gui                        # the manager
 ```
@@ -60,9 +66,12 @@ truth for host and username. Two extra keys are ours; clients ignore keys they d
 recognise:
 
 ```
-rcm-vnc-port:i:5900
 rcm-protocols:s:rdp,vnc,radmin
+rcm-port-vnc:i:5900
 ```
+
+`rcm-port-<protocol>` overrides that protocol's default port for one host, so a new
+protocol needs no code change. RDP keeps using the file's own `server port`.
 
 Rename a group folder with a leading dot (`Plant` → `.Plant`) and it disappears from
 every menu, list and export.
@@ -76,41 +85,64 @@ back to something that happened to work on the author's machine.
 
 | File | What |
 |---|---|
-| `launchers.conf` | which program connects each protocol, and the `[radmin]` block |
+| `protocols.conf` | the protocols: buttons, commands, detection, credential typing |
 | `creds.conf` | scope → username. **No passwords** — those are in the keyring |
 | `shortcuts.conf` | system-wide keys |
 
-### Launchers
+### Protocols
+
+Each `[protocol:<id>]` section is one way of reaching a machine:
 
 ```ini
-[rdp]
+[protocol:rdp]
+label = RDP
+color = accent                  ; or #rrggbb for the button colour
+order = 10
+port  = 3389
 default = Thincast
-Thincast = flatpak run com.thincast.client {file}
-xfreerdp = xfreerdp3 /v:{host}:{port} /u:{user} +clipboard
-mstsc    = mstsc {file}
+launcher.Thincast = flatpak run com.thincast.client {file}
+launcher.xfreerdp = xfreerdp3 /v:{host}:{port} /u:{user} +clipboard
+detect.process = (^|/)(rdc|xfreerdp3?|mstsc)\b
 ```
 
 Placeholders are substituted per argument, so paths with spaces stay one argument:
-`{file} {host} {user} {port} {name}`. The toolbar buttons use `default`; right-click a
-connection for the others. Edit in the GUI under **Launchers…**.
+`{host} {port} {user} {password} {name} {file} {exe}`. The buttons use `default`;
+right-click a connection for the others. Edit it all in the GUI under **Protocols…**,
+which also writes new protocols for you.
 
-### Radmin
-
-Radmin has no `/password:` switch — Famatech deliberately prevent saving passwords on
-the Viewer machine — so the only route is typing into its dialog. Configure where it
-lives, and it works whether installed, portable, or under Wine:
+`exe` is optional and available to commands as `{exe}`; `env.NAME = value` sets
+environment for the launch. Together they cover a program that has to run through a
+wrapper — Radmin under Wine is just:
 
 ```ini
-[radmin]
-exe        = /path/to/Radmin.exe
-wine       = wine-stable     ; leave EMPTY for a native install
-wineprefix = ~/.local/share/wineprefixes/Radmin
-port       = 4899
+[protocol:radmin]
+exe = /path/to/Radmin.exe
+env.WINEPREFIX = ~/.local/share/wineprefixes/Radmin
+launcher.Wine = wine-stable {exe} /connect:{host}:{port}
+launcher.Native = {exe} /connect:{host}:{port}
 ```
 
-`rcm radmin detect` ranks the installs it can find; `--write` fills in the config.
-`rcm calibrate <connection>` opens the auth dialog, reports exactly what it is, saves a
-screenshot of it, and types nothing — use it if the dialog ever changes.
+`rcm detect radmin` ranks the installs it can find; `--write` records the best one.
+
+### Typing credentials into a prompt
+
+Some clients refuse to take a password on the command line — Radmin has no
+`/password:` switch because Famatech deliberately prevent saving passwords on the
+Viewer machine. For those, describe the prompt and the keystrokes:
+
+```ini
+inject.window_class = [Rr]admin      ; X11 class of the prompt
+inject.window_title = security       ; substring of its title
+inject.wait   = 20                   ; seconds to wait for it
+inject.settle = 0.3                  ; pause after focusing, before typing
+inject.delay  = 40                   ; ms between keystrokes
+inject.steps  = type:{user} | key:Tab | type:{password} | key:Return
+```
+
+Steps are `type:<text>`, `key:<keysym>`, `sleep:<seconds>`, `activate` and `clear`.
+`{password}` is read from the keyring at the moment it is typed and never written to
+disk. `rcm calibrate <connection> [protocol]` opens the prompt, reports exactly what it
+is, saves a screenshot of it, and types nothing — use it when writing the steps.
 
 ### Credentials
 
@@ -149,11 +181,11 @@ touches only those.
 
 ```
 rcm init | list | sessions | gui | focus | next | prev | goto <sel>
-rcm connect <sel> [--rdp|--vnc|--radmin] [--via <launcher>]
+rcm connect <sel> [--<protocol>] [--via <launcher>]
 rcm connect-all <group>
-rcm launchers | radmin show|detect [--write] | creds ... | shortcuts ...
+rcm protocols | detect <protocol> [--write] | creds ... | shortcuts ...
 rcm import <csv> [--overwrite] [--dry-run] | export [csv] | phonebook [out.rpb]
-rcm calibrate <sel> | gen-launcher
+rcm calibrate <sel> [protocol] | gen-launcher
 ```
 
 ## Notes from building this

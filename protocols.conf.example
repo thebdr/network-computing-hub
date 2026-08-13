@@ -1,0 +1,93 @@
+# Protocols.
+#
+# Each [protocol:<id>] section defines one way of reaching a machine: what its
+# button looks like, which programs can open it, how a live session is
+# recognised, and -- optionally -- how credentials get typed into a prompt.
+# Add as many as you like; nothing here is special-cased in the code.
+#
+# Keys
+#   label            button text and display name
+#   color            button colour (#rrggbb), or "accent" for the theme accent
+#   order            sort order for buttons and menus (low first)
+#   port             default port; a connection can override it
+#   exe              optional path, available to commands as {exe}
+#   env.NAME         environment variable set when launching
+#   default          which launcher the button uses
+#   launcher.<Name>  a command line; several per protocol is normal
+#   detect.process   regex matched against process command lines to spot a session
+#   detect.window    window-title pattern used to find that session's window
+#
+# Credential typing (optional; omit the whole block if the client handles auth)
+#   inject.window_class  X11 class of the credential dialog
+#   inject.window_title  substring of its title
+#   inject.wait          seconds to wait for it to appear
+#   inject.settle        pause after focusing it, before typing
+#   inject.delay         milliseconds between keystrokes
+#   inject.steps         what to do, in order, separated by |
+#                          type:<text>   key:<keysym>   sleep:<seconds>
+#                          activate      clear
+#
+# Placeholders in commands and steps:
+#   {host} {port} {user} {password} {name} {file} {exe}
+# {file} is the connection's .rdp path. {password} is read from the keyring at
+# the moment it is typed and never written to disk.
+
+[protocol:rdp]
+label = RDP
+color = accent
+order = 10
+port = 3389
+default = Thincast
+launcher.Thincast = flatpak run com.thincast.client {file}
+launcher.xfreerdp = xfreerdp3 /v:{host}:{port} /u:{user} +clipboard +fonts /dynamic-resolution /cert:ignore
+launcher.Remmina = remmina -c {file}
+launcher.mstsc = mstsc {file}
+detect.process = (^|/)(rdc|xfreerdp3?|freerdp|mstsc(\.exe)?)\b
+detect.window = {host}
+
+[protocol:vnc]
+label = VNC
+color = #2b6cb0
+order = 20
+port = 5900
+default = Remmina
+launcher.Remmina = remmina -c vnc://{host}:{port}
+launcher.TigerVNC = vncviewer {host}::{port}
+detect.process = vnc://|(^|/)(vncviewer|xtigervncviewer)\b
+detect.window = {host}
+
+[protocol:radmin]
+label = Radmin
+color = #d97a1f
+order = 30
+port = 4899
+exe =
+env.WINEPREFIX =
+default = Native
+launcher.Wine = wine-stable {exe} /connect:{host}:{port}
+launcher.Native = {exe} /connect:{host}:{port}
+detect.process = Radmin(\.exe)? .*/connect:
+detect.window = {host}
+# Radmin has no /password: switch by design, so the password must be typed.
+inject.window_class = [Rr]admin
+inject.window_title = security
+inject.wait = 20
+inject.settle = 0.3
+inject.delay = 40
+inject.steps = type:{user} | key:Tab | type:{password} | key:Return
+# Only `rcm phonebook` reads this; it uses the file as a structural template.
+phonebook =
+
+# Example of adding your own. AnyDesk prompts for a password in its own window;
+# adjust inject.window_title to whatever your version actually shows.
+#
+# [protocol:anydesk]
+# label = AnyDesk
+# color = #ef443b
+# order = 40
+# default = AnyDesk
+# launcher.AnyDesk = anydesk {host}
+# detect.process = (^|/)anydesk\b
+# inject.window_title = Password
+# inject.wait = 20
+# inject.steps = type:{password} | key:Return
