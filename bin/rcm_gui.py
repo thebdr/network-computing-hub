@@ -247,115 +247,12 @@ class Win(Gtk.Window):
         outer.pack_start(self.tab_strip, False, False, 0)
         self.rebuild_tab_strip()
 
-        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_position(660)
-        outer.pack_start(paned, True, True, 0)
-
-        # ---- left: saved connections ---------------------------------------- #
-        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        left.set_border_width(8)
-        paned.pack1(left, True, False)
-
-        head = Gtk.Box(spacing=6)
-        lbl = Gtk.Label(xalign=0)
-        lbl.set_markup("<b>Saved sessions</b>")
-        head.pack_start(lbl, False, False, 0)
-        self.count_lbl = Gtk.Label(xalign=0)
-        self.count_lbl.get_style_context().add_class("dim-label")
-        head.pack_start(self.count_lbl, False, False, 0)
-        left.pack_start(head, False, False, 0)
-
-        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str,
-                                   int, int)
-        self.tree = Gtk.TreeView(model=self.store)
-        # Ctrl and Shift range-select come free with MULTIPLE.
-        self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
-        self.tree.set_rubber_banding(True)
-
-        toggle = Gtk.CellRendererToggle()
-        toggle.set_activatable(True)
-        toggle.connect("toggled", self.on_check_toggled)
-        col = Gtk.TreeViewColumn("", toggle, active=C_CHECK)
-        col.set_min_width(30)
-        self.tree.append_column(col)
-
-        r = Gtk.CellRendererText()
-        col = Gtk.TreeViewColumn("Live", r, text=C_MARK)
-        col.set_min_width(36)
-        self.tree.append_column(col)
-
-        for idx, title, minw in ((C_LABEL, "Connection", 130),
-                                 (C_HOST, "Host", 118), (C_USER, "User", 78),
-                                 (C_PROTOS, "Protocols", 168),
-                                 (C_KEY, "Key", 86)):
-            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
-            if idx == C_PROTOS:
-                col = Gtk.TreeViewColumn(title, r, markup=idx)
-            else:
-                col = Gtk.TreeViewColumn(title, r, text=idx)
-            col.add_attribute(r, "weight", C_WEIGHT)   # bold = a session is live
-            col.add_attribute(r, "style", C_STYLE)     # italic = a group header
-            col.set_resizable(True)
-            col.set_min_width(minw)
-            col.set_expand(idx == C_LABEL)
-            self.tree.append_column(col)
-
-        self.tree.connect("row-activated", self.on_row_activated)
-        self.tree.connect("button-press-event", self.on_tree_click)
-        sw = Gtk.ScrolledWindow()
-        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        sw.add(self.tree)
-        sw.set_shadow_type(Gtk.ShadowType.IN)
-        left.pack_start(sw, True, True, 0)
-
-        # Edit / Duplicate / Delete live in the right-click menu, not here.
-        # One button per configured protocol; a FlowBox so ten of them wrap
-        # instead of squeezing into an unreadable row.
-        self.button_box = Gtk.FlowBox()
-        self.button_box.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.button_box.set_max_children_per_line(4)
-        self.button_box.set_row_spacing(6)
-        self.button_box.set_column_spacing(6)
-        self.button_box.set_homogeneous(True)
-        left.pack_start(self.button_box, False, False, 0)
-        self.rebuild_buttons()
-
-        # ---- right: active sessions ----------------------------------------- #
-        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        right.set_border_width(8)
-        paned.pack2(right, False, False)
-
-        lbl = Gtk.Label(xalign=0)
-        lbl.set_markup("<b>Active sessions</b>")
-        right.pack_start(lbl, False, False, 0)
-
-        # proto, label, host, key, pid, window
-        self.sstore = Gtk.ListStore(str, str, str, str, int, str)
-        self.slist = Gtk.TreeView(model=self.sstore)
-        self.slist.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
-        for i, (title, minw) in enumerate((("", 58), ("Session", 125),
-                                           ("Host", 125), ("Key", 95))):
-            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
-            col = Gtk.TreeViewColumn(title, r, text=i)
-            col.set_resizable(True)
-            col.set_min_width(minw)
-            self.slist.append_column(col)
-        self.slist.connect("row-activated", lambda *_: self.on_focus())
-        sw2 = Gtk.ScrolledWindow()
-        sw2.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        sw2.add(self.slist)
-        sw2.set_shadow_type(Gtk.ShadowType.IN)
-        right.pack_start(sw2, True, True, 0)
-
-        row3 = Gtk.Box(spacing=6, homogeneous=True)
-        right.pack_start(row3, False, False, 0)
-        b = Gtk.Button(label="Focus")
-        b.connect("clicked", lambda *_: self.on_focus())
-        row3.pack_start(b, True, True, 0)
-        b = Gtk.Button(label="Disconnect")
-        b.get_style_context().add_class("destructive-action")
-        b.connect("clicked", lambda *_: self.on_disconnect())
-        row3.pack_start(b, True, True, 0)
+        # The window body is owned by the active layout; switching layouts
+        # rebuilds this container and nothing else (headerbar, tab strip and
+        # status bar are the shared shell).
+        self.layout_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.pack_start(self.layout_container, True, True, 0)
+        self.current_layout = None
 
         # Status bar: transient messages left, standing config-health warnings
         # right (fed by rcm.config_health(), same source as the Setup badge).
@@ -371,7 +268,7 @@ class Win(Gtk.Window):
 
         self.connect("key-press-event", self.on_window_key)
 
-        self.reload()
+        self.apply_layout(self.ui_state["layout"])
         GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
 
     LAYOUT_DESCRIPTIONS = {
@@ -381,7 +278,7 @@ class Win(Gtk.Window):
         "inspector": "read-only audit of credentials and config",
         "classic": "the original window",
     }
-    IMPLEMENTED_LAYOUTS = ("classic",)   # widened as layouts land in this branch
+    IMPLEMENTED_LAYOUTS = rcm.LAYOUTS
 
     def build_layout_popover(self) -> Gtk.Popover:
         popover = Gtk.Popover()
@@ -418,6 +315,7 @@ class Win(Gtk.Window):
         self.ui_state["layout"] = layout_id
         rcm.save_ui_state(self.ui_state)
         self.layout_label.set_text(f"Layout: {layout_id.title()} ▾")
+        self.apply_layout(layout_id)
         self.say(f"layout switched to {layout_id} — saved in ui.conf")
 
     def rebuild_tab_strip(self) -> None:
@@ -514,6 +412,489 @@ class Win(Gtk.Window):
             f'{extra}</span>')
         self.health_label.set_tooltip_text("\n".join(w.message for w in problems))
 
+
+    # ------------------------------------------------------------------ #
+    # layout engine: five window arrangements over the same shell
+    # ------------------------------------------------------------------ #
+    def apply_layout(self, layout_id: str) -> None:
+        """Tear down the body and rebuild it as the chosen layout."""
+        if layout_id not in rcm.LAYOUTS:
+            layout_id = "classic"
+        for child in self.layout_container.get_children():
+            child.destroy()
+        # Widgets the layouts may or may not create; reload()/refresh_live()
+        # only touch what exists.
+        self.tree = None
+        self.store = None
+        self.slist = None
+        self.sstore = None
+        self.button_box = None
+        self.sidebar = None
+        self.setup_badge = None
+        self.filter_entry = None
+        self.inspector_store = None
+        self.cockpit_cards = None
+        self.flat_list = layout_id in ("rail", "spotlight", "cockpit")
+        self.highlight_matches = layout_id == "spotlight"
+        self.current_layout = layout_id
+        builder = getattr(self, f"build_{layout_id}_layout")
+        self.layout_container.pack_start(builder(), True, True, 0)
+        self.layout_container.show_all()
+        self.reload()
+
+    def build_classic_layout(self):
+        """The pre-redesign window, kept selectable for continuity."""
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(660)
+
+        # ---- left: saved connections ---------------------------------------- #
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        left.set_border_width(8)
+        paned.pack1(left, True, False)
+
+        head = Gtk.Box(spacing=6)
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup("<b>Saved sessions</b>")
+        head.pack_start(lbl, False, False, 0)
+        self.count_lbl = Gtk.Label(xalign=0)
+        self.count_lbl.get_style_context().add_class("dim-label")
+        head.pack_start(self.count_lbl, False, False, 0)
+        left.pack_start(head, False, False, 0)
+
+        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str,
+                                   int, int)
+        self.tree = Gtk.TreeView(model=self.store)
+        # Ctrl and Shift range-select come free with MULTIPLE.
+        self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self.tree.set_rubber_banding(True)
+
+        toggle = Gtk.CellRendererToggle()
+        toggle.set_activatable(True)
+        toggle.connect("toggled", self.on_check_toggled)
+        col = Gtk.TreeViewColumn("", toggle, active=C_CHECK)
+        col.set_min_width(30)
+        self.tree.append_column(col)
+
+        r = Gtk.CellRendererText()
+        col = Gtk.TreeViewColumn("Live", r, text=C_MARK)
+        col.set_min_width(36)
+        self.tree.append_column(col)
+
+        for idx, title, minw in ((C_LABEL, "Connection", 130),
+                                 (C_HOST, "Host", 118), (C_USER, "User", 78),
+                                 (C_PROTOS, "Protocols", 168),
+                                 (C_KEY, "Key", 86)):
+            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            if idx in (C_PROTOS, C_LABEL, C_HOST):
+                col = Gtk.TreeViewColumn(title, r, markup=idx)
+            else:
+                col = Gtk.TreeViewColumn(title, r, text=idx)
+            col.add_attribute(r, "weight", C_WEIGHT)   # bold = a session is live
+            col.add_attribute(r, "style", C_STYLE)     # italic = a group header
+            col.set_resizable(True)
+            col.set_min_width(minw)
+            col.set_expand(idx == C_LABEL)
+            self.tree.append_column(col)
+
+        self.tree.connect("row-activated", self.on_row_activated)
+        self.tree.connect("button-press-event", self.on_tree_click)
+        sw = Gtk.ScrolledWindow()
+        sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw.add(self.tree)
+        sw.set_shadow_type(Gtk.ShadowType.IN)
+        left.pack_start(sw, True, True, 0)
+
+        # Edit / Duplicate / Delete live in the right-click menu, not here.
+        # One button per configured protocol; a FlowBox so ten of them wrap
+        # instead of squeezing into an unreadable row.
+        self.button_box = Gtk.FlowBox()
+        self.button_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.button_box.set_max_children_per_line(4)
+        self.button_box.set_row_spacing(6)
+        self.button_box.set_column_spacing(6)
+        self.button_box.set_homogeneous(True)
+        left.pack_start(self.button_box, False, False, 0)
+        self.rebuild_buttons()
+
+        # ---- right: active sessions ----------------------------------------- #
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        right.set_border_width(8)
+        paned.pack2(right, False, False)
+
+        lbl = Gtk.Label(xalign=0)
+        lbl.set_markup("<b>Active sessions</b>")
+        right.pack_start(lbl, False, False, 0)
+
+        # proto, label, host, key, pid, window
+        self.sstore = Gtk.ListStore(str, str, str, str, int, str)
+        self.slist = Gtk.TreeView(model=self.sstore)
+        self.slist.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        for i, (title, minw) in enumerate((("", 58), ("Session", 125),
+                                           ("Host", 125), ("Key", 95))):
+            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, r, text=i)
+            col.set_resizable(True)
+            col.set_min_width(minw)
+            self.slist.append_column(col)
+        self.slist.connect("row-activated", lambda *_: self.on_focus())
+        sw2 = Gtk.ScrolledWindow()
+        sw2.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sw2.add(self.slist)
+        sw2.set_shadow_type(Gtk.ShadowType.IN)
+        right.pack_start(sw2, True, True, 0)
+
+        row3 = Gtk.Box(spacing=6, homogeneous=True)
+        right.pack_start(row3, False, False, 0)
+        b = Gtk.Button(label="Focus")
+        b.connect("clicked", lambda *_: self.on_focus())
+        row3.pack_start(b, True, True, 0)
+        b = Gtk.Button(label="Disconnect")
+        b.get_style_context().add_class("destructive-action")
+        b.connect("clicked", lambda *_: self.on_disconnect())
+        row3.pack_start(b, True, True, 0)
+
+        return paned
+
+    # ---- shared pieces the new layouts compose ------------------------- #
+    def build_connection_list(self):
+        """The connection list used by Rail/Spotlight/Cockpit: same columns as
+        Classic, but flat — group changes render as italic heading rows rather
+        than expander nesting, and Spotlight highlights filter matches."""
+        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, int, int)
+        self.tree = Gtk.TreeView(model=self.store)
+        self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self.tree.set_rubber_banding(True)
+        toggle = Gtk.CellRendererToggle()
+        toggle.set_activatable(True)
+        toggle.connect("toggled", self.on_check_toggled)
+        col = Gtk.TreeViewColumn("", toggle, active=C_CHECK)
+        col.set_min_width(30)
+        self.tree.append_column(col)
+        live_renderer = Gtk.CellRendererText()
+        col = Gtk.TreeViewColumn("Live", live_renderer, text=C_MARK)
+        col.set_min_width(36)
+        self.tree.append_column(col)
+        for idx, title, minw in ((C_LABEL, "Connection", 150),
+                                 (C_HOST, "Host", 118), (C_USER, "User", 78),
+                                 (C_PROTOS, "Protocols", 168), (C_KEY, "Key", 86)):
+            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            if idx in (C_LABEL, C_HOST, C_PROTOS):
+                col = Gtk.TreeViewColumn(title, renderer, markup=idx)
+            else:
+                col = Gtk.TreeViewColumn(title, renderer, text=idx)
+            col.add_attribute(renderer, "weight", C_WEIGHT)
+            col.add_attribute(renderer, "style", C_STYLE)
+            col.set_resizable(True)
+            col.set_min_width(minw)
+            col.set_expand(idx == C_LABEL)
+            self.tree.append_column(col)
+        self.tree.connect("row-activated", self.on_row_activated)
+        self.tree.connect("button-press-event", self.on_tree_click)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(self.tree)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        return scroller
+
+    def build_filter_row(self, placeholder: str):
+        row = Gtk.Box(spacing=6)
+        self.filter_entry = Gtk.SearchEntry()
+        self.filter_entry.set_placeholder_text(placeholder)
+        self.filter_entry.set_text(self.query_text)
+        self.filter_entry.connect("search-changed", self.on_filter_changed)
+        row.pack_start(self.filter_entry, True, True, 0)
+        new_button = Gtk.Button(label="New")
+        new_button.connect("clicked", lambda *_: self.edit_dialog(None))
+        row.pack_start(new_button, False, False, 0)
+        return row
+
+    def on_filter_changed(self, entry) -> None:
+        self.query_text = entry.get_text().strip()
+        self.reload()
+
+    def build_active_pane(self):
+        """Active-sessions pane (right side of Classic and Rail)."""
+        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        pane.set_border_width(8)
+        label = Gtk.Label(xalign=0)
+        label.set_markup("<b>Active sessions</b>")
+        pane.pack_start(label, False, False, 0)
+        self.sstore = Gtk.ListStore(str, str, str, str, int, str)
+        self.slist = Gtk.TreeView(model=self.sstore)
+        self.slist.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        for i, (title, minw) in enumerate((("", 58), ("Session", 125),
+                                           ("Host", 125), ("Key", 95))):
+            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, renderer, text=i)
+            col.set_resizable(True)
+            col.set_min_width(minw)
+            self.slist.append_column(col)
+        self.slist.connect("row-activated", lambda *_: self.on_focus())
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(self.slist)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        pane.pack_start(scroller, True, True, 0)
+        buttons = Gtk.Box(spacing=6, homogeneous=True)
+        pane.pack_start(buttons, False, False, 0)
+        focus = Gtk.Button(label="Focus")
+        focus.connect("clicked", lambda *_: self.on_focus())
+        buttons.pack_start(focus, True, True, 0)
+        disconnect = Gtk.Button(label="Disconnect")
+        disconnect.get_style_context().add_class("destructive-action")
+        disconnect.connect("clicked", lambda *_: self.on_disconnect())
+        buttons.pack_start(disconnect, True, True, 0)
+        return pane
+
+    def build_connect_button_box(self):
+        self.button_box = Gtk.FlowBox()
+        self.button_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.button_box.set_max_children_per_line(4)
+        self.button_box.set_row_spacing(6)
+        self.button_box.set_column_spacing(6)
+        self.button_box.set_homogeneous(True)
+        self.rebuild_buttons()
+        return self.button_box
+
+    # ---- Rail ----------------------------------------------------------- #
+    def build_rail_layout(self):
+        """Design 8a: group sidebar, flat list, active pane."""
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_position(190)
+
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        side.set_border_width(6)
+        self.sidebar = Gtk.TreeView(headers_visible=False)
+        self.sidebar.get_style_context().add_class("sidebar")
+        self.sidebar_store = Gtk.TreeStore(str, str)   # markup, group path
+        self.sidebar.set_model(self.sidebar_store)
+        renderer = Gtk.CellRendererText()
+        self.sidebar.append_column(Gtk.TreeViewColumn("", renderer, markup=0))
+        self.sidebar.get_selection().connect("changed", self.on_sidebar_selected)
+        side_scroller = Gtk.ScrolledWindow()
+        side_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        side_scroller.add(self.sidebar)
+        side.pack_start(side_scroller, True, True, 0)
+        side.pack_start(Gtk.Separator(), False, False, 0)
+        self.setup_badge = Gtk.Button()
+        self.setup_badge.set_relief(Gtk.ReliefStyle.NONE)
+        self.setup_badge.connect("clicked", lambda *_: self.on_setup())
+        side.pack_start(self.setup_badge, False, False, 0)
+        paned.pack1(side, False, False)
+
+        right = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        right.set_position(600)
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        main.set_border_width(8)
+        main.pack_start(self.build_filter_row(
+            "filter name, host, user…  (Ctrl+T pins as tab)"), False, False, 0)
+        main.pack_start(self.build_connection_list(), True, True, 0)
+        main.pack_start(self.build_connect_button_box(), False, False, 0)
+        right.pack1(main, True, False)
+        right.pack2(self.build_active_pane(), False, False)
+        paned.pack2(right, True, False)
+        return paned
+
+    def on_sidebar_selected(self, selection) -> None:
+        model, it = selection.get_selected()
+        if it:
+            self.query_group = model[it][1]
+            self.reload()
+
+    def refresh_sidebar(self) -> None:
+        if getattr(self, "sidebar", None) is None:
+            return
+        self.sidebar_store.clear()
+        total = len(rcm.conns_cached())
+        all_row = self.sidebar_store.append(
+            None, [f"All  <small>({total})</small>", ""])
+        nodes = {"": all_row}
+        for group in rcm.groups():
+            parent = nodes.get(group.rsplit("/", 1)[0] if "/" in group else "")
+            count = len(rcm.group_members(group))
+            nodes[group] = self.sidebar_store.append(
+                parent, [f"{GLib.markup_escape_text(group.rsplit('/', 1)[-1])}"
+                         f"  <small>({count})</small>", group])
+        self.sidebar.expand_all()
+        problems = len(rcm.config_health())
+        self.setup_badge.set_label(
+            f"⚙ Setup{f'  ({problems}⚠)' if problems else ''}")
+
+    def on_setup(self) -> None:
+        # Interim destination until the Setup page (Phase 5): show the health
+        # list; the real page replaces this method's body.
+        problems = rcm.config_health()
+        body = "\n".join(f"• {w.message}" for w in problems) or "No warnings."
+        self._dialog(Gtk.MessageType.INFO, "Configuration health", body)
+
+    # ---- Spotlight ------------------------------------------------------ #
+    def build_spotlight_layout(self):
+        """Design 6a: the filter is the whole navigation."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_border_width(8)
+        self.filter_entry = Gtk.SearchEntry()
+        self.filter_entry.set_placeholder_text(
+            "matches name · host · group · user")
+        self.filter_entry.set_text(self.query_text)
+        # 15px query text per the design tokens.
+        self.filter_entry.modify_font(Pango.FontDescription("15"))
+        self.filter_entry.connect("search-changed", self.on_filter_changed)
+        box.pack_start(self.filter_entry, False, False, 0)
+
+        chips = Gtk.Box(spacing=6)
+        self.live_chip = Gtk.ToggleButton(label="Live")
+        self.live_chip.connect("toggled", lambda *_: self.reload())
+        chips.pack_start(self.live_chip, False, False, 0)
+        self.proto_chips = {}
+        for proto in protocols_safe().values():
+            chip = Gtk.ToggleButton(label=proto.label)
+            chip.connect("toggled", lambda *_: self.reload())
+            self.proto_chips[proto.id] = chip
+            chips.pack_start(chip, False, False, 0)
+        box.pack_start(chips, False, False, 0)
+        box.pack_start(self.build_connection_list(), True, True, 0)
+        box.pack_start(self.build_connect_button_box(), False, False, 0)
+        return box
+
+    def spotlight_row_allowed(self, c) -> bool:
+        if getattr(self, "live_chip", None) and self.live_chip.get_active():
+            if c.sel not in rcm.active_sels():
+                return False
+        chips = getattr(self, "proto_chips", None) or {}
+        wanted = [pid for pid, chip in chips.items() if chip.get_active()]
+        if wanted and not any(pid in c.protocols for pid in wanted):
+            return False
+        return True
+
+    # ---- Cockpit -------------------------------------------------------- #
+    def build_cockpit_layout(self):
+        """Design 6b: live sessions as the headline strip."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_border_width(8)
+        strip_label = Gtk.Label(xalign=0)
+        strip_label.set_markup("<b>Active</b>")
+        box.pack_start(strip_label, False, False, 0)
+        self.cockpit_cards = Gtk.FlowBox()
+        self.cockpit_cards.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.cockpit_cards.set_max_children_per_line(6)
+        self.cockpit_cards.set_min_children_per_line(2)
+        box.pack_start(self.cockpit_cards, False, False, 0)
+        box.pack_start(Gtk.Separator(), False, False, 0)
+        box.pack_start(self.build_filter_row("filter…"), False, False, 0)
+        box.pack_start(self.build_connection_list(), True, True, 0)
+        box.pack_start(self.build_connect_button_box(), False, False, 0)
+        return box
+
+    def refresh_cockpit_cards(self) -> None:
+        if getattr(self, "cockpit_cards", None) is None:
+            return
+        for child in self.cockpit_cards.get_children():
+            child.destroy()
+        registry = protocols_safe()
+        keys = rcm.session_bindings()
+        sessions = rcm.sessions()
+        if not sessions:
+            empty = Gtk.Label(label="no active sessions")
+            empty.get_style_context().add_class("dim-label")
+            self.cockpit_cards.add(empty)
+        for session in sessions:
+            card = Gtk.Frame()
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            inner.set_border_width(8)
+            head = Gtk.Label(xalign=0)
+            proto = next((p for p in registry.values()
+                          if p.label == session.proto), None)
+            chip = (f'<span background="{resolve_colour(proto.color)}" '
+                    f'foreground="#ffffff"> {GLib.markup_escape_text(session.proto)} '
+                    f'</span>  ') if proto else ""
+            head.set_markup(chip + f"<b>{GLib.markup_escape_text(session.label)}</b>")
+            inner.pack_start(head, False, False, 0)
+            sub = Gtk.Label(xalign=0)
+            key = pretty_key(keys.get(session.label, ""))
+            sub.set_markup(f"<small>{GLib.markup_escape_text(session.host)}"
+                           + (f" · {key}" if key else "") + "</small>")
+            sub.get_style_context().add_class("dim-label")
+            inner.pack_start(sub, False, False, 0)
+            actions = Gtk.Box(spacing=8)
+            focus = Gtk.Button(label="Focus")
+            focus.set_relief(Gtk.ReliefStyle.NONE)
+            focus.connect("clicked",
+                          lambda _b, sess=session: rcm.focus_session(sess))
+            actions.pack_start(focus, False, False, 0)
+            end = Gtk.Button(label="Disconnect")
+            end.set_relief(Gtk.ReliefStyle.NONE)
+            end.get_style_context().add_class("destructive-action")
+            end.connect("clicked",
+                        lambda _b, sess=session: (rcm.kill_session(sess),
+                                                  self.refresh_live()))
+            actions.pack_start(end, False, False, 0)
+            inner.pack_start(actions, False, False, 0)
+            card.add(inner)
+            self.cockpit_cards.add(card)
+        self.cockpit_cards.show_all()
+
+    # ---- Inspector ------------------------------------------------------ #
+    def build_inspector_layout(self):
+        """Design 8b: read-only audit — where each connection's password comes
+        from (its rung on the credential chain), its shortcut, and whether its
+        protocols are healthy. Warnings point at Setup."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_border_width(8)
+        self.inspector_store = Gtk.ListStore(str, str, str, str, str)
+        view = Gtk.TreeView(model=self.inspector_store)
+        for i, (title, minw, expand) in enumerate(
+                (("Connection", 170, True), ("Host", 110, False),
+                 ("Password", 210, False), ("Shortcut", 100, False),
+                 ("Protocol health", 220, False))):
+            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, renderer, markup=i)
+            col.set_resizable(True)
+            col.set_min_width(minw)
+            col.set_expand(expand)
+            view.append_column(col)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(view)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        box.pack_start(scroller, True, True, 0)
+        return box
+
+    def reload_inspector(self) -> None:
+        self.inspector_store.clear()
+        registry = protocols_safe()
+        proto_problems = {w.warning_id: w for w in rcm.config_health()}
+        keys = rcm.session_bindings()
+        warn = '<span foreground="#b5890a">%s</span>'
+        error = '<span foreground="#c04040">%s</span>'
+        ok = '<span foreground="#26a269">%s</span>'
+        for c in rcm.conns_cached():
+            if not self.connection_matches_query(c):
+                continue
+            state, scope = rcm.connection_password_state(c)
+            table = rcm.creds_conf_table()
+            if state == "own":
+                password = ok % "own ✓ (keyring)"
+            elif state == "inherited":
+                user = (table.get(scope, ("", ""))[0] or c.username or "?")
+                password = (f"inherits {GLib.markup_escape_text(scope)} "
+                            f"<small>({GLib.markup_escape_text(user)})</small>")
+            else:
+                password = error % "none — will prompt ⚠"
+            health_bits = []
+            for pid in c.protocols:
+                for wid in (f"exe-missing-{pid}", f"no-detect-{pid}",
+                            f"no-launchers-{pid}"):
+                    if wid in proto_problems:
+                        health_bits.append(warn % GLib.markup_escape_text(
+                            proto_problems[wid].message))
+            health = " · ".join(health_bits) if health_bits else ok % "ok"
+            self.inspector_store.append([
+                GLib.markup_escape_text(c.sel),
+                GLib.markup_escape_text(c.host),
+                password,
+                GLib.markup_escape_text(pretty_key(keys.get(c.sel, ""))) or "—",
+                health])
+
     def rebuild_buttons(self) -> None:
         """Redraw the Connect row from protocols.conf."""
         for child in self.button_box.get_children():
@@ -542,59 +923,116 @@ class Win(Gtk.Window):
 
     def reload(self) -> None:
         rcm.conns_cached(refresh=True)
+        if self.current_layout == "inspector":
+            self.reload_inspector()
+            self.refresh_health()
+            return
+        if self.store is None:
+            return
         keys = rcm.session_bindings()
         ticked = self.checked_sels()
         registry = protocols_safe()
         self.store.clear()
-        nodes: dict[str, Gtk.TreeIter] = {}
 
-        def group_iter(path: str):
-            """Row for a group path, creating each missing level above it."""
-            if not path:
-                return None
-            if path not in nodes:
-                parent = group_iter(path.rsplit("/", 1)[0] if "/" in path else "")
-                # Field order follows the C_* constants, not the visual order.
-                nodes[path] = self.store.append(
-                    parent, [False, "", path.rsplit("/", 1)[-1], "", "", "", "", "",
-                             700, Pango.Style.ITALIC])
-            return nodes[path]
+        def highlight(text: str) -> str:
+            """Escape, and in Spotlight wrap filter matches in the search tint."""
+            escaped = GLib.markup_escape_text(text)
+            needle = self.query_text.strip()
+            if not (self.highlight_matches and needle):
+                return escaped
+            pattern = re.compile(re.escape(GLib.markup_escape_text(needle)),
+                                 re.IGNORECASE)
+            return pattern.sub(
+                lambda m: f'<span background="#f8e45c" foreground="#000000">'
+                          f'{m.group(0)}</span>', escaped)
 
-        for c in rcm.conns_cached():
-            if not self.connection_matches_query(c):
-                continue
-            labels = protocol_badges(c.protocols, registry, c.default_protocol)
-            self.store.append(group_iter(c.group),
-                              [c.sel in ticked, "", c.name, c.host, c.username,
-                               labels, pretty_key(keys.get(c.sel, "")), c.sel,
-                               400, Pango.Style.NORMAL])
-        # Deepest first, so a parent sees its sub-groups already reconciled.
-        for path in sorted(nodes, key=lambda p: p.count("/"), reverse=True):
-            self._sync_group_check(nodes[path])
-        self.tree.expand_all()
-        visible = sum(1 for c in rcm.conns_cached() if self.connection_matches_query(c))
+        def connection_row(c, parent):
+            name_markup = highlight(c.name)
+            state, _scope = rcm.connection_password_state(c)
+            if state == "none":
+                name_markup += ('\n<small><span foreground="#c04040">'
+                                'no password — will prompt</span></small>')
+            self.store.append(parent, [
+                c.sel in ticked, "", name_markup, highlight(c.host),
+                c.username, protocol_badges(c.protocols, registry,
+                                            c.default_protocol),
+                pretty_key(keys.get(c.sel, "")), c.sel, 400, Pango.Style.NORMAL])
+
+        visible = 0
+        if self.flat_list:
+            # Flat list with italic dim heading rows on group changes (Rail,
+            # Spotlight, Cockpit). Headings carry no C_SEL, so selection and
+            # ticking of them is inert by the existing rules.
+            last_group = None
+            for c in rcm.conns_cached():
+                if not self.connection_matches_query(c):
+                    continue
+                if self.current_layout == "spotlight" and \
+                        not self.spotlight_row_allowed(c):
+                    continue
+                if c.group != last_group and c.group:
+                    heading = GLib.markup_escape_text(c.group.replace("/", " / "))
+                    self.store.append(None, [False, "", heading, "", "", "", "",
+                                             "", 400, Pango.Style.ITALIC])
+                    last_group = c.group
+                connection_row(c, None)
+                visible += 1
+        else:
+            nodes: dict[str, Gtk.TreeIter] = {}
+
+            def group_iter(path: str):
+                if not path:
+                    return None
+                if path not in nodes:
+                    parent = group_iter(path.rsplit("/", 1)[0] if "/" in path else "")
+                    nodes[path] = self.store.append(
+                        parent, [False, "", GLib.markup_escape_text(
+                            path.rsplit("/", 1)[-1]), "", "", "", "", "",
+                            700, Pango.Style.ITALIC])
+                return nodes[path]
+
+            for c in rcm.conns_cached():
+                if not self.connection_matches_query(c):
+                    continue
+                connection_row(c, group_iter(c.group))
+                visible += 1
+            for path in sorted(nodes, key=lambda g: g.count("/"), reverse=True):
+                self._sync_group_check(nodes[path])
+            self.tree.expand_all()
+
         total = len(rcm.conns_cached())
-        self.count_lbl.set_text(f"({visible})" if visible == total
-                                else f"({visible} of {total})")
+        if getattr(self, "count_lbl", None):
+            self.count_lbl.set_text(f"({visible})" if visible == total
+                                    else f"({visible} of {total})")
+        if self.current_layout == "spotlight" and self.filter_entry:
+            self.filter_entry.set_tooltip_text(f"{visible} of {total} match")
+        self.refresh_sidebar()
         self.refresh_live()
         self.refresh_health()
 
     def refresh_live(self) -> None:
-        """Repaint the active-session list and the live markers in the tree."""
+        """Repaint everything that shows liveness, on the 4s timer."""
+        if self.current_layout == "inspector":
+            return
+        self.refresh_cockpit_cards()
+        if self.store is None:
+            return
         live = rcm.active_sels()
 
-        smodel, spaths = self.slist.get_selection().get_selected_rows()
-        keep = {smodel[smodel.get_iter(p)][4] for p in spaths}
-        keys = rcm.session_bindings()
-        self.sstore.clear()
-        for s in rcm.sessions():
-            self.sstore.append([s.proto, s.label, s.host,
-                                pretty_key(keys.get(s.label, "")), s.pid, s.window])
-        if keep:
-            sel = self.slist.get_selection()
-            for row in self.sstore:
-                if row[4] in keep:
-                    sel.select_path(self.sstore.get_path(row.iter))
+        if self.slist is not None:
+            smodel, spaths = self.slist.get_selection().get_selected_rows()
+            keep = {smodel[smodel.get_iter(p)][4] for p in spaths}
+            keys = rcm.session_bindings()
+            self.sstore.clear()
+            for s in rcm.sessions():
+                self.sstore.append([s.proto, s.label, s.host,
+                                    pretty_key(keys.get(s.label, "")), s.pid,
+                                    s.window])
+            if keep:
+                sel = self.slist.get_selection()
+                for row in self.sstore:
+                    if row[4] in keep:
+                        sel.select_path(self.sstore.get_path(row.iter))
 
         def paint(it) -> bool:
             any_live = False
