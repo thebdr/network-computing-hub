@@ -26,14 +26,16 @@ Linux/X11 (developed on Cinnamon). A Windows port is planned — see [Roadmap](#
 
 ## Install
 
-Requirements: Python 3.11+, PyGObject (GTK 3), `xdotool`, `rofi` is *not* required.
-Optional: `psutil`, and whichever clients you want to launch.
+Requirements: Python 3.11+, PyGObject (GTK 3) and `xdotool`. Plus whichever clients
+you want it to launch — none are required to install.
 
 ```bash
-git clone <your-fork> ~/RemoteConnections
-cd ~/RemoteConnections
+sudo apt install python3-gi gir1.2-gtk-3.0 xdotool
+
+git clone https://github.com/thebdr/network-computing-hub.git ~/network-computing-hub
+cd ~/network-computing-hub
 ./bin/rcm init          # writes launchers.conf, creds.conf, shortcuts.conf
-ln -s ~/RemoteConnections/bin/rcm ~/bin/rcm
+mkdir -p ~/bin && ln -s ~/network-computing-hub/bin/rcm ~/bin/rcm
 ```
 
 Open the manager once (`rcm gui`) and it will create any missing config for you.
