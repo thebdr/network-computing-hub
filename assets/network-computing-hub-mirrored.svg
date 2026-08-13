@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <title>Network Computing Hub (mirrored)</title>
+  <!-- Mirror of the main icon: hub on the left, machines fanning right. The
+       composition is flipped by coordinates, not by transform, so the >_
+       prompts still read left to right. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a424b"/>
+      <stop offset="1" stop-color="#242a30"/>
+    </linearGradient>
+    <linearGradient id="hub" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#c9d1d9"/>
+    </linearGradient>
+    <g id="prompt" stroke="#ffffff" stroke-width="2.6" fill="none"
+       stroke-linecap="round" stroke-linejoin="round" opacity="0.92">
+      <polyline points="9.5,8.5 15,12.9 9.5,17.3"/>
+      <line x1="18" y1="17.8" x2="26" y2="17.8"/>
+    </g>
+  </defs>
+
+  <rect x="6" y="6" width="116" height="116" rx="26" fill="url(#bg)"/>
+
+  <g stroke="#8b949e" stroke-width="6" stroke-linecap="round">
+    <line x1="37" y1="64" x2="99" y2="25"/>
+    <line x1="37" y1="64" x2="103" y2="73"/>
+    <line x1="37" y1="64" x2="81" y2="107"/>
+  </g>
+
+  <g>
+    <rect x="82" y="12" width="34" height="26" rx="5.5" fill="#4e9a25"/>
+    <use href="#prompt" x="82" y="12"/>
+
+    <rect x="86" y="60" width="34" height="26" rx="5.5" fill="#d97a1f"/>
+    <use href="#prompt" x="86" y="60"/>
+
+    <rect x="64" y="94" width="34" height="26" rx="5.5" fill="#2b6cb0"/>
+    <use href="#prompt" x="64" y="94"/>
+  </g>
+
+  <polygon points="12,64 24.5,42.35 49.5,42.35 62,64 49.5,85.65 24.5,85.65"
+           fill="url(#hub)"/>
+  <polygon points="27,64 32,55.34 42,55.34 47,64 42,72.66 32,72.66" fill="#2b3138"/>
+</svg>
