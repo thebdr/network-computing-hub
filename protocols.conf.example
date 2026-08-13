@@ -91,3 +91,23 @@ phonebook =
 # inject.window_title = Password
 # inject.wait = 20
 # inject.steps = type:{password} | key:Return
+
+# Proof that protocols are only config: ssh and web need nothing from the code.
+[protocol:ssh]
+label = SSH
+color = #613583
+order = 50
+port = 22
+default = Terminal
+launcher.Terminal = gnome-terminal -- ssh {user}@{host} -p {port}
+detect.process = (^|/)ssh\s+.*@
+
+[protocol:web]
+label = Web
+color = #5a6470
+order = 60
+port = 443
+default = Browser
+launcher.Browser = xdg-open https://{host}:{port}/
+# Deliberately unmatchable: a browser tab is not ours to track as a session.
+detect.process = ^$

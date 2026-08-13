@@ -46,69 +46,132 @@ WATCHED = (Gdk.ModifierType.MOD1_MASK,      # Alt
            Gdk.ModifierType.CONTROL_MASK)
 
 CSS = b"""
-window.rcm-switch { background-color: rgba(28,28,30,0.97); }
+window.rcm-switch { background-color: rgba(28,28,30,0.97); border-radius: 10px; }
 .rcm-switch-title { color: #9aa0a6; font-size: 90%; }
-.rcm-row { color: #e8eaed; padding: 6px 10px; }
-.rcm-row-sel { background-color: #2b6cb0; color: #ffffff; }
-.rcm-proto { color: #9aa0a6; }
-.rcm-empty { color: #9aa0a6; padding: 10px; }
+.rcm-card { background-color: #2a2a2e; border: 1px solid #46464c;
+            border-radius: 6px; padding: 8px 10px; }
+.rcm-card-selected { background-color: #2b6cb0; border-color: #d7e3f2; }
+.rcm-card-dashed { border-style: dashed; }
+.rcm-card-name { color: #ffffff; }
+.rcm-dim { color: #9aa0a6; }
+.rcm-key { color: #8fd6b4; }
 """
 
 
 class Switcher(Gtk.Window):
-    def __init__(self, sessions: list[rcm.Session], start: int = 1):
+    """Design 5c: every session and every shortcut-bound target, as cards.
+
+    The grid always shows everything — live sessions as solid cards, non-live
+    connections that have a keyboard shortcut as dashed ~62%-opacity cards
+    labelled "not running — connects". No overflow row: the grid grows.
+    Committing a dashed card launches it via rcm.goto(); a solid one focuses.
+    """
+
+    COLUMNS = 3
+
+    def __init__(self, entries: list, start: int = 1):
         super().__init__(type=Gtk.WindowType.POPUP)
         self.get_style_context().add_class("rcm-switch")
         self.set_position(Gtk.WindowPosition.CENTER_ALWAYS)
         self.set_keep_above(True)
-        self.sessions = sessions
-        self.index = start % len(sessions) if sessions else 0
-        self.rows: list[Gtk.Box] = []
+        self.entries = entries      # ("live", Session) | ("target", sel, key)
+        self.index = start % len(entries) if entries else 0
+        self.cards: list[Gtk.Widget] = []
         self.done = False
+        self.held = Gdk.ModifierType(0)
 
-        frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-        frame.set_border_width(10)
+        frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        frame.set_border_width(12)
         self.add(frame)
 
-        title = Gtk.Label(xalign=0, label="Active sessions")
+        live_count = sum(1 for e in self.entries if e[0] == "live")
+        title_row = Gtk.Box(spacing=20)
+        title = Gtk.Label(xalign=0)
+        title.set_markup(f"Sessions — {live_count} live · "
+                         f"{len(self.entries)} targets")
         title.get_style_context().add_class("rcm-switch-title")
-        frame.pack_start(title, False, False, 0)
+        title_row.pack_start(title, True, True, 0)
+        release = Gtk.Label(label="release Super to switch")
+        release.get_style_context().add_class("rcm-switch-title")
+        title_row.pack_end(release, False, False, 0)
+        frame.pack_start(title_row, False, False, 0)
 
-        if not sessions:
-            empty = Gtk.Label(label="No active sessions")
-            empty.get_style_context().add_class("rcm-empty")
-            frame.pack_start(empty, False, False, 0)
-        for s in sessions:
-            row = Gtk.Box(spacing=10)
-            row.get_style_context().add_class("rcm-row")
-            proto = Gtk.Label(label=s.proto, xalign=0, width_chars=7)
-            proto.get_style_context().add_class("rcm-proto")
-            row.pack_start(proto, False, False, 0)
-            lab = Gtk.Label(label=s.label, xalign=0, width_chars=16)
-            lab.set_ellipsize(Pango.EllipsizeMode.END)
-            row.pack_start(lab, False, False, 0)
-            host = Gtk.Label(label=s.host, xalign=0)
-            host.get_style_context().add_class("rcm-proto")
-            row.pack_start(host, False, False, 0)
-            frame.pack_start(row, False, False, 0)
-            self.rows.append(row)
+        try:
+            registry = rcm.load_protocols()
+        except Exception:
+            registry = {}
+        by_label = {p.label: p for p in registry.values()}
+
+        grid = Gtk.Grid(row_spacing=8, column_spacing=8)
+        frame.pack_start(grid, True, True, 0)
+        for position, entry in enumerate(self.entries):
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            card.get_style_context().add_class("rcm-card")
+            head = Gtk.Label(xalign=0)
+            body = Gtk.Label(xalign=0)
+            key_label = Gtk.Label(xalign=0)
+            if entry[0] == "live":
+                session = entry[1]
+                proto = by_label.get(session.proto)
+                colour = proto.color if proto and proto.color.startswith("#") \
+                    else "#5a6470"
+                head.set_markup(
+                    f'<span background="{colour}" foreground="#ffffff"> '
+                    f'{GLib.markup_escape_text(session.proto)} </span>  '
+                    f'<b>{GLib.markup_escape_text(session.label)}</b>')
+                head.get_style_context().add_class("rcm-card-name")
+                body.set_markup(GLib.markup_escape_text(session.host))
+                body.get_style_context().add_class("rcm-dim")
+                key = rcm.session_bindings().get(session.label, "")
+                key_label.set_text(pretty_binding(key))
+            else:
+                _kind, sel, key = entry
+                connection = rcm.find(sel)
+                pid = connection.default_protocol if connection else ""
+                proto = registry.get(pid)
+                colour = proto.color if proto and proto.color.startswith("#") \
+                    else "#5a6470"
+                label = proto.label if proto else pid or "?"
+                card.get_style_context().add_class("rcm-card-dashed")
+                card.set_opacity(0.62)
+                head.set_markup(
+                    f'<span background="{colour}" foreground="#ffffff"> '
+                    f'{GLib.markup_escape_text(label)} </span>  '
+                    f'<b>{GLib.markup_escape_text(sel)}</b>')
+                body.set_markup("not running — connects")
+                body.get_style_context().add_class("rcm-dim")
+                key_label.set_text(pretty_binding(key))
+            key_label.get_style_context().add_class("rcm-key")
+            card.pack_start(head, False, False, 0)
+            card.pack_start(body, False, False, 0)
+            card.pack_start(key_label, False, False, 0)
+            grid.attach(card, position % self.COLUMNS,
+                        position // self.COLUMNS, 1, 1)
+            self.cards.append(card)
+
+        footer = Gtk.Label(xalign=0)
+        footer.set_markup("W next · Q prev · Enter switch · Esc cancel")
+        footer.get_style_context().add_class("rcm-switch-title")
+        frame.pack_start(footer, False, False, 0)
 
         self.connect("key-press-event", self.on_key)
         self.connect("key-release-event", self.on_release)
-        self.held = Gdk.ModifierType(0)
 
     # ---- selection ---------------------------------------------------------- #
     def paint(self) -> None:
-        for i, row in enumerate(self.rows):
-            ctx = row.get_style_context()
-            if i == self.index:
-                ctx.add_class("rcm-row-sel")
+        for position, card in enumerate(self.cards):
+            ctx = card.get_style_context()
+            if position == self.index:
+                ctx.add_class("rcm-card-selected")
+                card.set_opacity(1.0)
             else:
-                ctx.remove_class("rcm-row-sel")
+                ctx.remove_class("rcm-card-selected")
+                if self.entries[position][0] == "target":
+                    card.set_opacity(0.62)
 
     def step(self, delta: int) -> None:
-        if self.rows:
-            self.index = (self.index + delta) % len(self.rows)
+        if self.cards:
+            self.index = (self.index + delta) % len(self.cards)
             self.paint()
 
     # ---- input -------------------------------------------------------------- #
@@ -119,8 +182,8 @@ class Switcher(Gtk.Window):
             self.finish(commit=False)
         elif key in ("Return", "KP_Enter", "space"):
             self.finish(commit=True)
-        # w/q are the bound keys: we hold the grab, so Cinnamon never sees the
-        # repeat press and we have to advance on them ourselves.
+        # w/q are the bound keys: while our grab holds, Cinnamon never sees the
+        # repeat press and we advance on them ourselves.
         elif key in ("q", "Q", "Up", "Left", "ISO_Left_Tab"):
             self.step(-1)
         elif key in ("w", "W", "Tab", "Down", "Right", "grave", "quoteleft"):
@@ -160,11 +223,24 @@ class Switcher(Gtk.Window):
         seat = Gdk.Display.get_default().get_default_seat()
         if seat:
             seat.ungrab()
-        target = self.sessions[self.index] if (commit and self.sessions) else None
+        chosen = self.entries[self.index] if (commit and self.entries) else None
         self.hide()
-        if target:
-            rcm.focus_session(target)
+        if chosen:
+            if chosen[0] == "live":
+                rcm.focus_session(chosen[1])
+            else:
+                rcm.goto(chosen[1])
         Gtk.main_quit()
+
+
+def pretty_binding(binding: str) -> str:
+    """'<Super><Alt>1' -> 'Super+Alt+1' for the card corner."""
+    import re as _re
+    if not binding:
+        return ""
+    mods = _re.findall(r"<([^>]+)>", binding)
+    key = _re.sub(r"<[^>]+>", "", binding)
+    return "+".join(mods + [key])
 
 
 def held_modifiers() -> Gdk.ModifierType:
@@ -189,20 +265,25 @@ def run(delta: int = 1) -> int:
         Gtk.StyleContext.add_provider_for_screen(
             screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-    # Only windowed sessions can be focused; including the rest would let the
-    # selection park on an entry it can never move off.
+    # Live sessions with windows, then every shortcut-bound connection that is
+    # not already among them: the design's "every session and every target".
     sessions = [s for s in rcm.sessions() if s.window]
-    if not sessions:
-        rcm.notify("No active sessions")
+    live_labels = {s.label for s in sessions}
+    entries: list = [("live", s) for s in sessions]
+    for sel, binding in rcm.session_bindings().items():
+        if sel not in live_labels and rcm.find(sel):
+            entries.append(("target", sel, binding))
+    if not entries:
+        rcm.notify("No sessions and no shortcut-bound targets")
         return 0
 
     held = held_modifiers()
-    if not held or len(sessions) == 1:
+    if not held or len(entries) == 1:
         # Nothing held means a terminal or a script: no popup, just switch.
         print(rcm.step_session(delta))
         return 0
 
-    w = Switcher(sessions, start=delta)
+    w = Switcher(entries, start=delta)
     w.held = held
     w.show_all()
     w.paint()

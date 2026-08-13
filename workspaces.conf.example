@@ -1,0 +1,8 @@
+# Workspaces: named sets of connections opened together.
+#
+#   [workspace:<name>]
+#   member.1 = <group/name>|<protocol>|<monitor>
+#
+# protocol and monitor are optional; blank means the connection's default and
+# no placement. Connect one with `rcm workspace <name>`, or give it a keyboard
+# shortcut under [sessions] in shortcuts.conf as `workspace:<name> = <combo>`.

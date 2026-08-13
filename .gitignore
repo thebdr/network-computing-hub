@@ -7,6 +7,8 @@ creds.conf
 protocols.conf
 launchers.conf
 shortcuts.conf
+ui.conf
+workspaces.conf
 
 # Generated output
 export/
@@ -21,3 +23,5 @@ __pycache__/
 *.swp
 *~
 .DS_Store
+logs/
+help/

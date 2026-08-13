@@ -36,6 +36,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+# This script has no .py suffix, so sibling modules need the directory on the
+# path; rcm_gui/rcm_switch are imported the same way further down.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from rcm_help import HELP_TOPICS, help_topic, register_topic  # noqa: E402
+
 APP = Path(__file__).resolve().parent.parent
 RDP_DIR = APP / "RDP"
 TEMPLATE = APP / "templates" / "default.rdp"
@@ -44,6 +49,17 @@ CREDS = APP / "creds.conf"
 PROTOCOLS_FILE = APP / "protocols.conf"
 LEGACY_LAUNCHERS = APP / "protocols.conf"
 SHORTCUTS = APP / "shortcuts.conf"
+UI_CONF = APP / "ui.conf"
+WORKSPACES_CONF = APP / "workspaces.conf"
+LOGS_DIR = APP / "logs"
+
+# Window layouts a user can switch between. Browse absorbed the three flat
+# variants of the original design (rail / spotlight / cockpit): they were one
+# layout differing only in sidebar, filter emphasis and where live sessions
+# rendered, so those became toggles inside Browse instead of modes beside it.
+LAYOUTS = ("browse", "inspector", "classic")
+LEGACY_LAYOUT_NAMES = {"rail": "browse", "spotlight": "browse",
+                       "cockpit": "browse"}
 LEGACY_CREDS = Path.home() / ".config" / "radmin" / "creds.conf"
 
 DESKTOP_FILE = Path.home() / ".local/share/applications/rdp-menu.desktop"
@@ -76,6 +92,16 @@ class Conn:
             return known
         want = [p.strip().lower() for p in raw.split(",") if p.strip()]
         return tuple(p for p in known if p in want) or known
+
+    @property
+    def tags(self) -> tuple[str, ...]:
+        """Free labels orthogonal to groups, stored as rcm-tags in the .rdp.
+
+        The same host may legitimately exist twice on different LANs, so tags
+        never deduplicate; they only filter.
+        """
+        raw = (self.extra.get("rcm-tags") or "").strip()
+        return tuple(t.strip() for t in raw.split(",") if t.strip())
 
     @property
     def default_protocol(self) -> str:
@@ -189,31 +215,31 @@ def creds_path() -> Path | None:
 # Passwords live in the login keyring (libsecret), encrypted at rest and unlocked
 # with the session. creds.conf keeps only "key|username" -- no secret material.
 # A third field there is still honoured so pre-keyring files keep working.
-_SECRET = None
+_KEYRING_BACKEND = None
 
 
-def _secret():
-    global _SECRET
-    if _SECRET is None:
+def keyring_backend():
+    global _KEYRING_BACKEND
+    if _KEYRING_BACKEND is None:
         try:
             import gi
             gi.require_version("Secret", "1")
             from gi.repository import Secret
-            _SECRET = (Secret, Secret.Schema.new(
+            _KEYRING_BACKEND = (Secret, Secret.Schema.new(
                 "org.hyper.rcm", Secret.SchemaFlags.NONE,
                 {"app": Secret.SchemaAttributeType.STRING,
                  "key": Secret.SchemaAttributeType.STRING}))
         except Exception:
-            _SECRET = (None, None)
-    return _SECRET
+            _KEYRING_BACKEND = (None, None)
+    return _KEYRING_BACKEND
 
 
 def keyring_available() -> bool:
-    return _secret()[0] is not None
+    return keyring_backend()[0] is not None
 
 
 def secret_get(key: str) -> str:
-    Secret, schema = _secret()
+    Secret, schema = keyring_backend()
     if not Secret:
         return ""
     try:
@@ -223,7 +249,7 @@ def secret_get(key: str) -> str:
 
 
 def secret_set(key: str, password: str) -> bool:
-    Secret, schema = _secret()
+    Secret, schema = keyring_backend()
     if not Secret:
         return False
     return bool(Secret.password_store_sync(
@@ -232,7 +258,7 @@ def secret_set(key: str, password: str) -> bool:
 
 
 def secret_clear(key: str) -> bool:
-    Secret, schema = _secret()
+    Secret, schema = keyring_backend()
     if not Secret:
         return False
     try:
@@ -241,7 +267,7 @@ def secret_clear(key: str) -> bool:
         return False
 
 
-def _creds_table() -> dict[str, tuple[str, str]]:
+def creds_conf_table() -> dict[str, tuple[str, str]]:
     """key -> (username, legacy_plaintext_password_or_empty)."""
     p = creds_path()
     table: dict[str, tuple[str, str]] = {}
@@ -258,9 +284,12 @@ def _creds_table() -> dict[str, tuple[str, str]]:
 
 
 def creds_keys() -> list[str]:
-    return sorted(_creds_table())
+    return sorted(creds_conf_table())
 
 
+@help_topic("credential-chain", "How passwords are resolved",
+            ("credentials", "keyring", "default", "precedence"),
+            section="Credentials")
 def creds_chain(sel: str, proto: str = "") -> list[str]:
     """Credential keys to try, most specific first.
 
@@ -286,7 +315,7 @@ def creds_chain(sel: str, proto: str = "") -> list[str]:
 
 def creds_lookup(sel: str, fallback_user: str = "", proto: str = "") -> tuple[str, str]:
     """(username, password) for a connection, optionally for one protocol."""
-    table = _creds_table()
+    table = creds_conf_table()
     user, pw = fallback_user, ""
     for key in creds_chain(sel, proto):
         secret = secret_get(key)
@@ -307,7 +336,7 @@ def creds_scopes() -> list[str]:
     show up in the editor next to the generic entry they refine.
     """
     base = ["DEFAULT"] + groups()
-    extra = {k for k in _creds_table() if k not in base}
+    extra = {k for k in creds_conf_table() if k not in base}
     extra |= {c.sel for c in conns_cached() if secret_get(c.sel)}
     for scope in list(base):
         for proto in protocol_ids():
@@ -323,7 +352,7 @@ def secret_keys_known() -> list[str]:
 
 def creds_status(key: str) -> tuple[str, bool, bool]:
     """(username, password_in_keyring, password_plaintext_in_file) for one scope."""
-    entry = _creds_table().get(key, ("", ""))
+    entry = creds_conf_table().get(key, ("", ""))
     return entry[0], bool(secret_get(key)), bool(entry[1])
 
 
@@ -443,6 +472,63 @@ def prune_empty_parents(start: Path) -> list[str]:
     return removed
 
 
+@help_topic("rename-regroup", "Renaming and regrouping a connection",
+            ("rename", "move", "group", "edit"), section="Connections")
+def move_connection(c: Conn, new_group: str, new_name: str) -> Conn:
+    """Renaming or regrouping moves the .rdp file — everything follows.
+
+    The connection's identity is its file path, so a rename is a move. The
+    parts that hang off that identity move with it in the same operation: the
+    keyring password entries (the connection's own and any per-protocol ones)
+    are re-stored under the new name, and a keyboard shortcut bound to the old
+    name is rebound. Typing a group that does not exist yet creates it, and a
+    group folder left empty is removed, exactly as on delete.
+    """
+    new_group = new_group.strip().strip("/")
+    new_name = new_name.strip()
+    if not new_name:
+        raise ValueError("a connection needs a name")
+    if re.search(r"[/\\]", new_name) or "\\" in new_group:
+        raise ValueError("'/' belongs in the group, not the name")
+    if (new_group, new_name) == (c.group, c.name):
+        return c
+
+    dest_dir = RDP_DIR / new_group if new_group else RDP_DIR
+    dest = dest_dir / f"{new_name}.rdp"
+    if dest.exists():
+        raise FileExistsError(dest)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    old_sel, old_parent = c.sel, c.path.parent
+    c.path.rename(dest)
+    prune_empty_parents(old_parent)
+
+    new_sel = f"{new_group}/{new_name}" if new_group else new_name
+    # Keyring entries: the connection's own, plus one per protocol.
+    for suffix in ("", *(f"@{pid}" for pid in protocol_ids())):
+        secret = secret_get(old_sel + suffix)
+        if secret:
+            secret_set(new_sel + suffix, secret)
+            secret_clear(old_sel + suffix)
+    # creds.conf username rows keyed to the old name.
+    table = creds_conf_table()
+    for key, (username, _legacy) in list(table.items()):
+        if key == old_sel or key.startswith(old_sel + "@"):
+            creds_delete(key)
+            creds_set_user(key.replace(old_sel, new_sel, 1), username)
+    # A shortcut bound to the old name follows too.
+    global_keys, per_session = load_shortcuts()
+    if old_sel in per_session:
+        per_session[new_sel] = per_session.pop(old_sel)
+        save_shortcuts(global_keys, per_session)
+        shortcuts_install()
+
+    conns_cached(refresh=True)
+    moved = find(new_sel)
+    if moved is None:
+        raise RuntimeError(f"moved {old_sel} but cannot find {new_sel} after rescan")
+    return moved
+
+
 def delete_conn(c: Conn) -> list[str]:
     """Delete a connection. Returns any group folders that emptied out with it."""
     c.path.unlink()
@@ -490,7 +576,7 @@ def set_fields(c: Conn, host: str | None = None, username: str | None = None,
 # --------------------------------------------------------------------------- #
 # launching
 # --------------------------------------------------------------------------- #
-def _spawn(argv: list[str], env: dict | None = None) -> None:
+def spawn_detached(argv: list[str], env: dict | None = None) -> None:
     e = dict(os.environ)
     if env:
         e.update(env)
@@ -582,7 +668,7 @@ def load_protocols() -> dict[str, Protocol]:
         p.color = raw.get("color", "accent")
         p.order = num("order", int, 100)
         p.port = num("port", int, 0)
-        p.exe = _expand(raw.get("exe", ""))
+        p.exe = expand_user_and_vars(raw.get("exe", ""))
         p.default = raw.get("default", "")
         p.detect_process = raw.get("detect.process", "")
         p.detect_window = raw.get("detect.window", "{host}")
@@ -597,10 +683,10 @@ def load_protocols() -> dict[str, Protocol]:
             if k.startswith("launcher."):
                 p.launchers[k[len("launcher."):]] = v
             elif k.startswith("env."):
-                p.env[k[len("env."):]] = _expand(v)
+                p.env[k[len("env."):]] = expand_user_and_vars(v)
             elif k not in ("label", "color", "order", "port", "exe", "default") \
                     and not k.startswith(("detect.", "inject.")):
-                p.extras[k] = _expand(v)
+                p.extras[k] = expand_user_and_vars(v)
         if p.default and p.default not in p.launchers:
             raise ConfigError(f"{PROTOCOLS_FILE} [{section}] default={p.default!r} "
                               "is not one of its launchers")
@@ -725,6 +811,26 @@ phonebook =
 # inject.window_title = Password
 # inject.wait = 20
 # inject.steps = type:{password} | key:Return
+
+# Proof that protocols are only config: ssh and web need nothing from the code.
+[protocol:ssh]
+label = SSH
+color = #613583
+order = 50
+port = 22
+default = Terminal
+launcher.Terminal = gnome-terminal -- ssh {user}@{host} -p {port}
+detect.process = (^|/)ssh\s+.*@
+
+[protocol:web]
+label = Web
+color = #5a6470
+order = 60
+port = 443
+default = Browser
+launcher.Browser = xdg-open https://{host}:{port}/
+# Deliberately unmatchable: a browser tab is not ours to track as a session.
+detect.process = ^$
 """,
     "creds.conf": """\
 # Credentials for rcm. Passwords are NOT stored here -- they live in the OS
@@ -744,6 +850,36 @@ phonebook =
 # Edit here, or in the manager under Credentials...
 
 DEFAULT||
+""",
+    "workspaces.conf": """\
+# Workspaces: named sets of connections opened together.
+#
+#   [workspace:<name>]
+#   member.1 = <group/name>|<protocol>|<monitor>
+#
+# protocol and monitor are optional; blank means the connection's default and
+# no placement. Connect one with `rcm workspace <name>`, or give it a keyboard
+# shortcut under [sessions] in shortcuts.conf as `workspace:<name> = <combo>`.
+""",
+    "ui.conf": """\
+# Manager window state. The GUI writes this; editing it by hand is equally fine.
+
+[ui]
+# Which window layout the manager uses: browse | inspector | classic.
+# The Layout button in the headerbar writes this same key.
+layout = browse
+# Browse only: show the group sidebar. The ⊞ button toggles this.
+sidebar = on
+
+[tabs]
+# Pinned filter tabs, shared by every layout. One per line:
+#   tab.<n> = <label>|<group filter>|<text filter>
+# The "All" tab is built in and not listed here.
+
+[help]
+# Editor used by Help's "Open code" links, e.g. `code --goto {file}:{line}`.
+# Leave empty to auto-detect; Help asks once when nothing is found.
+editor =
 """,
     "shortcuts.conf": """\
 # System-wide keyboard shortcuts.
@@ -788,7 +924,7 @@ def write_default_configs(names: list[str] | None = None) -> list[str]:
     return written
 
 
-def _expand(value: str) -> str:
+def expand_user_and_vars(value: str) -> str:
     return os.path.expandvars(os.path.expanduser(value.strip()))
 
 
@@ -889,14 +1025,14 @@ def migrate_launchers() -> bool:
     if cp.has_section("radmin") and "radmin" in protos:
         r, p = dict(cp.items("radmin")), protos["radmin"]
         if r.get("exe"):
-            p.exe = _expand(r["exe"])
+            p.exe = expand_user_and_vars(r["exe"])
         if r.get("wineprefix"):
-            p.env["WINEPREFIX"] = _expand(r["wineprefix"])
+            p.env["WINEPREFIX"] = expand_user_and_vars(r["wineprefix"])
         p.default = "Native" if not r.get("wine", "").strip() else "Wine"
         if r.get("wine", "").strip():
             p.launchers["Wine"] = f"{r['wine'].strip()} {{exe}} /connect:{{host}}:{{port}}"
         if r.get("phonebook"):
-            p.extras["phonebook"] = _expand(r["phonebook"])
+            p.extras["phonebook"] = expand_user_and_vars(r["phonebook"])
         for src, dst in (("port", "port"), ("dialog_wait", "inject_wait"),
                          ("settle", "inject_settle"), ("type_delay", "inject_delay")):
             if r.get(src):
@@ -922,7 +1058,7 @@ def launcher_names(proto: str) -> list[str]:
         return []
 
 
-def _subst(c: Conn, p: Protocol, password: str = "") -> dict[str, str]:
+def launch_placeholder_values(c: Conn, p: Protocol, password: str = "") -> dict[str, str]:
     return {"file": str(c.path), "host": c.host, "user": c.username,
             "port": str(c.port_for(p)), "name": c.name, "exe": p.exe,
             "password": password}
@@ -935,21 +1071,57 @@ def build_argv(c: Conn, proto: str, launcher: str = "") -> list[str]:
     if not tmpl:
         raise RuntimeError(f"{PROTOCOLS_FILE}: protocol {proto!r} has no launcher"
                            + (f" named {name!r}" if name else ""))
-    vals = _subst(c, p)
+    vals = launch_placeholder_values(c, p)
     # Substitute per token so a path with spaces stays a single argument.
     return [tok.format(**vals) for tok in shlex.split(tmpl)]
 
 
+@help_topic("connecting", "Connecting", ("connect", "launch", "protocol"),
+            section="Connections")
 def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
+    """Connecting hands the connection to the protocol's configured program.
+
+    The Connect buttons use each protocol's default launcher; right-click a
+    row or a chip for the alternatives. A pre hook (rcm-pre) must exit 0
+    first or the launch stops; clients that refuse a password on the command
+    line get it typed into their prompt per the protocol's inject steps; the
+    MAC is learned after launch so ⚡ Wake works later; and every launch is
+    one line in the event log.
+    """
     p = protocol(proto or next(iter(load_protocols())))
     argv = build_argv(c, p.id, launcher)
     if not shutil.which(argv[0]) and not Path(argv[0]).is_file():
         raise RuntimeError(f"{argv[0]} is not installed "
                            f"(launcher {launcher or p.default!r} for {p.label})")
+    # Pre-hook: must exit 0 or the launch stops -- that is the contract that
+    # makes gateway tunnels and mount scripts safe to rely on.
+    pre_command = (c.extra.get("rcm-pre") or "").strip()
+    if pre_command:
+        rendered = pre_command.format(**launch_placeholder_values(c, p))
+        completed = subprocess.run(rendered, shell=True, capture_output=True,
+                                   text=True, timeout=120)
+        log_event("pre-hook", sel=c.sel, command=rendered,
+                  exit_code=completed.returncode)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"pre hook failed (exit {completed.returncode}): "
+                f"{completed.stderr.strip() or rendered}")
     if p.injects:
-        return inject_credentials(c, p, argv)
-    _spawn(argv, env=p.env or None)
-    return f"{p.label} -> {c.sel} ({c.host}) via {Path(argv[0]).name}"
+        result = inject_credentials(c, p, argv)
+    else:
+        spawn_detached(argv, env=p.env or None)
+        result = f"{p.label} -> {c.sel} ({c.host}) via {Path(argv[0]).name}"
+    log_event("launch", sel=c.sel, host=c.host, protocol=p.id,
+              launcher=launcher or p.default)
+    post_command = (c.extra.get("rcm-post") or "").strip()
+    if post_command:
+        spawn_detached(["/bin/sh", "-c",
+                        post_command.format(**launch_placeholder_values(c, p))])
+    # Remember the MAC while the host is surely on: that is what Wake needs later.
+    mac = learn_mac(c.host)
+    if mac and c.extra.get("rcm-mac") != mac:
+        set_connection_extra(c, "rcm-mac", mac)
+    return result
 
 
 def inject_credentials(c: Conn, p: Protocol, argv: list[str]) -> str:
@@ -966,39 +1138,39 @@ def inject_credentials(c: Conn, p: Protocol, argv: list[str]) -> str:
             "credential typing will not work (ydotool is the fallback)")
 
     user, pw = creds_lookup(c.sel, c.username, proto=p.id)
-    win, _ = open_prompt(p, c.host, argv)
+    win, _ = open_credential_prompt(p, c.host, argv)
     if not pw or pw == "CHANGEME":
         return f"prompt open on {c.host}; no password set -- type it manually"
 
-    vals = _subst(c, p, password=pw)
+    vals = launch_placeholder_values(c, p, password=pw)
     vals["user"] = user
     # xdotool type --window uses XSendEvent, which Wine ignores outright.
     # Always activate first, then type to the focused window via XTEST.
-    x("windowactivate", "--sync", win)
+    xdotool("windowactivate", "--sync", win)
     time.sleep(p.inject_settle)
     for op, arg in p.inject_steps:
         if op == "type":
-            x("type", "--delay", str(p.inject_delay), "--", arg.format(**vals))
+            xdotool("type", "--delay", str(p.inject_delay), "--", arg.format(**vals))
         elif op == "key":
-            x("key", arg)
+            xdotool("key", arg)
         elif op == "sleep":
             time.sleep(float(arg or 0))
         elif op == "activate":
-            x("windowactivate", "--sync", win)
+            xdotool("windowactivate", "--sync", win)
         elif op == "clear":
-            x("key", "ctrl+a")
-            x("key", "Delete")
+            xdotool("key", "ctrl+a")
+            xdotool("key", "Delete")
     return f"{p.label} -> {c.sel} ({c.host}) as {user}"
 
 
-def open_prompt(p: Protocol, host: str, argv: list[str]) -> tuple[str, list[str]]:
+def open_credential_prompt(p: Protocol, host: str, argv: list[str]) -> tuple[str, list[str]]:
     """Launch and wait for the credential window. (chosen window, all new)."""
-    before = _windows_of(p)
-    _spawn(argv, env=p.env or None)
+    before = visible_protocol_windows(p)
+    spawn_detached(argv, env=p.env or None)
     deadline = time.time() + p.inject_wait
     new: list[str] = []
     while time.time() < deadline:
-        new = sorted(_windows_of(p) - before)
+        new = sorted(visible_protocol_windows(p) - before)
         if new:
             break
         time.sleep(0.25)
@@ -1007,17 +1179,17 @@ def open_prompt(p: Protocol, host: str, argv: list[str]) -> tuple[str, list[str]
     # Prefer the prompt by title, falling back to the newest window if the
     # wording ever changes.
     for w in new:
-        nm = x("getwindowname", w)
+        nm = xdotool("getwindowname", w)
         if p.inject_title.lower() in nm.lower() and host in nm:
             return w, new
     return new[-1], new
 
 
-def _windows_of(p: Protocol) -> set[str]:
+def visible_protocol_windows(p: Protocol) -> set[str]:
     if p.inject_class:
-        out = x("search", "--onlyvisible", "--class", p.inject_class)
+        out = xdotool("search", "--onlyvisible", "--class", p.inject_class)
     else:
-        out = x("search", "--onlyvisible", "--name", p.inject_title or p.label)
+        out = xdotool("search", "--onlyvisible", "--name", p.inject_title or p.label)
     return {w for w in out.splitlines() if w.strip()}
 
 
@@ -1025,7 +1197,7 @@ def launch_rdp(c: Conn) -> None:
     launch(c, "rdp")
 
 
-def x(*args: str) -> str:
+def xdotool(*args: str) -> str:
     try:
         return subprocess.run(["xdotool", *args], capture_output=True,
                               text=True, timeout=10).stdout.strip()
@@ -1046,7 +1218,7 @@ def capture_window(win: str, dest: Path) -> Path | None:
     except ImportError:
         return None
     geom = {}
-    for line in x("getwindowgeometry", "--shell", win).splitlines():
+    for line in xdotool("getwindowgeometry", "--shell", win).splitlines():
         if "=" in line:
             k, _, v = line.partition("=")
             geom[k.strip()] = v.strip()
@@ -1072,7 +1244,7 @@ def capture_window(win: str, dest: Path) -> Path | None:
         full.unlink(missing_ok=True)
 
 
-def _ps() -> list[tuple[int, str]]:
+def process_command_lines() -> list[tuple[int, str]]:
     out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
                          text=True).stdout
     rows = []
@@ -1104,7 +1276,7 @@ def launcher_exe(p: Protocol, tmpl: str) -> str:
         return ""
 
 
-def _classify(args: str, protos: dict[str, Protocol] | None = None) -> Protocol | None:
+def classify_process_protocol(args: str, protos: dict[str, Protocol] | None = None) -> Protocol | None:
     """Which protocol a command line represents, from each detect.process regex."""
     # A shell invoked with -c carries its whole script in argv, so a command that
     # merely mentions a host or a .rdp path would otherwise register as a session.
@@ -1120,6 +1292,16 @@ def _classify(args: str, protos: dict[str, Protocol] | None = None) -> Protocol 
     return None
 
 
+@dataclass
+class Session:
+    """One live remote session, matched back to a saved connection when possible."""
+    proto: str      # protocol label as configured, e.g. "RDP"
+    label: str      # connection sel, or best-effort name when unmatched
+    host: str
+    pid: int
+    window: str = ""   # X11 window id, empty when none was found
+
+
 def sessions() -> list[Session]:
     """Live sessions from any configured launcher, matched back to connections."""
     out: list[Session] = []
@@ -1131,10 +1313,10 @@ def sessions() -> list[Session]:
     except ConfigError:
         return out
     mine = {os.getpid(), os.getppid()}
-    for pid, args in _ps():
+    for pid, args in process_command_lines():
         if pid in mine:
             continue
-        p = _classify(args, protos)
+        p = classify_process_protocol(args, protos)
         if not p:
             continue
         proto = p.label
@@ -1163,7 +1345,7 @@ def sessions() -> list[Session]:
         win = ""
         if host:
             pattern = (p.detect_window or "{host}").format(host=host, name=label)
-            for w in x("search", "--name", pattern).splitlines():
+            for w in xdotool("search", "--name", pattern).splitlines():
                 if w.strip():
                     win = w.strip()
                     break
@@ -1188,7 +1370,7 @@ def active_sels() -> dict[str, list[str]]:
 
 def focus_session(s: Session) -> bool:
     if s.window:
-        x("windowactivate", "--sync", s.window)
+        xdotool("windowactivate", "--sync", s.window)
         return True
     return False
 
@@ -1318,7 +1500,7 @@ PB_OFF_USER = 5908
 PB_FIELD_CAP = 128  # bytes; conservative, verified against the live file
 
 
-def _pb_layout(raw: bytes) -> tuple[int, int, int]:
+def phonebook_layout(raw: bytes) -> tuple[int, int, int]:
     count = int.from_bytes(raw[0:4], "little")
     stride = int.from_bytes(raw[12:16], "little")
     if not stride or count <= 0:
@@ -1330,7 +1512,7 @@ def _pb_layout(raw: bytes) -> tuple[int, int, int]:
     return header, stride, count
 
 
-def _pb_patch(rec: bytearray, off: int, value: str, marker: str = "") -> None:
+def phonebook_patch_string(rec: bytearray, off: int, value: str, marker: str = "") -> None:
     """Write a UTF-16LE string at off, optionally followed by a packed marker.
 
     Folder records store their type string ("folder") immediately after the name's
@@ -1363,7 +1545,7 @@ def export_phonebook(dest: Path, conns: list[Conn] | None = None,
     if dest.resolve() == src.resolve():
         raise RuntimeError("refusing to overwrite the live phonebook")
     raw = src.read_bytes()
-    header_len, stride, count = _pb_layout(raw)
+    header_len, stride, count = phonebook_layout(raw)
     recs = [raw[header_len + i * stride: header_len + (i + 1) * stride]
             for i in range(count)]
 
@@ -1382,13 +1564,13 @@ def export_phonebook(dest: Path, conns: list[Conn] | None = None,
     for g in sorted({c.group for c in conns if c.group}):
         if folder_tpl is not None:
             fr = bytearray(folder_tpl)
-            _pb_patch(fr, PB_OFF_NAME, g, marker="folder")
+            phonebook_patch_string(fr, PB_OFF_NAME, g, marker="folder")
             out_recs.append(bytes(fr))
     for c in conns:
         r = bytearray(host_tpl)
-        _pb_patch(r, PB_OFF_HOST, c.host)
-        _pb_patch(r, PB_OFF_NAME, c.name)
-        _pb_patch(r, PB_OFF_USER, c.username)
+        phonebook_patch_string(r, PB_OFF_HOST, c.host)
+        phonebook_patch_string(r, PB_OFF_NAME, c.name)
+        phonebook_patch_string(r, PB_OFF_USER, c.username)
         out_recs.append(bytes(r))
 
     head = bytearray(raw[:header_len])
@@ -1396,6 +1578,370 @@ def export_phonebook(dest: Path, conns: list[Conn] | None = None,
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(bytes(head) + b"".join(out_recs))
     return len(out_recs)
+
+
+# --------------------------------------------------------------------------- #
+# help: generated guide + Open-code editor chain
+# --------------------------------------------------------------------------- #
+HELP_DIR = APP / "help"
+EDITOR_CANDIDATES = (
+    ("code", ["code", "--goto", "{file}:{line}"]),
+    ("subl", ["subl", "{file}:{line}"]),
+    ("gedit", ["gedit", "+{line}", "{file}"]),
+    ("kate", ["kate", "-l", "{line}", "{file}"]),
+    ("notepad++", ["notepad++", "-n{line}", "{file}"]),
+)
+
+
+def open_in_editor(file: str, line: int) -> str:
+    """Open a source location in a goto-capable editor. Returns a status.
+
+    The editor chosen in ui.conf wins; otherwise the first known editor on
+    PATH is used and remembered. With none found the caller shows the advice
+    dialog — this function never guesses at a plain text editor by itself.
+    """
+    state = load_ui_state()
+    target = str((APP / file).resolve()) if not Path(file).is_absolute() else file
+    chain = list(EDITOR_CANDIDATES)
+    if state.get("editor"):
+        chain.insert(0, (state["editor"].split()[0],
+                         state["editor"].split() + ["{file}:{line}"]))
+    for name, template in chain:
+        if shutil.which(name):
+            argv = [part.format(file=target, line=line) for part in template]
+            spawn_detached(argv)
+            if not state.get("editor"):
+                state["editor"] = name
+                save_ui_state(state)
+            return f"opened {file}:{line} in {name}"
+    return ""
+
+
+def dump_help_html() -> int:
+    """Write help/*.html from the registry: the offline guide, generated.
+
+    Behaviour text lives only in the source docstrings; this render adds
+    framing, never content. Regenerated whenever the topics change.
+    """
+    import html
+    HELP_DIR.mkdir(parents=True, exist_ok=True)
+    style = ("<style>body{font-family:sans-serif;margin:2em;max-width:46em}"
+             "pre{background:#f4f4f4;padding:1em}a{color:#1a5fb4}"
+             "small{color:#777}</style>")
+    index_lines = [f"<h1>Network Computing Hub — guide</h1>{style}",
+                   "<p><small>generated from the source at launch — the code "
+                   "is the manual</small></p>"]
+    from rcm_help import topics_by_section
+    for section, topics in topics_by_section().items():
+        index_lines.append(f"<h2>{html.escape(section)}</h2><ul>")
+        for topic in topics:
+            index_lines.append(
+                f'<li><a href="{topic.topic_id}.html">'
+                f"{html.escape(topic.title)}</a></li>")
+            body = "".join(f"<p>{html.escape(par)}</p>"
+                           for par in topic.body.split("\n\n"))
+            (HELP_DIR / f"{topic.topic_id}.html").write_text(
+                f"<h1>{html.escape(topic.title)}</h1>{style}{body}"
+                f"<hr><p><small>⌁ the source is the full manual: "
+                f"{html.escape(topic.source_file)}:{topic.source_line} "
+                f"{html.escape(topic.symbol)}()</small></p>"
+                f'<p><a href="index.html">← guide index</a></p>')
+        index_lines.append("</ul>")
+    (HELP_DIR / "index.html").write_text("\n".join(index_lines))
+    return len(HELP_TOPICS)
+
+
+# --------------------------------------------------------------------------- #
+# workspaces: named sets of connections opened together
+# --------------------------------------------------------------------------- #
+@help_topic("workspaces", "Workspaces", ("workspace", "connect all", "sets"),
+            section="Connections")
+def load_workspaces() -> dict[str, list[dict]]:
+    """A workspace opens a named set of connections in one go.
+
+    workspaces.conf holds one [workspace:<name>] section per set; each member
+    line is `member.<n> = <sel>|<protocol>|<monitor>` (protocol and monitor
+    optional). Connecting a workspace walks its members with the usual launch
+    stagger; members that are already live are focused, never relaunched. A
+    workspace can carry its own keyboard shortcut like any connection.
+    """
+    if not WORKSPACES_CONF.is_file():
+        return {}
+    parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
+    parser.optionxform = str
+    parser.read(WORKSPACES_CONF)
+    out: dict[str, list[dict]] = {}
+    for section in parser.sections():
+        if not section.startswith("workspace:"):
+            continue
+        name = section.split(":", 1)[1].strip()
+        members = []
+        for _key, raw in sorted(parser.items(section)):
+            if not _key.startswith("member"):
+                continue
+            parts = (raw.split("|") + ["", ""])[:3]
+            if parts[0].strip():
+                members.append({"sel": parts[0].strip(),
+                                "protocol": parts[1].strip(),
+                                "monitor": parts[2].strip()})
+        out[name] = members
+    return out
+
+
+def connect_workspace(name: str) -> list[str]:
+    """Open every member; focus the ones already live. Returns status lines."""
+    members = load_workspaces().get(name)
+    if members is None:
+        raise ConfigError(f"{WORKSPACES_CONF}: no [workspace:{name}] section")
+    live = active_sels()
+    lines = []
+    for position, member in enumerate(members):
+        c = find(member["sel"])
+        if not c:
+            lines.append(f"{member['sel']}: not found")
+            continue
+        if member["sel"] in live:
+            for session in sessions():
+                if session.label == member["sel"] and session.window:
+                    focus_session(session)
+                    break
+            lines.append(f"{member['sel']}: already live — focused")
+            continue
+        if position:
+            time.sleep(2)
+        try:
+            lines.append(launch(c, member["protocol"] or c.default_protocol))
+        except (RuntimeError, ConfigError) as problem:
+            lines.append(f"{member['sel']}: {problem}")
+    log_event("workspace", name=name, members=len(members))
+    return lines
+
+
+# --------------------------------------------------------------------------- #
+# event log: one JSONL line per user-visible event
+# --------------------------------------------------------------------------- #
+@help_topic("logging", "The event log", ("logs", "jsonl", "history"),
+            section="Logs")
+def log_event(kind: str, **fields) -> None:
+    """Everything notable appends one JSON line to logs/YYYY-MM-DD.jsonl.
+
+    Session launches and ends (with duration), script runs (with exit codes),
+    probe transitions, Wake-on-LAN sends and credential changes all land in
+    the same daily file — plain JSONL, one object per line, rotated by name.
+    The Logs page reads these; `rcm history <sel>` filters to one connection.
+    """
+    import json
+    from datetime import datetime, timezone
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc)
+    record = {"ts": stamp.isoformat(timespec="seconds"), "kind": kind, **fields}
+    day_file = LOGS_DIR / f"{stamp:%Y-%m-%d}.jsonl"
+    with day_file.open("a") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def read_log_events(days: int = 7, kind: str = "", sel: str = "") -> list[dict]:
+    """Newest-first events from the last N daily files, optionally filtered."""
+    import json
+    from datetime import datetime, timedelta, timezone
+    events: list[dict] = []
+    today = datetime.now(timezone.utc).date()
+    for offset in range(days):
+        day_file = LOGS_DIR / f"{today - timedelta(days=offset):%Y-%m-%d}.jsonl"
+        if not day_file.is_file():
+            continue
+        for line in day_file.read_text().splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if kind and record.get("kind") != kind:
+                continue
+            if sel and record.get("sel") != sel:
+                continue
+            events.append(record)
+    events.reverse()
+    return events
+
+
+# --------------------------------------------------------------------------- #
+# online probe + Wake-on-LAN
+# --------------------------------------------------------------------------- #
+def probe_host(host: str, port: int, timeout: float = 1.0) -> bool:
+    """One TCP connect, the whole probe. Serial by design: the caller runs ONE
+    of these at a time so 500 hosts never means 500 sockets."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def learn_mac(host: str) -> str:
+    """The MAC from the ARP table after a successful connect, else ''."""
+    neigh = subprocess.run(["ip", "neigh", "show", host],
+                           capture_output=True, text=True).stdout
+    match = re.search(r"lladdr\s+([0-9a-f:]{17})", neigh)
+    return match.group(1) if match else ""
+
+
+@help_topic("wake-on-lan", "Wake-on-LAN", ("wol", "wake", "magic packet", "mac"),
+            section="Connections")
+def wake(mac: str, host: str = "", port: int = 9) -> None:
+    """An offline machine with a known MAC can be woken from its row.
+
+    The MAC is learned automatically from the ARP table on a successful
+    connect and stored as `rcm-mac` in the .rdp. Waking sends the standard
+    magic packet — 6×FF then the MAC sixteen times — as a UDP broadcast on
+    port 9; no dependency, raw sockets suffice.
+    """
+    import socket
+    raw = bytes.fromhex(mac.replace(":", "").replace("-", ""))
+    if len(raw) != 6:
+        raise ValueError(f"not a MAC address: {mac!r}")
+    packet = b"\xff" * 6 + raw * 16
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.sendto(packet, ("255.255.255.255", port))
+    log_event("wake", mac=mac, host=host)
+
+
+def set_connection_extra(c: Conn, key: str, value: str) -> None:
+    """Upsert one rcm-* key in a connection's .rdp file."""
+    lines = c.path.read_text().splitlines()
+    prefix = f"{key}:s:"
+    lines = [line for line in lines if not line.startswith(prefix)]
+    if value:
+        lines.append(f"{prefix}{value}")
+    c.path.write_text("\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# UI state (layout + pinned tabs) and config health
+# --------------------------------------------------------------------------- #
+@help_topic("layouts", "Window layouts", ("rail", "spotlight", "cockpit",
+            "inspector", "classic", "layout menu"), section="The window")
+def load_ui_state() -> dict:
+    """The manager offers three window layouts.
+
+    Browse (the default) is the everyday view: a filter-first flat list with a
+    collapsible group sidebar, and live sessions appearing as a card strip only
+    while any exist. Inspector is a read-only audit of credentials and
+    configuration health. Classic is the original window, kept for continuity.
+
+    The choice is saved as `layout =` in ui.conf and survives restarts, as do
+    the pinned filter tabs and the sidebar toggle, shared by every layout.
+    Older files naming rail, spotlight or cockpit are read as Browse.
+    """
+    state = {"layout": "browse", "tabs": [], "editor": "", "sidebar": True}
+    if not UI_CONF.is_file():
+        return state
+    parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
+    parser.optionxform = str
+    parser.read(UI_CONF)
+    layout = parser.get("ui", "layout", fallback="browse").strip().lower()
+    layout = LEGACY_LAYOUT_NAMES.get(layout, layout)
+    state["layout"] = layout if layout in LAYOUTS else "browse"
+    state["sidebar"] = parser.getboolean("ui", "sidebar", fallback=True)
+    if parser.has_section("tabs"):
+        for _key, raw in sorted(parser.items("tabs")):
+            parts = (raw.split("|") + ["", "", ""])[:3]
+            if parts[0].strip():
+                state["tabs"].append(tuple(part.strip() for part in parts))
+    state["editor"] = parser.get("help", "editor", fallback="").strip()
+    return state
+
+
+def save_ui_state(state: dict) -> None:
+    """Rewrite ui.conf. Header comments come from the documented default."""
+    header, _, _ = DEFAULT_CONFIGS["ui.conf"].partition("[ui]")
+    lines = [header.rstrip("\n"), "", "[ui]",
+             f"layout = {state.get('layout', 'browse')}",
+             f"sidebar = {'on' if state.get('sidebar', True) else 'off'}",
+             "", "[tabs]"]
+    for index, (label, group, text) in enumerate(state.get("tabs", []), start=1):
+        lines.append(f"tab.{index} = {label}|{group}|{text}")
+    lines += ["", "[help]", f"editor = {state.get('editor', '')}"]
+    UI_CONF.write_text("\n".join(lines) + "\n")
+
+
+@dataclass
+class HealthWarning:
+    """One actionable configuration problem, shown wherever health surfaces."""
+    warning_id: str
+    message: str          # human sentence, ready for the status bar
+    setup_section: str    # which Setup card fixes it: protocols|credentials|shortcuts
+    severity: str = "warning"   # "warning" | "error"
+
+
+def connection_password_state(c: Conn, proto: str = "") -> tuple[str, str]:
+    """Where a connection's password would come from: its credential fate.
+
+    Returns (state, scope): state is "own" (a keyring entry for exactly this
+    connection), "inherited" (found further up the chain — scope names the rung,
+    e.g. "Plant" or "DEFAULT"), or "none" (nothing anywhere: connecting will
+    prompt inside the client).
+    """
+    table = creds_conf_table()
+    for key in creds_chain(c.sel, proto):
+        entry = table.get(key)
+        if secret_get(key) or (entry and entry[1] and entry[1] != "CHANGEME"):
+            scope = key.split("@")[0]
+            return ("own" if scope == c.sel else "inherited"), key
+    return "none", ""
+
+
+@help_topic("config-health", "Configuration health", ("warnings", "setup badge",
+            "status bar", "broken config"), section="Setup")
+def config_health() -> list[HealthWarning]:
+    """Broken or incomplete configuration warns — it never blocks the window.
+
+    Problems surface in four places, all fed by this one check: the status bar
+    at the bottom of the manager, the badge on the Setup entry, the Inspector
+    layout's per-row columns, and warning banners on the Setup page itself.
+
+    Checked: protocols.conf parses; each protocol's exe exists when set; each
+    protocol can detect its sessions (detect.process); a DEFAULT credential
+    exists so unmatched connections have a password; and how many connections
+    would prompt because nothing on their credential chain has one.
+    """
+    warnings: list[HealthWarning] = []
+    try:
+        registry = load_protocols()
+    except ConfigError as broken:
+        return [HealthWarning("protocols-broken", str(broken), "protocols", "error")]
+
+    for proto in registry.values():
+        if proto.exe and not Path(proto.exe).is_file():
+            warnings.append(HealthWarning(
+                f"exe-missing-{proto.id}",
+                f"{proto.id}: exe not found — {proto.exe}", "protocols"))
+        if not proto.detect_process:
+            warnings.append(HealthWarning(
+                f"no-detect-{proto.id}",
+                f"{proto.id}: no detect.process — its sessions won't be seen",
+                "protocols"))
+        if not proto.launchers:
+            warnings.append(HealthWarning(
+                f"no-launchers-{proto.id}",
+                f"{proto.id}: no launcher commands configured", "protocols"))
+
+    default_entry = creds_conf_table().get("DEFAULT")
+    if not (secret_get("DEFAULT") or (default_entry and default_entry[1])):
+        warnings.append(HealthWarning(
+            "no-default-credential",
+            "creds.conf: no DEFAULT entry — connections without a group password "
+            "will prompt every time", "credentials"))
+
+    unresolved = [c.sel for c in conns_cached()
+                  if connection_password_state(c)[0] == "none"]
+    if unresolved and len(unresolved) < len(conns_cached()):
+        warnings.append(HealthWarning(
+            "connections-without-password",
+            f"{len(unresolved)} connection(s) have no password on their chain "
+            "and will prompt", "credentials"))
+    return warnings
 
 
 # --------------------------------------------------------------------------- #
@@ -1414,7 +1960,7 @@ def notify(msg: str) -> None:
 
 
 def gui_window() -> str:
-    for w in x("search", "--name", f"^{GUI_TITLE}$").splitlines():
+    for w in xdotool("search", "--name", f"^{GUI_TITLE}$").splitlines():
         if w.strip():
             return w.strip()
     return ""
@@ -1424,9 +1970,9 @@ def focus_gui() -> str:
     """Raise the manager, starting it if it isn't running."""
     win = gui_window()
     if win:
-        x("windowactivate", "--sync", win)
+        xdotool("windowactivate", "--sync", win)
         return "focused the manager"
-    _spawn([sys.executable, str(Path(__file__).resolve()), "gui"])
+    spawn_detached([sys.executable, str(Path(__file__).resolve()), "gui"])
     return "starting the manager"
 
 
@@ -1437,7 +1983,7 @@ def goto(sel: str) -> str:
         return f"no such connection: {sel}"
     for s in sessions():
         if s.label == sel and s.window:
-            x("windowactivate", "--sync", s.window)
+            xdotool("windowactivate", "--sync", s.window)
             return f"focused {sel} ({s.proto})"
     proto = c.default_protocol
     try:
@@ -1453,7 +1999,7 @@ def step_session(delta: int) -> str:
     ss = [s for s in sessions() if s.window]
     if not ss:
         return "no active sessions to focus"
-    cur = x("getwindowfocus")
+    cur = xdotool("getwindowfocus")
     idx = next((i for i, s in enumerate(ss) if s.window == cur), None)
     if idx is None:
         # Nothing of ours focused: Super+W starts at the top, Super+Q at the end.
@@ -1533,7 +2079,7 @@ def load_shortcuts() -> tuple[dict[str, str], dict[str, str]]:
     return g, s
 
 
-def _gs(*args: str) -> str:
+def run_gsettings(*args: str) -> str:
     return subprocess.run(["gsettings", *args], capture_output=True, text=True).stdout.strip()
 
 
@@ -1543,7 +2089,7 @@ def _binding_conflicts(binding: str) -> list[str]:
     for schema in ("org.cinnamon.desktop.keybindings.wm",
                    "org.cinnamon.desktop.keybindings.media-keys",
                    "org.cinnamon.muffin.keybindings"):
-        for line in _gs("list-recursively", schema).splitlines():
+        for line in run_gsettings("list-recursively", schema).splitlines():
             if f"'{binding}'" in line:
                 out.append(" ".join(line.split()[:2]))
     return out
@@ -1561,7 +2107,7 @@ def shortcut_specs() -> list[tuple[str, str, str, str]]:
     for sel, binding in s.items():
         if not binding:
             continue
-        specs.append((f"rcm-goto-{_slug(sel)}", f"rcm: {sel}",
+        specs.append((f"rcm-goto-{slugify(sel)}", f"rcm: {sel}",
                       f"{me} goto {shlex.quote(sel)}", binding))
     return specs
 
@@ -1572,7 +2118,7 @@ def shortcuts_install() -> tuple[int, list[str]]:
     for _id, _name, _cmd, binding in specs:
         for conflict in _binding_conflicts(binding):
             warnings.append(f"{binding} is already used by {conflict}")
-    current = _parse_gs_list(_gs("get", GS_LIST, "custom-list"))
+    current = parse_gsettings_list(run_gsettings("get", GS_LIST, "custom-list"))
     keep = [i for i in current if not i.startswith("rcm-")]
     ids = [s[0] for s in specs]
     # Clear rcm- entries that are no longer configured, or removing a shortcut
@@ -1582,25 +2128,25 @@ def shortcuts_install() -> tuple[int, list[str]]:
                        capture_output=True)
     for _id, name, cmd, binding in specs:
         path = f"{DCONF_ROOT}/{_id}/"
-        _gs("set", f"{GS_ITEM}:{path}", "name", name)
-        _gs("set", f"{GS_ITEM}:{path}", "command", cmd)
-        _gs("set", f"{GS_ITEM}:{path}", "binding", "['" + binding + "']")
-    _gs("set", GS_LIST, "custom-list", str(keep + ids).replace('"', "'"))
+        run_gsettings("set", f"{GS_ITEM}:{path}", "name", name)
+        run_gsettings("set", f"{GS_ITEM}:{path}", "command", cmd)
+        run_gsettings("set", f"{GS_ITEM}:{path}", "binding", "['" + binding + "']")
+    run_gsettings("set", GS_LIST, "custom-list", str(keep + ids).replace('"', "'"))
     return len(specs), warnings
 
 
 def shortcuts_remove() -> int:
-    current = _parse_gs_list(_gs("get", GS_LIST, "custom-list"))
+    current = parse_gsettings_list(run_gsettings("get", GS_LIST, "custom-list"))
     mine = [i for i in current if i.startswith("rcm-")]
     for _id in mine:
         subprocess.run(["dconf", "reset", "-f", f"{DCONF_ROOT}/{_id}/"],
                        capture_output=True)
     keep = [i for i in current if not i.startswith("rcm-")]
-    _gs("set", GS_LIST, "custom-list", str(keep).replace('"', "'"))
+    run_gsettings("set", GS_LIST, "custom-list", str(keep).replace('"', "'"))
     return len(mine)
 
 
-def _parse_gs_list(raw: str) -> list[str]:
+def parse_gsettings_list(raw: str) -> list[str]:
     raw = raw.strip()
     if not raw or raw in ("@as []", "[]"):
         return []
@@ -1658,11 +2204,11 @@ def install_icon() -> list[str]:
     return written
 
 
-def _slug(s: str) -> str:
+def slugify(s: str) -> str:
     return re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]", "-", s.lower())).strip("-")
 
 
-def _dq(s: str) -> str:
+def quote_exec_argument(s: str) -> str:
     """Quote one Exec= argument per the Desktop Entry spec.
 
     Connection names may contain spaces ("Line 1.rdp"); unquoted, the launcher
@@ -1686,8 +2232,8 @@ def gen_launcher() -> int:
             pass
     cs = conns_cached(refresh=True)
     gs = groups()   # every level, so a nested tree still gets jump-list entries
-    actions = ([_slug(c.sel) for c in cs[:MAX_JUMPLIST]]
-               + [f"all-{_slug(g)}" for g in gs] + ["switcher"])
+    actions = ([slugify(c.sel) for c in cs[:MAX_JUMPLIST]]
+               + [f"all-{slugify(g)}" for g in gs] + ["switcher"])
     L = ["[Desktop Entry]", "Type=Application", "Name=Remote Connections",
          f"Comment=RDP, VNC and Radmin sessions from {RDP_DIR}",
          f"Exec={me} gui", f"Icon={ICON_NAME}", "Terminal=false",
@@ -1699,13 +2245,13 @@ def gen_launcher() -> int:
     if actions:
         L.append("Actions=" + ";".join(actions) + ";")
     for c in cs[:MAX_JUMPLIST]:
-        L += ["", f"[Desktop Action {_slug(c.sel)}]",
+        L += ["", f"[Desktop Action {slugify(c.sel)}]",
               f"Name={c.sel.replace('_', ' ').replace('/', ' / ')}",
               # Absolute paths only -- Exec= does not expand ~ and fails silently.
-              f"Exec={_dq(str(me))} connect {_dq(c.sel)}"]
+              f"Exec={quote_exec_argument(str(me))} connect {quote_exec_argument(c.sel)}"]
     for g in gs:
-        L += ["", f"[Desktop Action all-{_slug(g)}]", f"Name=Connect all ({g})",
-              f"Exec={_dq(str(me))} connect-all {_dq(g)}"]
+        L += ["", f"[Desktop Action all-{slugify(g)}]", f"Name=Connect all ({g})",
+              f"Exec={quote_exec_argument(str(me))} connect-all {quote_exec_argument(g)}"]
     L += ["", "[Desktop Action switcher]", "Name=Switch active session...",
           f"Exec={me} cycle"]
     DESKTOP_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1741,7 +2287,7 @@ USAGE = """rcm -- remote connection manager
   rcm import <file.csv> [--overwrite] [--dry-run]
   rcm export [file.csv]          default: export/connections.csv
   rcm phonebook [out.rpb]        experimental Radmin phonebook (never overwrites live)
-  rcm gen-launcher               rebuild the .desktop jump list
+  rcm workspace [name]           open a named set of connections\n  rcm wake <sel>                 send a Wake-on-LAN magic packet\n  rcm history [sel]              recent events from the JSONL log\n  rcm gen-launcher               rebuild the .desktop jump list
   rcm install-icon               install the app icon into your icon theme
 """
 
@@ -1881,7 +2427,7 @@ def main(argv: list[str]) -> int:
         sub = rest[0] if rest else "list"
         if sub == "list":
             print(f"keyring: {'available' if keyring_available() else 'NOT AVAILABLE'}")
-            table = _creds_table()
+            table = creds_conf_table()
             keys = sorted(set(table) | {"DEFAULT"})
             for k in keys:
                 u = table.get(k, ("", ""))[0]
@@ -1987,16 +2533,16 @@ def main(argv: list[str]) -> int:
         print(f"protocol={p.label} host={c.host} user={user} password: "
               f"{'set (%d chars)' % len(pw) if pw and pw != 'CHANGEME' else 'NOT SET'}")
         try:
-            _, new = open_prompt(p, c.host, argv)
+            _, new = open_credential_prompt(p, c.host, argv)
         except RuntimeError as e:
             print(f"rcm: {e}", file=sys.stderr)
             return 1
         for w in sorted(new):
             print(f"--- window {w}")
-            print(f"  name    : {x('getwindowname', w)}")
-            print(f"  geometry: {x('getwindowgeometry', '--shell', w).replace(chr(10), ' ')}")
-        foc = x("getwindowfocus")
-        print(f"focused   : {foc} ({x('getwindowname', foc)})")
+            print(f"  name    : {xdotool('getwindowname', w)}")
+            print(f"  geometry: {xdotool('getwindowgeometry', '--shell', w).replace(chr(10), ' ')}")
+        foc = xdotool("getwindowfocus")
+        print(f"focused   : {foc} ({xdotool('getwindowname', foc)})")
         shot = capture_window(sorted(new)[-1], Path.home() / "radmin-calibrate.png")
         print(f"image     : {shot}" if shot else
               "image     : skipped (needs gnome-screenshot + python3-pil)")
@@ -2017,6 +2563,92 @@ def main(argv: list[str]) -> int:
 
     if cmd == "gen-launcher":
         print(f"{gen_launcher()} connection(s) -> {DESKTOP_FILE}")
+        return 0
+
+    if cmd == "workspace":
+        spaces = load_workspaces()
+        if not rest or rest[0] == "list":
+            for name, members in spaces.items():
+                print(f"  {name}: {', '.join(m['sel'] for m in members)}")
+            if not spaces:
+                print(f"  none defined — add [workspace:<name>] sections to "
+                      f"{WORKSPACES_CONF}")
+            return 0
+        try:
+            for line in connect_workspace(rest[0]):
+                print(f"  {line}")
+        except ConfigError as problem:
+            print(f"rcm: {problem}", file=sys.stderr)
+            return 1
+        return 0
+
+    if cmd == "wake":
+        if not rest:
+            print("usage: rcm wake <group/name>", file=sys.stderr)
+            return 2
+        c = find(rest[0])
+        if not c:
+            print(f"no such connection: {rest[0]}", file=sys.stderr)
+            return 1
+        mac = c.extra.get("rcm-mac", "")
+        if not mac:
+            print(f"{c.sel}: no rcm-mac recorded yet — connect once while it is "
+                  "on, the MAC is learned automatically", file=sys.stderr)
+            return 1
+        wake(mac, host=c.host)
+        print(f"magic packet sent to {mac} ({c.sel})")
+        return 0
+
+    if cmd == "history":
+        sel = rest[0] if rest else ""
+        for record in read_log_events(days=30, sel=sel)[:200]:
+            extras = {k: v for k, v in record.items() if k not in ("ts", "kind")}
+            print(f"  {record['ts']}  {record['kind']:8} "
+                  + " ".join(f"{k}={v}" for k, v in extras.items()))
+        return 0
+
+    if cmd == "health":
+        problems = config_health()
+        if not problems:
+            print("configuration healthy — no warnings")
+            return 0
+        for w in problems:
+            print(f"  {'ERROR ' if w.severity == 'error' else 'warn  '}{w.message}")
+            print(f"         fix under Setup ▸ {w.setup_section}")
+        return 1
+
+    if cmd == "help":
+        # Topics register at import time, so the guide is only complete once
+        # every registering module is loaded; headless (no display) skips the
+        # GUI's topics rather than failing.
+        sys.modules.setdefault("rcm", sys.modules["__main__"])
+        for module_name in ("rcm_gui", "rcm_switch"):
+            try:
+                __import__(module_name)
+            except Exception:
+                pass
+        if "--coverage" in rest:
+            # The mandate check: user-facing commands must carry a topic.
+            documented = {t.source_file for t in HELP_TOPICS.values()}
+            print(f"{len(HELP_TOPICS)} topic(s) registered across "
+                  f"{len(documented)} file(s)")
+            for topic in HELP_TOPICS.values():
+                print(f"  {topic.topic_id:20} {topic.source_file}:{topic.source_line}")
+            return 0
+        if "--dump" in rest:
+            count = dump_help_html()
+            print(f"{count} topic(s) -> {HELP_DIR}/index.html")
+            return 0
+        if not HELP_TOPICS:
+            print("no help topics registered")
+            return 0
+        by_section: dict[str, list] = {}
+        for t in HELP_TOPICS.values():
+            by_section.setdefault(t.section or "General", []).append(t)
+        for section, topics in by_section.items():
+            print(f"[{section}]")
+            for t in topics:
+                print(f"  {t.topic_id:20} {t.title:32} {t.source_file}:{t.source_line}")
         return 0
 
     if cmd == "focus":
@@ -2054,7 +2686,7 @@ def main(argv: list[str]) -> int:
         sub = rest[0] if rest else "list"
         if sub == "list":
             specs = shortcut_specs()
-            active = _parse_gs_list(_gs("get", GS_LIST, "custom-list"))
+            active = parse_gsettings_list(run_gsettings("get", GS_LIST, "custom-list"))
             if not specs:
                 print("nothing configured in", SHORTCUTS)
             for _id, name, cmdline, binding in specs:

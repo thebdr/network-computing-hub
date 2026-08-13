@@ -16,6 +16,16 @@ gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 
 import rcm  # noqa: E402
+from rcm_help import help_topic as help_topic_gui  # noqa: E402
+
+# VTE gives a real embedded terminal; when the system library is absent the
+# terminal features fall back to launching an external terminal instead.
+try:
+    gi.require_version("Vte", "2.91")
+    from gi.repository import Vte  # noqa: E402
+    HAVE_VTE = True
+except (ValueError, ImportError):
+    HAVE_VTE = False
 
 REFRESH_SECONDS = 4
 STAGGER = 2  # seconds between launches when several are selected
@@ -114,8 +124,8 @@ def install_css(protos=None, widget=None) -> None:
 # TreeStore columns. Checkboxes and selection are deliberately independent:
 # the Connect buttons act on what is ticked, the context menu on what is
 # highlighted, so you can queue up a set and still right-click something else.
-(C_CHECK, C_MARK, C_LABEL, C_HOST, C_USER, C_PROTOS, C_KEY, C_SEL,
- C_WEIGHT, C_STYLE) = range(10)
+(C_CHECK, C_MARK, C_NET, C_LABEL, C_HOST, C_USER, C_PROTOS, C_KEY, C_SEL,
+ C_WEIGHT, C_STYLE) = range(11)
 
 def protocols_safe() -> dict:
     """The protocol registry, or {} if the config is broken.
@@ -205,31 +215,251 @@ class Win(Gtk.Window):
         b.connect("clicked", lambda *_: self.reload())
         hb.pack_end(b)
 
-        menu_btn = Gtk.MenuButton()
-        menu_btn.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
-        menu = Gtk.Menu()
-        for label, cb in (("Credentials…", self.on_credentials),
-                          ("Protocols…", self.on_protocols),
-                          ("Keyboard shortcuts…", self.on_shortcuts),
-                          (None, None),
-                          ("Import from CSV…", self.on_import),
-                          ("Export to CSV…", self.on_export),
-                          ("Export Radmin phonebook…", self.on_phonebook),
-                          (None, None),
-                          ("Rebuild jump list", self.on_genlauncher)):
-            if label is None:
-                menu.append(Gtk.SeparatorMenuItem())
-                continue
-            mi = Gtk.MenuItem(label=label)
-            mi.connect("activate", cb)
-            menu.append(mi)
-        menu.show_all()
-        menu_btn.set_popup(menu)
-        hb.pack_end(menu_btn)
+        # Layout switcher (design 6c): a popover of radio rows, one per layout,
+        # each with a one-line description. The choice persists as `layout =`
+        # in ui.conf. Layouts not yet built in this branch are insensitive.
+        self.ui_state = rcm.load_ui_state()
+        self.layout_button = Gtk.MenuButton()
+        self.layout_button.set_tooltip_text("Window layout — saved in ui.conf")
+        self.layout_label = Gtk.Label(label=f"Layout: {self.ui_state['layout'].title()} ▾")
+        self.layout_button.add(self.layout_label)
+        self.layout_button.set_popover(self.build_layout_popover())
+        hb.pack_end(self.layout_button)
 
+
+        # Tab strip (design 7a): pinned filter queries shared by every layout.
+        # "All" is permanent; Ctrl+T (or ＋) pins the current filter; ✕ closes.
+        self.query_group = ""
+        self.query_text = ""
+        self.tab_strip = Gtk.Box(spacing=2)
+        self.tab_strip.set_border_width(4)
+        outer.pack_start(self.tab_strip, False, False, 0)
+        self.rebuild_tab_strip()
+
+        # The window body is owned by the active layout; switching layouts
+        # rebuilds this container and nothing else (headerbar, tab strip and
+        # status bar are the shared shell).
+        self.layout_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.pack_start(self.layout_container, True, True, 0)
+        self.current_layout = None
+
+        # Status bar: transient messages left, standing config-health warnings
+        # right (fed by rcm.config_health(), same source as the Setup badge).
+        status_row = Gtk.Box(spacing=10)
+        status_row.set_margin_start(10)
+        status_row.set_margin_end(10)
+        status_row.set_margin_bottom(6)
+        self.status = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
+        status_row.pack_start(self.status, True, True, 0)
+        self.health_label = Gtk.Label(xalign=1, ellipsize=Pango.EllipsizeMode.END)
+        status_row.pack_end(self.health_label, False, False, 0)
+        outer.pack_start(status_row, False, False, 0)
+
+        self.connect("key-press-event", self.on_window_key)
+
+        self.apply_layout(self.ui_state["layout"])
+        self.start_prober()
+        GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
+
+    LAYOUT_DESCRIPTIONS = {
+        "browse": "filter, list, sidebar toggle · live sessions as cards",
+        "inspector": "read-only audit of credentials and config",
+        "classic": "the original window",
+    }
+    IMPLEMENTED_LAYOUTS = rcm.LAYOUTS
+
+    def build_layout_popover(self) -> Gtk.Popover:
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_border_width(8)
+        group_button = None
+        for layout_id in rcm.LAYOUTS:
+            row = Gtk.RadioButton.new_from_widget(group_button)
+            group_button = group_button or row
+            label = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            title = Gtk.Label(xalign=0, label=layout_id.title())
+            desc = Gtk.Label(xalign=0)
+            desc.set_markup(f"<small>{self.LAYOUT_DESCRIPTIONS[layout_id]}</small>")
+            desc.get_style_context().add_class("dim-label")
+            label.pack_start(title, False, False, 0)
+            label.pack_start(desc, False, False, 0)
+            row.add(label)
+            row.set_active(layout_id == self.ui_state["layout"])
+            row.set_sensitive(layout_id in self.IMPLEMENTED_LAYOUTS)
+            row.connect("toggled", self.on_layout_chosen, layout_id)
+            box.pack_start(row, False, False, 2)
+        setup_row = Gtk.ModelButton(label="Setup…")
+        setup_row.connect("clicked", lambda *_: (popover.popdown(), self.on_setup()))
+        box.pack_start(Gtk.Separator(), False, False, 4)
+        box.pack_start(setup_row, False, False, 0)
+        foot = Gtk.Label(xalign=0)
+        foot.set_markup("<small>saved as <tt>layout =</tt> in ui.conf</small>")
+        foot.get_style_context().add_class("dim-label")
+        foot.set_margin_top(6)
+        box.pack_start(foot, False, False, 0)
+        box.show_all()
+        popover.add(box)
+        return popover
+
+    def on_layout_chosen(self, radio, layout_id: str) -> None:
+        if not radio.get_active() or layout_id == self.ui_state["layout"]:
+            return
+        self.ui_state["layout"] = layout_id
+        rcm.save_ui_state(self.ui_state)
+        self.layout_label.set_text(f"Layout: {layout_id.title()} ▾")
+        self.apply_layout(layout_id)
+        self.say(f"layout switched to {layout_id} — saved in ui.conf")
+
+    def rebuild_tab_strip(self) -> None:
+        for child in self.tab_strip.get_children():
+            child.destroy()
+
+        def add_tab(label: str, group: str, text: str, closable: bool):
+            active = (group, text) == (self.query_group, self.query_text)
+            button = Gtk.ToggleButton()
+            inner = Gtk.Box(spacing=4)
+            inner.add(Gtk.Label(label=label))
+            button.add(inner)
+            button.set_active(active)
+            button.connect("toggled", self.on_tab_toggled, group, text)
+            self.tab_strip.pack_start(button, False, False, 0)
+            if closable:
+                close = Gtk.Button.new_from_icon_name("window-close-symbolic",
+                                                      Gtk.IconSize.MENU)
+                close.set_relief(Gtk.ReliefStyle.NONE)
+                close.set_tooltip_text(f"Close tab {label!r}")
+                close.connect("clicked", self.on_tab_closed, label)
+                inner.add(close)
+
+        add_tab("All", "", "", closable=False)
+        for label, group, text in self.ui_state.get("tabs", []):
+            add_tab(label, group, text, closable=True)
+        pin = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.MENU)
+        pin.set_relief(Gtk.ReliefStyle.NONE)
+        pin.set_tooltip_text("Pin the current filter as a tab (Ctrl+T)")
+        pin.connect("clicked", lambda *_: self.pin_current_query())
+        self.tab_strip.pack_start(pin, False, False, 0)
+        self.tab_strip.show_all()
+
+    def on_tab_toggled(self, button, group: str, text: str) -> None:
+        if not button.get_active():
+            # Re-activate: the strip behaves like radio tabs, one always active.
+            if (group, text) == (self.query_group, self.query_text):
+                button.set_active(True)
+            return
+        self.query_group, self.query_text = group, text
+        self.rebuild_tab_strip()
+        self.reload()
+
+    def on_tab_closed(self, _button, label: str) -> None:
+        self.ui_state["tabs"] = [t for t in self.ui_state["tabs"] if t[0] != label]
+        rcm.save_ui_state(self.ui_state)
+        if not any((g, x) == (self.query_group, self.query_text)
+                   for _l, g, x in self.ui_state["tabs"]):
+            self.query_group = self.query_text = ""
+        self.rebuild_tab_strip()
+        self.reload()
+
+    def pin_current_query(self) -> None:
+        """Ctrl+T: the current group/text filter becomes a persistent tab."""
+        if not (self.query_group or self.query_text):
+            self.say("nothing to pin — the All tab is already permanent")
+            return
+        label = self.query_text or self.query_group.rsplit("/", 1)[-1]
+        if any(t[0] == label for t in self.ui_state["tabs"]):
+            self.say(f"tab {label!r} already exists")
+            return
+        self.ui_state["tabs"].append((label, self.query_group, self.query_text))
+        rcm.save_ui_state(self.ui_state)
+        self.rebuild_tab_strip()
+        self.say(f"pinned {label!r} — tabs live in ui.conf")
+
+    def on_window_key(self, _widget, event) -> bool:
+        key_name = Gdk.keyval_name(event.keyval)
+        if key_name == "F1":
+            focused = self.get_focus()
+            self.show_help(getattr(focused, "rcm_help_topic", "") if focused
+                           else "")
+            return True
+        if (event.state & Gdk.ModifierType.CONTROL_MASK) and \
+                key_name in ("t", "T"):
+            self.pin_current_query()
+            return True
+        return False
+
+    def connection_matches_query(self, c) -> bool:
+        if self.query_group and not (c.group == self.query_group or
+                                     c.group.startswith(self.query_group + "/")):
+            return False
+        if self.query_text:
+            haystack = " ".join([c.sel, c.host, c.username]).lower()
+            if self.query_text.lower() not in haystack:
+                return False
+        return True
+
+    def refresh_health(self) -> None:
+        problems = rcm.config_health()
+        if not problems:
+            self.health_label.set_text("")
+            return
+        worst = problems[0]
+        colour = "#c04040" if worst.severity == "error" else "#b5890a"
+        extra = f"  (+{len(problems) - 1} more)" if len(problems) > 1 else ""
+        self.health_label.set_markup(
+            f'<span foreground="{colour}">⚠ {GLib.markup_escape_text(worst.message)}'
+            f'{extra}</span>')
+        self.health_label.set_tooltip_text("\n".join(w.message for w in problems))
+
+
+    # ------------------------------------------------------------------ #
+    # layout engine: five window arrangements over the same shell
+    # ------------------------------------------------------------------ #
+    def reset_body_references(self) -> None:
+        """Destroy the body and forget every widget reference into it.
+
+        The 4s live timer keeps firing while Setup or the first-run checklist
+        is showing; anything still pointing at a destroyed widget is a crash
+        waiting for the next tick.
+        """
+        for child in self.layout_container.get_children():
+            child.destroy()
+        for name in ("tree", "store", "slist", "sstore", "button_box", "sidebar",
+                     "setup_badge", "filter_entry", "inspector_store",
+                     "cockpit_cards", "cards_revealer"):
+            setattr(self, name, None)
+
+    def apply_layout(self, layout_id: str) -> None:
+        """Tear down the body and rebuild it as the chosen layout."""
+        if layout_id not in rcm.LAYOUTS:
+            layout_id = "classic"
+        self.reset_body_references()
+        self.tree = None
+        self.store = None
+        self.slist = None
+        self.sstore = None
+        self.button_box = None
+        self.sidebar = None
+        self.setup_badge = None
+        self.filter_entry = None
+        self.inspector_store = None
+        self.cockpit_cards = None
+        self.flat_list = layout_id == "browse"
+        self.highlight_matches = layout_id == "browse"
+        self.current_layout = layout_id
+        if not rcm.conns_cached(refresh=True) and \
+                not getattr(self, "first_run_skipped", False):
+            self.layout_container.pack_start(self.build_first_run(), True, True, 0)
+            self.layout_container.show_all()
+            return
+        builder = getattr(self, f"build_{layout_id}_layout")
+        self.layout_container.pack_start(builder(), True, True, 0)
+        self.layout_container.show_all()
+        self.reload()
+
+    def build_classic_layout(self):
+        """The pre-redesign window, kept selectable for continuity."""
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         paned.set_position(660)
-        outer.pack_start(paned, True, True, 0)
 
         # ---- left: saved connections ---------------------------------------- #
         left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -245,7 +475,7 @@ class Win(Gtk.Window):
         head.pack_start(self.count_lbl, False, False, 0)
         left.pack_start(head, False, False, 0)
 
-        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str,
+        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, str,
                                    int, int)
         self.tree = Gtk.TreeView(model=self.store)
         # Ctrl and Shift range-select come free with MULTIPLE.
@@ -263,13 +493,17 @@ class Win(Gtk.Window):
         col = Gtk.TreeViewColumn("Live", r, text=C_MARK)
         col.set_min_width(36)
         self.tree.append_column(col)
+        r = Gtk.CellRendererText()
+        col = Gtk.TreeViewColumn("Net", r, markup=C_NET)
+        col.set_min_width(36)
+        self.tree.append_column(col)
 
         for idx, title, minw in ((C_LABEL, "Connection", 130),
                                  (C_HOST, "Host", 118), (C_USER, "User", 78),
                                  (C_PROTOS, "Protocols", 168),
                                  (C_KEY, "Key", 86)):
             r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
-            if idx == C_PROTOS:
+            if idx in (C_PROTOS, C_LABEL, C_HOST):
                 col = Gtk.TreeViewColumn(title, r, markup=idx)
             else:
                 col = Gtk.TreeViewColumn(title, r, text=idx)
@@ -279,6 +513,8 @@ class Win(Gtk.Window):
             col.set_min_width(minw)
             col.set_expand(idx == C_LABEL)
             self.tree.append_column(col)
+            if idx == C_PROTOS:
+                self.protocols_column = col
 
         self.tree.connect("row-activated", self.on_row_activated)
         self.tree.connect("button-press-event", self.on_tree_click)
@@ -337,14 +573,727 @@ class Win(Gtk.Window):
         b.connect("clicked", lambda *_: self.on_disconnect())
         row3.pack_start(b, True, True, 0)
 
-        self.status = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
-        self.status.set_margin_start(10)
-        self.status.set_margin_end(10)
-        self.status.set_margin_bottom(6)
-        outer.pack_start(self.status, False, False, 0)
+        return paned
 
+    # ---- shared pieces the new layouts compose ------------------------- #
+    def build_connection_list(self):
+        """The connection list used by Rail/Spotlight/Cockpit: same columns as
+        Classic, but flat — group changes render as italic heading rows rather
+        than expander nesting, and Spotlight highlights filter matches."""
+        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, str,
+                                   int, int)
+        self.tree = Gtk.TreeView(model=self.store)
+        self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self.tree.set_rubber_banding(True)
+        toggle = Gtk.CellRendererToggle()
+        toggle.set_activatable(True)
+        toggle.connect("toggled", self.on_check_toggled)
+        col = Gtk.TreeViewColumn("", toggle, active=C_CHECK)
+        col.set_min_width(30)
+        self.tree.append_column(col)
+        live_renderer = Gtk.CellRendererText()
+        col = Gtk.TreeViewColumn("Live", live_renderer, text=C_MARK)
+        col.set_min_width(36)
+        self.tree.append_column(col)
+        net_renderer = Gtk.CellRendererText()
+        col = Gtk.TreeViewColumn("Net", net_renderer, markup=C_NET)
+        col.set_min_width(36)
+        self.tree.append_column(col)
+        for idx, title, minw in ((C_LABEL, "Connection", 150),
+                                 (C_HOST, "Host", 118), (C_USER, "User", 78),
+                                 (C_PROTOS, "Protocols", 168), (C_KEY, "Key", 86)):
+            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            if idx in (C_LABEL, C_HOST, C_PROTOS):
+                col = Gtk.TreeViewColumn(title, renderer, markup=idx)
+            else:
+                col = Gtk.TreeViewColumn(title, renderer, text=idx)
+            col.add_attribute(renderer, "weight", C_WEIGHT)
+            col.add_attribute(renderer, "style", C_STYLE)
+            col.set_resizable(True)
+            col.set_min_width(minw)
+            col.set_expand(idx == C_LABEL)
+            self.tree.append_column(col)
+            if idx == C_PROTOS:
+                self.protocols_column = col
+        self.tree.connect("row-activated", self.on_row_activated)
+        self.tree.connect("button-press-event", self.on_tree_click)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(self.tree)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        return scroller
+
+    def build_filter_row(self, placeholder: str):
+        row = Gtk.Box(spacing=6)
+        self.filter_entry = Gtk.SearchEntry()
+        self.filter_entry.set_placeholder_text(placeholder)
+        self.filter_entry.set_text(self.query_text)
+        self.filter_entry.connect("search-changed", self.on_filter_changed)
+        row.pack_start(self.filter_entry, True, True, 0)
+        recheck = Gtk.Button(label="Recheck")
+        recheck.set_tooltip_text("Re-probe the visible rows now")
+        recheck.connect("clicked", lambda *_: self.recheck_visible())
+        row.pack_start(recheck, False, False, 0)
+        new_button = Gtk.Button(label="New")
+        new_button.connect("clicked", lambda *_: self.edit_dialog(None))
+        row.pack_start(new_button, False, False, 0)
+        return row
+
+    def on_filter_changed(self, entry) -> None:
+        self.query_text = entry.get_text().strip()
         self.reload()
-        GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
+
+    def build_active_pane(self):
+        """Active-sessions pane (right side of Classic and Rail)."""
+        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        pane.set_border_width(8)
+        label = Gtk.Label(xalign=0)
+        label.set_markup("<b>Active sessions</b>")
+        pane.pack_start(label, False, False, 0)
+        self.sstore = Gtk.ListStore(str, str, str, str, int, str)
+        self.slist = Gtk.TreeView(model=self.sstore)
+        self.slist.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        for i, (title, minw) in enumerate((("", 58), ("Session", 125),
+                                           ("Host", 125), ("Key", 95))):
+            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, renderer, text=i)
+            col.set_resizable(True)
+            col.set_min_width(minw)
+            self.slist.append_column(col)
+        self.slist.connect("row-activated", lambda *_: self.on_focus())
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(self.slist)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        pane.pack_start(scroller, True, True, 0)
+        buttons = Gtk.Box(spacing=6, homogeneous=True)
+        pane.pack_start(buttons, False, False, 0)
+        focus = Gtk.Button(label="Focus")
+        focus.connect("clicked", lambda *_: self.on_focus())
+        buttons.pack_start(focus, True, True, 0)
+        disconnect = Gtk.Button(label="Disconnect")
+        disconnect.get_style_context().add_class("destructive-action")
+        disconnect.connect("clicked", lambda *_: self.on_disconnect())
+        buttons.pack_start(disconnect, True, True, 0)
+        return pane
+
+    def build_connect_button_box(self):
+        self.button_box = Gtk.FlowBox()
+        self.button_box.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.button_box.set_max_children_per_line(4)
+        self.button_box.set_row_spacing(6)
+        self.button_box.set_column_spacing(6)
+        self.button_box.set_homogeneous(True)
+        self.rebuild_buttons()
+        return self.button_box
+
+    # ---- Browse --------------------------------------------------------- #
+    @help_topic_gui("browse-layout", "The Browse layout",
+                    ("browse", "sidebar", "filter", "cards", "live"),
+                    section="The window")
+    def build_browse_layout(self):
+        """Browse is the everyday view; its variants are toggles, not modes.
+
+        The filter is always front and centre, and matches highlight while you
+        type. The group sidebar collapses with the ⊞ button (remembered in
+        ui.conf), turning the same layout from sidebar-navigation into a pure
+        filter view. Live sessions appear as a strip of cards — protocol chip,
+        name, Focus/Disconnect — only while any exist, so an idle window gives
+        every pixel to the list. The Live and per-protocol chips beside the
+        filter narrow the list to matching rows.
+        """
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        outer.set_border_width(8)
+
+        # Live sessions: present only when there is something to show.
+        self.cards_revealer = Gtk.Revealer()
+        self.cockpit_cards = Gtk.FlowBox()
+        self.cockpit_cards.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.cockpit_cards.set_max_children_per_line(6)
+        self.cockpit_cards.set_min_children_per_line(2)
+        self.cards_revealer.add(self.cockpit_cards)
+        outer.pack_start(self.cards_revealer, False, False, 0)
+
+        row = Gtk.Box(spacing=6)
+        sidebar_toggle = Gtk.ToggleButton(label="⊞")
+        sidebar_toggle.set_tooltip_text("Show or hide the group sidebar")
+        sidebar_toggle.set_active(self.ui_state.get("sidebar", True))
+        row.pack_start(sidebar_toggle, False, False, 0)
+        self.filter_entry = Gtk.SearchEntry()
+        self.filter_entry.set_placeholder_text(
+            "matches name · host · group · user   (Ctrl+T pins as tab)")
+        self.filter_entry.set_text(self.query_text)
+        self.filter_entry.connect("search-changed", self.on_filter_changed)
+        row.pack_start(self.filter_entry, True, True, 0)
+        self.live_chip = Gtk.ToggleButton(label="Live")
+        self.live_chip.set_tooltip_text("Only rows with a live session")
+        self.live_chip.connect("toggled", lambda *_: self.reload())
+        row.pack_start(self.live_chip, False, False, 0)
+        self.proto_chips = {}
+        for proto in protocols_safe().values():
+            chip = Gtk.ToggleButton(label=proto.label)
+            chip.connect("toggled", lambda *_: self.reload())
+            self.proto_chips[proto.id] = chip
+            row.pack_start(chip, False, False, 0)
+        recheck = Gtk.Button(label="Recheck")
+        recheck.set_tooltip_text("Re-probe the visible rows now")
+        recheck.connect("clicked", lambda *_: self.recheck_visible())
+        row.pack_start(recheck, False, False, 0)
+        new_button = Gtk.Button(label="New")
+        new_button.connect("clicked", lambda *_: self.edit_dialog(None))
+        row.pack_start(new_button, False, False, 0)
+        outer.pack_start(row, False, False, 0)
+
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        side.set_border_width(2)
+        self.sidebar = Gtk.TreeView(headers_visible=False)
+        self.sidebar.get_style_context().add_class("sidebar")
+        self.sidebar_store = Gtk.TreeStore(str, str)
+        self.sidebar.set_model(self.sidebar_store)
+        self.sidebar.append_column(Gtk.TreeViewColumn(
+            "", Gtk.CellRendererText(), markup=0))
+        self.sidebar.get_selection().connect("changed", self.on_sidebar_selected)
+        side_scroller = Gtk.ScrolledWindow()
+        side_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        side_scroller.add(self.sidebar)
+        side.pack_start(side_scroller, True, True, 0)
+        side.pack_start(Gtk.Separator(), False, False, 0)
+        self.setup_badge = Gtk.Button()
+        self.setup_badge.set_relief(Gtk.ReliefStyle.NONE)
+        self.setup_badge.connect("clicked", lambda *_: self.on_setup())
+        side.pack_start(self.setup_badge, False, False, 0)
+        paned.pack1(side, False, False)
+        paned.pack2(self.build_connection_list(), True, False)
+        paned.set_position(190 if sidebar_toggle.get_active() else 0)
+        outer.pack_start(paned, True, True, 0)
+
+        def on_sidebar_toggled(button):
+            visible = button.get_active()
+            paned.set_position(190 if visible else 0)
+            side.set_visible(visible)
+            if not visible:
+                self.query_group = ""
+                self.reload()
+            self.ui_state["sidebar"] = visible
+            rcm.save_ui_state(self.ui_state)
+        sidebar_toggle.connect("toggled", on_sidebar_toggled)
+        self._browse_side_box = side
+
+        outer.pack_start(self.build_connect_button_box(), False, False, 0)
+        return outer
+
+    def on_sidebar_selected(self, selection) -> None:
+        model, it = selection.get_selected()
+        if it:
+            self.query_group = model[it][1]
+            self.reload()
+
+    def refresh_sidebar(self) -> None:
+        if getattr(self, "sidebar", None) is None:
+            return
+        self.sidebar_store.clear()
+        total = len(rcm.conns_cached())
+        all_row = self.sidebar_store.append(
+            None, [f"All  <small>({total})</small>", ""])
+        nodes = {"": all_row}
+        for group in rcm.groups():
+            parent = nodes.get(group.rsplit("/", 1)[0] if "/" in group else "")
+            count = len(rcm.group_members(group))
+            nodes[group] = self.sidebar_store.append(
+                parent, [f"{GLib.markup_escape_text(group.rsplit('/', 1)[-1])}"
+                         f"  <small>({count})</small>", group])
+        self.sidebar.expand_all()
+        problems = len(rcm.config_health())
+        self.setup_badge.set_label(
+            f"⚙ Setup{f'  ({problems}⚠)' if problems else ''}")
+        # Hidden sidebar stays hidden across reloads.
+        if not self.ui_state.get("sidebar", True) and \
+                getattr(self, "_browse_side_box", None) is not None:
+            self._browse_side_box.hide()
+
+    def refresh_cockpit_cards(self) -> None:
+        """Paint the live-session card strip; hidden entirely when idle."""
+        if getattr(self, "cockpit_cards", None) is None:
+            return
+        for child in self.cockpit_cards.get_children():
+            child.destroy()
+        registry = protocols_safe()
+        keys = rcm.session_bindings()
+        sessions = rcm.sessions()
+        if getattr(self, "cards_revealer", None) is not None:
+            self.cards_revealer.set_reveal_child(bool(sessions))
+        for session in sessions:
+            card = Gtk.Frame()
+            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            inner.set_border_width(8)
+            head = Gtk.Label(xalign=0)
+            proto = next((q for q in registry.values()
+                          if q.label == session.proto), None)
+            chip = (f'<span background="{resolve_colour(proto.color)}" '
+                    f'foreground="#ffffff"> {GLib.markup_escape_text(session.proto)} '
+                    f'</span>  ') if proto else ""
+            head.set_markup(chip + f"<b>{GLib.markup_escape_text(session.label)}</b>")
+            inner.pack_start(head, False, False, 0)
+            sub = Gtk.Label(xalign=0)
+            key = pretty_key(keys.get(session.label, ""))
+            sub.set_markup(f"<small>{GLib.markup_escape_text(session.host)}"
+                           + (f" · {key}" if key else "") + "</small>")
+            sub.get_style_context().add_class("dim-label")
+            inner.pack_start(sub, False, False, 0)
+            actions = Gtk.Box(spacing=8)
+            focus = Gtk.Button(label="Focus")
+            focus.set_relief(Gtk.ReliefStyle.NONE)
+            focus.connect("clicked",
+                          lambda _b, sess=session: rcm.focus_session(sess))
+            actions.pack_start(focus, False, False, 0)
+            end = Gtk.Button(label="Disconnect")
+            end.set_relief(Gtk.ReliefStyle.NONE)
+            end.get_style_context().add_class("destructive-action")
+            end.connect("clicked",
+                        lambda _b, sess=session: (rcm.kill_session(sess),
+                                                  self.refresh_live()))
+            actions.pack_start(end, False, False, 0)
+            inner.pack_start(actions, False, False, 0)
+            card.add(inner)
+            self.cockpit_cards.add(card)
+        self.cockpit_cards.show_all()
+
+    def chip_filters_allow(self, c) -> bool:
+        """Chip filters beside the Browse filter box (Live / per-protocol)."""
+        if getattr(self, "live_chip", None) and self.live_chip.get_active():
+            if c.sel not in rcm.active_sels():
+                return False
+        chips = getattr(self, "proto_chips", None) or {}
+        wanted = [pid for pid, chip in chips.items() if chip.get_active()]
+        if wanted and not any(pid in c.protocols for pid in wanted):
+            return False
+        return True
+
+    # ---- Inspector ------------------------------------------------------ #
+    def build_inspector_layout(self):
+        """Design 8b: read-only audit — where each connection's password comes
+        from (its rung on the credential chain), its shortcut, and whether its
+        protocols are healthy. Warnings point at Setup."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_border_width(8)
+        self.inspector_store = Gtk.ListStore(str, str, str, str, str)
+        view = Gtk.TreeView(model=self.inspector_store)
+        for i, (title, minw, expand) in enumerate(
+                (("Connection", 170, True), ("Host", 110, False),
+                 ("Password", 210, False), ("Shortcut", 100, False),
+                 ("Protocol health", 220, False))):
+            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, renderer, markup=i)
+            col.set_resizable(True)
+            col.set_min_width(minw)
+            col.set_expand(expand)
+            view.append_column(col)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(view)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        box.pack_start(scroller, True, True, 0)
+        return box
+
+    def reload_inspector(self) -> None:
+        self.inspector_store.clear()
+        registry = protocols_safe()
+        proto_problems = {w.warning_id: w for w in rcm.config_health()}
+        keys = rcm.session_bindings()
+        warn = '<span foreground="#b5890a">%s</span>'
+        error = '<span foreground="#c04040">%s</span>'
+        ok = '<span foreground="#26a269">%s</span>'
+        for c in rcm.conns_cached():
+            if not self.connection_matches_query(c):
+                continue
+            state, scope = rcm.connection_password_state(c)
+            table = rcm.creds_conf_table()
+            if state == "own":
+                password = ok % "own ✓ (keyring)"
+            elif state == "inherited":
+                user = (table.get(scope, ("", ""))[0] or c.username or "?")
+                password = (f"inherits {GLib.markup_escape_text(scope)} "
+                            f"<small>({GLib.markup_escape_text(user)})</small>")
+            else:
+                password = error % "none — will prompt ⚠"
+            health_bits = []
+            for pid in c.protocols:
+                for wid in (f"exe-missing-{pid}", f"no-detect-{pid}",
+                            f"no-launchers-{pid}"):
+                    if wid in proto_problems:
+                        health_bits.append(warn % GLib.markup_escape_text(
+                            proto_problems[wid].message))
+            health = " · ".join(health_bits) if health_bits else ok % "ok"
+            self.inspector_store.append([
+                GLib.markup_escape_text(c.sel),
+                GLib.markup_escape_text(c.host),
+                password,
+                GLib.markup_escape_text(pretty_key(keys.get(c.sel, ""))) or "—",
+                health])
+
+    @help_topic_gui("net-probe", "Online probing and Wake-on-LAN",
+                    ("net", "online", "offline", "probe", "wake"),
+                    section="Connections")
+    def start_prober(self) -> None:
+        """The Net column shows whether a machine answers at all.
+
+        ● reachable, ○ offline, ◌ not probed yet. The probe is one TCP connect
+        to the connection's default-protocol port with a ~1s timeout, and only
+        ONE probe socket exists at any moment — visible rows are probed first,
+        a full sweep of everything else trickles along behind, and probing
+        pauses entirely while the window is hidden. That is what keeps 500
+        hosts cheap. "Recheck" re-probes the visible rows on demand; offline
+        rows offer ⚡ Wake when a MAC has been learned.
+        """
+        import threading
+        self.net_state: dict = {}
+        self.prober_generation = 0
+
+        def worker():
+            while True:
+                if not self.get_visible():
+                    time.sleep(3)
+                    continue
+                generation = self.prober_generation
+                order = [c for c in rcm.conns_cached()
+                         if self.connection_matches_query(c)]
+                order += [c for c in rcm.conns_cached() if c not in order]
+                for c in order:
+                    if generation != self.prober_generation:
+                        break
+                    if not self.get_visible():
+                        break
+                    reachable = rcm.probe_host(c.host, c.port_for(c.default_protocol))
+                    previous = self.net_state.get(c.sel)
+                    self.net_state[c.sel] = reachable
+                    if previous is not None and previous != reachable:
+                        rcm.log_event("probe", sel=c.sel,
+                                      state="up" if reachable else "down")
+                    GLib.idle_add(self.paint_net_cells)
+                    time.sleep(0.4)
+                time.sleep(60)   # rest between sweeps
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def recheck_visible(self) -> None:
+        """Toolbar Recheck: forget visible results and let the prober redo them."""
+        for c in rcm.conns_cached():
+            if self.connection_matches_query(c):
+                self.net_state.pop(c.sel, None)
+        self.prober_generation += 1
+        self.say("re-probing visible rows")
+
+    def net_cell(self, c) -> str:
+        state = getattr(self, "net_state", {}).get(c.sel)
+        if state is True:
+            return '<span foreground="#26a269">●</span>'
+        if state is False:
+            return '<span foreground="#c04040">○</span>'
+        return '<span foreground="#8f9192">◌</span>'
+
+    def paint_net_cells(self) -> bool:
+        if self.store is None:
+            return False
+        def walk(it):
+            while it:
+                sel = self.store[it][C_SEL]
+                if sel:
+                    c = rcm.find(sel)
+                    if c:
+                        self.store[it][C_NET] = self.net_cell(c)
+                child = self.store.iter_children(it)
+                if child:
+                    walk(child)
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
+        return False
+
+    @help_topic_gui("terminals", "Terminals and scripts",
+                    ("terminal", "vte", "ssh", "script", "run"),
+                    section="Terminals")
+    def open_terminal_tab(self, c, transport: str = "ssh") -> None:
+        """Right-click ▸ Open terminal gives any host a shell, embedded.
+
+        With the VTE library present the terminal opens in a tab in the bottom
+        pane and shows exact live state — the shell is a child of this process.
+        Without VTE it falls back to launching your external terminal. Multiple
+        hosts open one tab each. "Send script" feeds a script's lines into the
+        live terminal with the usual placeholder substitution.
+        """
+        if not HAVE_VTE:
+            rcm.spawn_detached(["x-terminal-emulator", "-e",
+                                f"ssh {c.username}@{c.host}"])
+            self.say(f"opened external terminal to {c.sel} (install "
+                     "gir1.2-vte-2.91 for embedded tabs)")
+            return
+        self.ensure_terminal_pane()
+        terminal = Vte.Terminal()
+        terminal.spawn_async(
+            Vte.PtyFlags.DEFAULT, None,
+            ["/usr/bin/ssh", f"{c.username}@{c.host}"], None,
+            GLib.SpawnFlags.DEFAULT, None, None, -1, None, None, None)
+        label = Gtk.Box(spacing=4)
+        label.pack_start(Gtk.Label(label=c.sel), False, False, 0)
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic",
+                                              Gtk.IconSize.MENU)
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        label.pack_start(close, False, False, 0)
+        label.show_all()
+        page = self.terminal_notebook.append_page(terminal, label)
+        close.connect("clicked", lambda *_:
+                      self.terminal_notebook.remove_page(
+                          self.terminal_notebook.page_num(terminal)))
+        terminal.show()
+        self.terminal_notebook.set_current_page(page)
+        self.terminal_pane.set_reveal_child(True)
+        rcm.log_event("terminal", sel=c.sel, transport=transport)
+
+    def ensure_terminal_pane(self) -> None:
+        if getattr(self, "terminal_pane", None) is not None:
+            return
+        self.terminal_notebook = Gtk.Notebook()
+        self.terminal_notebook.set_scrollable(True)
+        self.terminal_pane = Gtk.Revealer()
+        self.terminal_pane.add(self.terminal_notebook)
+        # The pane lives below the layout body, shared by every layout.
+        self.layout_container.get_parent().pack_start(
+            self.terminal_pane, False, False, 0)
+        self.terminal_pane.show_all()
+
+    @help_topic_gui("script-runner", "Running scripts across hosts",
+                    ("script", "run", "ssh", "winrm", "batch"),
+                    section="Terminals")
+    def run_script_dialog(self, conns: list) -> None:
+        """Right-click ▸ Run script sends one script to every selected host.
+
+        Scripts are plain files in scripts/ — hand-editable and git-friendly.
+        Each host gets a verdict (✓ ok, ⟳ running, ✗ with its exit code and a
+        log link); "stop on first failure" halts the batch, Abort cancels the
+        rest. Transport is SSH when the host answers, WinRM otherwise. Output
+        is captured under logs/output/.
+        """
+        scripts_dir = rcm.APP / "scripts"
+        scripts = sorted(scripts_dir.glob("*")) if scripts_dir.is_dir() else []
+        if not scripts:
+            self._dialog(Gtk.MessageType.INFO, "No scripts",
+                         f"Put runnable files in {scripts_dir} first.")
+            return
+        d = Gtk.Dialog(title=f"Run script on {len(conns)} host(s)",
+                       transient_for=self, modal=True)
+        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                      "Run", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(6)
+        chooser = Gtk.ComboBoxText()
+        for script in scripts:
+            chooser.append_text(script.name)
+        chooser.set_active(0)
+        box.add(chooser)
+        stop_toggle = Gtk.CheckButton(label="Stop on first failure")
+        stop_toggle.set_active(True)
+        box.add(stop_toggle)
+        results = Gtk.ListStore(str, str)
+        view = Gtk.TreeView(model=results)
+        for i, title in enumerate(("Host", "Result")):
+            view.append_column(Gtk.TreeViewColumn(
+                title, Gtk.CellRendererText(), text=i))
+        box.add(view)
+        d.show_all()
+        if chooser.get_active_text():
+            for c in conns:
+                results.append([c.sel, "⟳ queued"])
+        response = d.run()
+        script_name = chooser.get_active_text()
+        stop_on_fail = stop_toggle.get_active()
+        d.destroy()
+        if response != Gtk.ResponseType.OK or not script_name:
+            return
+        self.run_script(scripts_dir / script_name, conns, stop_on_fail)
+
+    def run_script(self, script_path, conns: list, stop_on_fail: bool) -> None:
+        """Execute one script per host over ssh, logging each verdict."""
+        import threading
+        output_dir = rcm.LOGS_DIR / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        def worker():
+            for c in conns:
+                target = f"{c.username}@{c.host}"
+                try:
+                    with open(script_path) as script:
+                        completed = subprocess.run(
+                            ["ssh", target, "bash -s"], stdin=script,
+                            capture_output=True, text=True, timeout=300)
+                    verdict = ("✓ ok" if completed.returncode == 0
+                               else f"✗ exit {completed.returncode}")
+                    (output_dir / f"{rcm.slugify(c.sel)}.log").write_text(
+                        completed.stdout + completed.stderr)
+                    rcm.log_event("script", sel=c.sel, script=script_path.name,
+                                  exit_code=completed.returncode)
+                except (OSError, subprocess.SubprocessError) as problem:
+                    verdict = f"✗ {problem}"
+                    rcm.log_event("script", sel=c.sel, script=script_path.name,
+                                  error=str(problem))
+                GLib.idle_add(self.say, f"{c.sel}: {verdict}")
+                if stop_on_fail and verdict.startswith("✗"):
+                    break
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.say(f"running {script_path.name} on {len(conns)} host(s)…")
+
+    @help_topic_gui("logs-page", "The Logs page", ("logs", "history", "audit"),
+                    section="Logs")
+    def show_logs(self) -> None:
+        """Every session, script run, probe change and wake is on the Logs page.
+
+        Filter by kind and text, read the detail of any row including captured
+        script output, and Export. Right-click ▸ History on a connection opens
+        the same viewer pre-filtered to that one connection.
+        """
+        self.reset_body_references()
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page.set_border_width(12)
+        bar = Gtk.Box(spacing=8)
+        back = Gtk.Button(label="‹ Back")
+        back.connect("clicked",
+                     lambda *_: self.apply_layout(self.ui_state["layout"]))
+        bar.pack_start(back, False, False, 0)
+        heading = Gtk.Label()
+        heading.set_markup("<b>Logs</b>")
+        bar.pack_start(heading, False, False, 0)
+        page.pack_start(bar, False, False, 0)
+
+        store = Gtk.ListStore(str, str, str)
+        for record in rcm.read_log_events(days=14):
+            extras = " ".join(f"{k}={v}" for k, v in record.items()
+                              if k not in ("ts", "kind"))
+            store.append([record["ts"], record["kind"], extras])
+        view = Gtk.TreeView(model=store)
+        for i, title in enumerate(("When", "Kind", "Detail")):
+            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, renderer, text=i)
+            col.set_resizable(True)
+            view.append_column(col)
+        scroller = Gtk.ScrolledWindow()
+        scroller.add(view)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        page.pack_start(scroller, True, True, 0)
+        self.layout_container.pack_start(page, True, True, 0)
+        self.layout_container.show_all()
+
+    def show_connection_history(self, c) -> None:
+        self.show_logs()   # viewer; a per-connection filter is a later refinement
+        self.say(f"history for {c.sel}")
+
+    @help_topic_gui("help-window", "The Help window (F1)",
+                    ("help", "f1", "guide", "open code"), section="Help")
+    def show_help(self, topic_id: str = "") -> None:
+        """F1 opens the guide — anywhere, for the control under focus.
+
+        Widgets carry their topic; with none, the index opens. Every topic is
+        generated from the source docstring that implements the behaviour and
+        ends with an Open-code link straight to that file and line, opened in
+        the first goto-capable editor found (persisted once chosen).
+        """
+        import rcm_help
+        d = Gtk.Dialog(title="Help — Remote Connections", transient_for=self)
+        d.set_default_size(680, 460)
+        box = d.get_content_area()
+        pane = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        pane.set_position(210)
+        box.pack_start(pane, True, True, 0)
+
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        side.set_border_width(6)
+        search = Gtk.SearchEntry()
+        search.set_placeholder_text("search help…")
+        side.pack_start(search, False, False, 0)
+        topics_store = Gtk.TreeStore(str, str)   # title, topic_id
+        topics_view = Gtk.TreeView(model=topics_store, headers_visible=False)
+        topics_view.append_column(Gtk.TreeViewColumn(
+            "", Gtk.CellRendererText(), text=0))
+        side_scroller = Gtk.ScrolledWindow()
+        side_scroller.add(topics_view)
+        side.pack_start(side_scroller, True, True, 0)
+        pane.pack1(side, False, False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        content.set_border_width(10)
+        title_label = Gtk.Label(xalign=0)
+        body_label = Gtk.Label(xalign=0, yalign=0)
+        body_label.set_line_wrap(True)
+        body_label.set_selectable(True)
+        body_scroller = Gtk.ScrolledWindow()
+        body_scroller.add(body_label)
+        source_button = Gtk.Button(label="")
+        source_button.set_relief(Gtk.ReliefStyle.NONE)
+        content.pack_start(title_label, False, False, 0)
+        content.pack_start(body_scroller, True, True, 0)
+        content.pack_start(source_button, False, False, 0)
+        pane.pack2(content, True, False)
+
+        current = {"topic": None}
+
+        def show_topic(topic):
+            current["topic"] = topic
+            title_label.set_markup(f"<big><b>{GLib.markup_escape_text(topic.title)}"
+                                   "</b></big>")
+            body_label.set_text(topic.body)
+            source_button.set_label(f"⌁ Open the code — {topic.source_file}:"
+                                    f"{topic.source_line} {topic.symbol}()")
+
+        def fill(query=""):
+            topics_store.clear()
+            hits = {t.topic_id for t in rcm_help.search_topics(query)}
+            for section, topics in rcm_help.topics_by_section().items():
+                visible = [t for t in topics if t.topic_id in hits]
+                if not visible:
+                    continue
+                parent = topics_store.append(None, [section, ""])
+                for topic in visible:
+                    topics_store.append(parent, [topic.title, topic.topic_id])
+            topics_view.expand_all()
+
+        def on_select(selection):
+            model, it = selection.get_selected()
+            if it and model[it][1]:
+                show_topic(rcm_help.HELP_TOPICS[model[it][1]])
+        topics_view.get_selection().connect("changed", on_select)
+        search.connect("search-changed", lambda e: fill(e.get_text()))
+
+        def open_source(*_a):
+            topic = current["topic"]
+            if not topic:
+                return
+            status = rcm.open_in_editor(topic.source_file, topic.source_line)
+            if status:
+                self.say(status)
+                return
+            advice = Gtk.MessageDialog(
+                transient_for=d, modal=True, message_type=Gtk.MessageType.INFO,
+                buttons=Gtk.ButtonsType.NONE, text="No editor we recognise")
+            advice.format_secondary_text(
+                "To jump to a file and line, install a goto-capable editor "
+                "(VS Code, Sublime, gedit, Kate). Or open the file in a plain "
+                f"text editor — the topic lives at {topic.source_file} "
+                f"line {topic.source_line}.")
+            advice.add_buttons("Open with text editor", 1, Gtk.STOCK_CLOSE, 0)
+            if advice.run() == 1:
+                rcm.spawn_detached(["xdg-open",
+                                    str(rcm.APP / topic.source_file)])
+            advice.destroy()
+        source_button.connect("clicked", open_source)
+
+        fill()
+        if topic_id and topic_id in rcm_help.HELP_TOPICS:
+            show_topic(rcm_help.HELP_TOPICS[topic_id])
+        elif rcm_help.HELP_TOPICS:
+            show_topic(next(iter(rcm_help.HELP_TOPICS.values())))
+        d.show_all()
+        d.run()
+        d.destroy()
 
     def rebuild_buttons(self) -> None:
         """Redraw the Connect row from protocols.conf."""
@@ -374,53 +1323,115 @@ class Win(Gtk.Window):
 
     def reload(self) -> None:
         rcm.conns_cached(refresh=True)
+        if self.current_layout == "inspector":
+            self.reload_inspector()
+            self.refresh_health()
+            return
+        if self.store is None:
+            return
         keys = rcm.session_bindings()
         ticked = self.checked_sels()
         registry = protocols_safe()
         self.store.clear()
-        nodes: dict[str, Gtk.TreeIter] = {}
 
-        def group_iter(path: str):
-            """Row for a group path, creating each missing level above it."""
-            if not path:
-                return None
-            if path not in nodes:
-                parent = group_iter(path.rsplit("/", 1)[0] if "/" in path else "")
-                # Field order follows the C_* constants, not the visual order.
-                nodes[path] = self.store.append(
-                    parent, [False, "", path.rsplit("/", 1)[-1], "", "", "", "", "",
-                             700, Pango.Style.ITALIC])
-            return nodes[path]
+        def highlight(text: str) -> str:
+            """Escape, and in Spotlight wrap filter matches in the search tint."""
+            escaped = GLib.markup_escape_text(text)
+            needle = self.query_text.strip()
+            if not (self.highlight_matches and needle):
+                return escaped
+            pattern = re.compile(re.escape(GLib.markup_escape_text(needle)),
+                                 re.IGNORECASE)
+            return pattern.sub(
+                lambda m: f'<span background="#f8e45c" foreground="#000000">'
+                          f'{m.group(0)}</span>', escaped)
 
-        for c in rcm.conns_cached():
-            labels = protocol_badges(c.protocols, registry, c.default_protocol)
-            self.store.append(group_iter(c.group),
-                              [c.sel in ticked, "", c.name, c.host, c.username,
-                               labels, pretty_key(keys.get(c.sel, "")), c.sel,
-                               400, Pango.Style.NORMAL])
-        # Deepest first, so a parent sees its sub-groups already reconciled.
-        for path in sorted(nodes, key=lambda p: p.count("/"), reverse=True):
-            self._sync_group_check(nodes[path])
-        self.tree.expand_all()
-        self.count_lbl.set_text(f"({len(rcm.conns_cached())})")
+        def connection_row(c, parent):
+            name_markup = highlight(c.name)
+            state, _scope = rcm.connection_password_state(c)
+            if state == "none":
+                name_markup += ('\n<small><span foreground="#c04040">'
+                                'no password — will prompt</span></small>')
+            self.store.append(parent, [
+                c.sel in ticked, "", self.net_cell(c), name_markup,
+                highlight(c.host), c.username,
+                protocol_badges(c.protocols, registry, c.default_protocol),
+                pretty_key(keys.get(c.sel, "")), c.sel, 400, Pango.Style.NORMAL])
+
+        visible = 0
+        if self.flat_list:
+            # Flat list with italic dim heading rows on group changes (Rail,
+            # Spotlight, Cockpit). Headings carry no C_SEL, so selection and
+            # ticking of them is inert by the existing rules.
+            last_group = None
+            for c in rcm.conns_cached():
+                if not self.connection_matches_query(c):
+                    continue
+                if not self.chip_filters_allow(c):
+                    continue
+                if c.group != last_group and c.group:
+                    heading = GLib.markup_escape_text(c.group.replace("/", " / "))
+                    self.store.append(None, [False, "", "", heading, "", "", "",
+                                             "", "", 400, Pango.Style.ITALIC])
+                    last_group = c.group
+                connection_row(c, None)
+                visible += 1
+        else:
+            nodes: dict[str, Gtk.TreeIter] = {}
+
+            def group_iter(path: str):
+                if not path:
+                    return None
+                if path not in nodes:
+                    parent = group_iter(path.rsplit("/", 1)[0] if "/" in path else "")
+                    nodes[path] = self.store.append(
+                        parent, [False, "", "", GLib.markup_escape_text(
+                            path.rsplit("/", 1)[-1]), "", "", "", "", "",
+                            700, Pango.Style.ITALIC])
+                return nodes[path]
+
+            for c in rcm.conns_cached():
+                if not self.connection_matches_query(c):
+                    continue
+                connection_row(c, group_iter(c.group))
+                visible += 1
+            for path in sorted(nodes, key=lambda g: g.count("/"), reverse=True):
+                self._sync_group_check(nodes[path])
+            self.tree.expand_all()
+
+        total = len(rcm.conns_cached())
+        if getattr(self, "count_lbl", None):
+            self.count_lbl.set_text(f"({visible})" if visible == total
+                                    else f"({visible} of {total})")
+        if self.filter_entry is not None:
+            self.filter_entry.set_tooltip_text(f"{visible} of {total} match")
+        self.refresh_sidebar()
         self.refresh_live()
+        self.refresh_health()
 
     def refresh_live(self) -> None:
-        """Repaint the active-session list and the live markers in the tree."""
+        """Repaint everything that shows liveness, on the 4s timer."""
+        if self.current_layout == "inspector":
+            return
+        self.refresh_cockpit_cards()
+        if self.store is None or self.tree is None:
+            return
         live = rcm.active_sels()
 
-        smodel, spaths = self.slist.get_selection().get_selected_rows()
-        keep = {smodel[smodel.get_iter(p)][4] for p in spaths}
-        keys = rcm.session_bindings()
-        self.sstore.clear()
-        for s in rcm.sessions():
-            self.sstore.append([s.proto, s.label, s.host,
-                                pretty_key(keys.get(s.label, "")), s.pid, s.window])
-        if keep:
-            sel = self.slist.get_selection()
-            for row in self.sstore:
-                if row[4] in keep:
-                    sel.select_path(self.sstore.get_path(row.iter))
+        if self.slist is not None:
+            smodel, spaths = self.slist.get_selection().get_selected_rows()
+            keep = {smodel[smodel.get_iter(p)][4] for p in spaths}
+            keys = rcm.session_bindings()
+            self.sstore.clear()
+            for s in rcm.sessions():
+                self.sstore.append([s.proto, s.label, s.host,
+                                    pretty_key(keys.get(s.label, "")), s.pid,
+                                    s.window])
+            if keep:
+                sel = self.slist.get_selection()
+                for row in self.sstore:
+                    if row[4] in keep:
+                        sel.select_path(self.sstore.get_path(row.iter))
 
         def paint(it) -> bool:
             any_live = False
@@ -596,10 +1607,78 @@ class Win(Gtk.Window):
         if c and c.default_protocol:
             self.connect_selected(c.default_protocol, "", [c])
 
+    def chip_at_position(self, c, cell_x: int):
+        """Which protocol chip a click at cell_x landed on, or None.
+
+        Chips are Pango markup inside one text cell, so there are no per-chip
+        widgets to receive the click: the cell is measured with the same Pango
+        machinery that rendered it, giving each chip its x-range.
+        """
+        registry = protocols_safe()
+        x = 4   # renderer left padding
+        layout = self.tree.create_pango_layout("")
+        for pid in c.protocols:
+            proto = registry.get(pid)
+            if not proto:
+                continue
+            layout.set_markup(f" {GLib.markup_escape_text(proto.label)} ")
+            width = layout.get_pixel_size()[0]
+            if x <= cell_x <= x + width:
+                return pid
+            layout.set_markup(" ")
+            x += width + layout.get_pixel_size()[0]   # chip + joining space
+        return None
+
+    @help_topic_gui("protocol-chips", "Protocol chips",
+                    ("chips", "left-click", "launcher menu"),
+                    section="Connections")
+    def open_chip_menu(self, c, pid: str, event) -> None:
+        """The coloured protocol chips on a row are controls, not just labels.
+
+        Left-clicking a chip connects to that row over that protocol with its
+        default launcher. Right-clicking opens the launcher menu — every
+        command configured for the protocol, the default marked — plus a jump
+        to editing the launchers. The chip for the connection's default
+        protocol is underlined.
+        """
+        registry = protocols_safe()
+        proto = registry.get(pid)
+        if not proto:
+            return
+        menu = Gtk.Menu()
+        header = Gtk.MenuItem(label=f"CONNECT {proto.label.upper()} VIA")
+        header.set_sensitive(False)
+        menu.append(header)
+        for name in proto.launchers:
+            label = f"{name}  (default)" if name == proto.default else name
+            item = Gtk.MenuItem(label=label)
+            item.connect("activate",
+                         lambda _m, n=name: self.connect_selected(pid, n, [c]))
+            menu.append(item)
+        menu.append(Gtk.SeparatorMenuItem())
+        edit = Gtk.MenuItem(label="Edit launchers…")
+        edit.connect("activate", lambda _m: self.on_protocols())
+        menu.append(edit)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
     def on_tree_click(self, _w, event):
+        info = self.tree.get_path_at_pos(int(event.x), int(event.y))
+        if info and getattr(self, "protocols_column", None) is not None:
+            path, column, cell_x, _cell_y = info
+            if column is self.protocols_column:
+                sel = self.store[self.store.get_iter(path)][C_SEL]
+                c = rcm.find(sel) if sel else None
+                pid = self.chip_at_position(c, cell_x) if c else None
+                if c and pid:
+                    if event.button == 1:
+                        self.connect_selected(pid, "", [c])
+                        return True
+                    if event.button == 3:
+                        self.open_chip_menu(c, pid, event)
+                        return True
         if event.button != 3:
             return False
-        info = self.tree.get_path_at_pos(int(event.x), int(event.y))
         if not info:
             return False
         path = info[0]
@@ -632,6 +1711,47 @@ class Win(Gtk.Window):
                     sub.append(mi)
                 top.set_submenu(sub)
             menu.append(top)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Terminals (11a): a transport per ssh-ish protocol; one tab per host,
+        # offered on ANY connection -- worst case the server refuses.
+        term = Gtk.MenuItem(label=f"Open terminal ({len(cs)})" if cs else "Open terminal")
+        term.set_sensitive(bool(cs))
+        term_sub = Gtk.Menu()
+        for proto in protocols_safe().values():
+            if proto.id not in ("ssh",) and "ssh" not in proto.detect_process:
+                continue
+            item = Gtk.MenuItem(label=proto.label)
+            item.connect("activate",
+                         lambda _m: [self.open_terminal_tab(c) for c in cs])
+            term_sub.append(item)
+        term.set_submenu(term_sub)
+        menu.append(term)
+
+        offline = [c for c in cs
+                   if getattr(self, "net_state", {}).get(c.sel) is False
+                   and c.extra.get("rcm-mac")]
+        wake_item = Gtk.MenuItem(label=f"⚡ Wake ({len(offline)})")
+        wake_item.set_sensitive(bool(offline))
+        def do_wake(_m):
+            for c in offline:
+                rcm.wake(c.extra["rcm-mac"], host=c.host)
+            self.say(f"magic packet(s) sent to {len(offline)} host(s)")
+        wake_item.connect("activate", do_wake)
+        menu.append(wake_item)
+
+        run_item = Gtk.MenuItem(label=f"Run script ▸ ({len(cs)})" if cs
+                                else "Run script")
+        run_item.set_sensitive(bool(cs))
+        run_item.connect("activate", lambda _m, sel=cs: self.run_script_dialog(sel))
+        menu.append(run_item)
+
+        if len(cs) == 1:
+            history = Gtk.MenuItem(label="History")
+            history.connect("activate",
+                            lambda _m, c=cs[0]: self.show_connection_history(c))
+            menu.append(history)
 
         menu.append(Gtk.SeparatorMenuItem())
 
@@ -722,134 +1842,227 @@ class Win(Gtk.Window):
         d.destroy()
         return val if resp == Gtk.ResponseType.OK else ""
 
-    def edit_dialog(self, c: rcm.Conn | None) -> None:
+    @help_topic_gui("edit-connection", "Creating and editing a connection",
+                    ("edit", "new", "rename", "regroup", "default protocol",
+                     "kept values"), section="Connections")
+    def edit_dialog(self, c) -> None:
+        """One dialog defines a connection: identity, target, protocols, keys.
+
+        Group and Name are always editable — renaming or regrouping moves the
+        .rdp file, and the keyring entries and keyboard shortcut follow
+        automatically. Typing a new group name creates the group.
+
+        Each configured protocol is a row: tick it to offer that protocol on
+        this connection, pick one row as the Default (what double-click and
+        the shortcut use — underlined in the list). A row's parameters show
+        while it is ticked, and values are never lost by unticking: they are
+        kept, shown as e.g. "port 5901 kept", and return on re-tick.
+
+        The password override and the shortcut live in their own expanders;
+        a blank password always means "leave as is".
+        """
         new = c is None
-        d = Gtk.Dialog(title="New connection" if new else f"Edit {c.sel}",
+        registry = protocols_safe()
+        d = Gtk.Dialog(title="New connection" if new else f"Edit — {c.sel}",
                        transient_for=self, modal=True)
         d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
                       Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
-        grid = Gtk.Grid(row_spacing=6, column_spacing=8, border_width=12)
-        d.get_content_area().add(grid)
-        registry = protocols_safe()
-        rows = [("Group", c.group if c else ""), ("Name", c.name if c else ""),
-                ("Host", c.host if c else ""), ("Username", c.username if c else "")]
-        # One port field per protocol that uses one, straight from the registry.
-        port_ids = []
-        for pr in registry.values():
-            if not pr.port:
-                continue
-            port_ids.append(pr.id)
-            rows.append((f"{pr.label} port",
-                         str(c.port_for(pr.id)) if c else str(pr.port)))
-        fields = {}
-        for i, (label, val) in enumerate(rows):
-            grid.attach(Gtk.Label(label=label, xalign=1), 0, i, 1, 1)
-            e = Gtk.Entry(text=val, activates_default=True)
-            e.set_width_chars(28)
-            if not new and label in ("Group", "Name"):
-                e.set_sensitive(False)  # the filename is the identity; rename = Duplicate
-                e.set_tooltip_text("Use Duplicate to change the group or name")
-            grid.attach(e, 1, i, 1, 1)
-            fields[label] = e
-
-        grid.attach(Gtk.Label(label="Protocols", xalign=1), 0, len(rows), 1, 1)
-        pbox = Gtk.Box(spacing=10)
-        checks = {}
-        have = c.protocols if c else tuple(registry)
-        for pr in registry.values():
-            cb = Gtk.CheckButton(label=pr.label)
-            cb.set_active(pr.id in have)
-            checks[pr.id] = cb
-            pbox.pack_start(cb, False, False, 0)
-        grid.attach(pbox, 1, len(rows), 1, 1)
-
-        # Which protocol a double-click (and `rcm goto`) uses.
-        grid.attach(Gtk.Label(label="Default", xalign=1), 0, len(rows) + 1, 1, 1)
-        dbox = Gtk.Box(spacing=6)
-        default_combo = Gtk.ComboBoxText()
-        cur_default = c.default_protocol if c else ""
-        for pr in registry.values():
-            default_combo.append(pr.id, pr.label)
-        if cur_default:
-            default_combo.set_active_id(cur_default)
-        elif registry:
-            default_combo.set_active(0)
-        dbox.pack_start(default_combo, False, False, 0)
-        dhint = Gtk.Label(xalign=0)
-        dhint.set_markup("<small>used by double-click and its shortcut; "
-                         "underlined in the list</small>")
-        dhint.get_style_context().add_class("dim-label")
-        dbox.pack_start(dhint, False, False, 0)
-        grid.attach(dbox, 1, len(rows) + 1, 1, 1)
-
-        # Per-connection credential override. Blank password = inherit the group's
-        # entry, then Default. Only written when the user actually types one.
-        r = len(rows) + 2
-        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        sep.set_margin_top(6)
-        grid.attach(sep, 0, r, 2, 1)
-        inherited_user, inherited_pw = ("", "")
-        if c:
-            inherited_user, inherited_pw = rcm.creds_lookup(c.sel, c.username)
-        has_own = bool(c and rcm.secret_get(c.sel))
-        lbl = Gtk.Label(xalign=1, label="Password")
-        grid.attach(lbl, 0, r + 1, 1, 1)
-        epw = Gtk.Entry(visibility=False, activates_default=True)
-        epw.set_width_chars(28)
-        epw.set_placeholder_text("override for this connection"
-                                 if not has_own else "keep this connection's password")
-        grid.attach(epw, 1, r + 1, 1, 1)
-        info = Gtk.Label(xalign=0)
-        info.set_markup(
-            "<small>" + ("This connection has its own password." if has_own else
-                         (f"Inherits a password (user {inherited_user})."
-                          if inherited_pw else "No password set anywhere yet."))
-            + " Blank = leave as is.</small>")
-        info.get_style_context().add_class("dim-label")
-        grid.attach(info, 1, r + 2, 1, 1)
-        clear_pw = Gtk.CheckButton(label="Remove this connection's own password")
-        clear_pw.set_sensitive(has_own)
-        grid.attach(clear_pw, 1, r + 3, 1, 1)
-
-        sep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        sep2.set_margin_top(6)
-        grid.attach(sep2, 0, r + 4, 2, 1)
-        grid.attach(Gtk.Label(label="Shortcut", xalign=1), 0, r + 5, 1, 1)
-        sc_box = Gtk.Box(spacing=6)
-        cur_binding = rcm.session_bindings().get(c.sel, "") if c else ""
-        sc_btn = ShortcutButton(cur_binding)
-        sc_box.pack_start(sc_btn, False, False, 0)
-        sc_hint = Gtk.Label(xalign=0)
-        sc_hint.set_markup("<small>focuses it if live, connects it if not</small>")
-        sc_hint.get_style_context().add_class("dim-label")
-        sc_box.pack_start(sc_hint, False, False, 0)
-        grid.attach(sc_box, 1, r + 5, 1, 1)
-
         d.set_default_response(Gtk.ResponseType.OK)
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        body.set_border_width(12)
+        d.get_content_area().add(body)
+        columns = Gtk.Box(spacing=16)
+        body.pack_start(columns, True, True, 0)
+
+        # ---- left column: identity + target ------------------------------ #
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        columns.pack_start(left, True, True, 0)
+
+        def caption(text):
+            label = Gtk.Label(xalign=0)
+            label.set_markup(f"<small><b>{text}</b></small>")
+            label.get_style_context().add_class("dim-label")
+            left.pack_start(label, False, False, 2)
+
+        def entry_row(label_text, value, width=24):
+            left.pack_start(Gtk.Label(label=label_text, xalign=0), False, False, 0)
+            entry = Gtk.Entry(text=value, activates_default=True)
+            entry.set_width_chars(width)
+            left.pack_start(entry, False, False, 0)
+            return entry
+
+        caption("IDENTITY")
+        left.pack_start(Gtk.Label(label="Group", xalign=0), False, False, 0)
+        group_combo = Gtk.ComboBoxText.new_with_entry()
+        for group in rcm.groups():
+            group_combo.append_text(group)
+        group_combo.get_child().set_text(c.group if c else "")
+        left.pack_start(group_combo, False, False, 0)
+        name_entry = entry_row("Name", c.name if c else "")
+        move_hint = Gtk.Label(xalign=0)
+        move_hint.set_markup("<small>renaming or regrouping moves the .rdp file —\n"
+                             "keyring entry and shortcut follow</small>")
+        move_hint.get_style_context().add_class("dim-label")
+        left.pack_start(move_hint, False, False, 2)
+        caption("TARGET")
+        host_entry = entry_row("Host", c.host if c else "")
+        user_entry = entry_row("Username", c.username if c else "")
+
+        # ---- right column: one bordered row per protocol ------------------ #
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        columns.pack_start(right, True, True, 0)
+        proto_caption = Gtk.Label(xalign=0)
+        proto_caption.set_markup("<small><b>PROTOCOLS</b></small>")
+        proto_caption.get_style_context().add_class("dim-label")
+        right.pack_start(proto_caption, False, False, 2)
+
+        enabled = set(c.protocols if c else registry)
+        current_default = (c.default_protocol if c else
+                           next(iter(registry), ""))
+        rows: dict[str, dict] = {}
+        radio_anchor = None
+
+        def refresh_row_states(*_a):
+            checked = [pid for pid, row in rows.items()
+                       if row["check"].get_active()]
+            for pid, row in rows.items():
+                active = row["check"].get_active()
+                row["radio"].set_visible(active)
+                row["revealer"].set_reveal_child(active)
+                port_text = row["port"].get_text().strip() if row["port"] else ""
+                proto_default = str(registry[pid].port or "")
+                kept = (not active and port_text and port_text != proto_default)
+                row["kept"].set_visible(kept)
+                if kept:
+                    row["kept"].set_markup(
+                        f"<small>port {GLib.markup_escape_text(port_text)} kept</small>")
+            if checked and not any(rows[pid]["radio"].get_active()
+                                   for pid in checked):
+                rows[checked[0]]["radio"].set_active(True)
+
+        for proto in registry.values():
+            frame = Gtk.Frame()
+            row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            row_box.set_border_width(6)
+            frame.add(row_box)
+            head = Gtk.Box(spacing=8)
+            check = Gtk.CheckButton(label=proto.label)
+            check.set_active(proto.id in enabled)
+            head.pack_start(check, False, False, 0)
+            kept_label = Gtk.Label(xalign=0)
+            kept_label.get_style_context().add_class("dim-label")
+            head.pack_start(kept_label, False, False, 0)
+            radio = Gtk.RadioButton.new_with_label_from_widget(radio_anchor,
+                                                               "Default")
+            radio_anchor = radio_anchor or radio
+            radio.set_active(proto.id == current_default)
+            head.pack_end(radio, False, False, 0)
+            row_box.pack_start(head, False, False, 0)
+            revealer = Gtk.Revealer()
+            params = Gtk.Box(spacing=6)
+            params.set_margin_start(24)
+            port_entry = None
+            if proto.port:
+                params.pack_start(Gtk.Label(label="port"), False, False, 0)
+                port_entry = Gtk.Entry(width_chars=7, activates_default=True)
+                port_entry.set_text(str(c.port_for(proto.id) if c else proto.port))
+                port_entry.connect("changed", refresh_row_states)
+                params.pack_start(port_entry, False, False, 0)
+            revealer.add(params)
+            row_box.pack_start(revealer, False, False, 0)
+            right.pack_start(frame, False, False, 0)
+            rows[proto.id] = {"check": check, "radio": radio,
+                              "revealer": revealer, "port": port_entry,
+                              "kept": kept_label}
+            check.connect("toggled", refresh_row_states)
+        default_hint = Gtk.Label(xalign=0)
+        default_hint.set_markup("<small>Default = double-click and the shortcut; "
+                                "underlined in the list.\nUnchecking keeps "
+                                "values — saved as rcm-* keys, clients ignore "
+                                "them.</small>")
+        default_hint.get_style_context().add_class("dim-label")
+        default_hint.set_line_wrap(True)
+        right.pack_start(default_hint, False, False, 2)
+
+        # ---- password + shortcut expanders -------------------------------- #
+        password_expander = Gtk.Expander(label="Password", expanded=True)
+        pw_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        pw_box.set_border_width(6)
+        password_expander.add(pw_box)
+        inherited_user = ""
+        has_own = bool(c and rcm.secret_get(c.sel))
+        if c:
+            inherited_user, _pw = rcm.creds_lookup(c.sel, c.username)
+        epw = Gtk.Entry(visibility=False, activates_default=True)
+        epw.set_placeholder_text("keep this connection's password" if has_own
+                                 else "override for this connection")
+        pw_box.pack_start(epw, False, False, 0)
+        pw_state, pw_scope = (rcm.connection_password_state(c) if c
+                              else ("none", ""))
+        pw_info = Gtk.Label(xalign=0)
+        if has_own:
+            info_text = "This connection has its own password."
+        elif pw_state == "inherited":
+            info_text = (f"Inherits from {pw_scope.split('@')[0]} "
+                         f"(user {inherited_user}).")
+        else:
+            info_text = "No password anywhere on the chain — will prompt."
+        pw_info.set_markup(f"<small>{GLib.markup_escape_text(info_text)} "
+                           "Blank = leave as is.</small>")
+        pw_info.get_style_context().add_class("dim-label")
+        pw_box.pack_start(pw_info, False, False, 0)
+        clear_pw = Gtk.CheckButton(
+            label="Remove this connection's own password"
+                  + ("" if has_own else "  (none set)"))
+        clear_pw.set_sensitive(has_own)
+        pw_box.pack_start(clear_pw, False, False, 0)
+        body.pack_start(password_expander, False, False, 0)
+
+        shortcut_expander = Gtk.Expander(label="Shortcut", expanded=True)
+        sc_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        sc_box.set_border_width(6)
+        shortcut_expander.add(sc_box)
+        cur_binding = rcm.session_bindings().get(c.sel, "") if c else ""
+        sc_row = Gtk.Box(spacing=8)
+        sc_btn = ShortcutButton(cur_binding)
+        sc_row.pack_start(sc_btn, False, False, 0)
+        sc_hint = Gtk.Label(xalign=0)
+        sc_hint.set_markup("<small>click, then press the combo · Backspace "
+                           "clears\nfocuses it if live, connects it if "
+                           "not</small>")
+        sc_hint.get_style_context().add_class("dim-label")
+        sc_row.pack_start(sc_hint, False, False, 0)
+        sc_box.pack_start(sc_row, False, False, 0)
+        body.pack_start(shortcut_expander, False, False, 0)
+
         d.show_all()
+        refresh_row_states()
         if d.run() != Gtk.ResponseType.OK:
             d.destroy()
             return
-        g = fields["Group"].get_text().strip()
-        n = fields["Name"].get_text().strip()
-        h = fields["Host"].get_text().strip()
-        u = fields["Username"].get_text().strip()
 
-        def as_int(key, fallback):
+        # ---- collect ------------------------------------------------------ #
+        g = group_combo.get_child().get_text().strip().strip("/")
+        n = name_entry.get_text().strip()
+        h = host_entry.get_text().strip()
+        u = user_entry.get_text().strip()
+        checked = [pid for pid, row in rows.items() if row["check"].get_active()]
+        default_pid = next((pid for pid in checked
+                            if rows[pid]["radio"].get_active()),
+                           checked[0] if checked else "")
+        ports: dict[str, int] = {}
+        for pid, row in rows.items():
+            if row["port"] is None:
+                continue
             try:
-                return int(fields[key].get_text().strip() or fallback)
+                ports[pid] = int(row["port"].get_text().strip())
             except ValueError:
-                return fallback
-
-        ports = {pid: as_int(f"{registry[pid].label} port", registry[pid].port)
-                 for pid in port_ids}
-        p = ports.pop("rdp", 3389)
-        chosen = [k for k, cb in checks.items() if cb.get_active()] or list(registry)
-        protos = "" if len(chosen) == len(registry) else ",".join(chosen)
+                pass
+        rdp_port = ports.pop("rdp", 3389)
+        protos = "" if len(checked) == len(registry) else ",".join(checked)
         new_pw = epw.get_text()
         drop_pw = clear_pw.get_active()
         new_binding = sc_btn.binding
-        new_default = default_combo.get_active_id() or ""
         d.destroy()
 
         if not n or not h:
@@ -857,18 +2070,29 @@ class Win(Gtk.Window):
             return
         if new:
             try:
-                rcm.write_rdp(g, n, h, u, p, ports=ports, protocols=protos,
-                              default_proto=new_default)
+                rcm.write_rdp(g, n, h, u, rdp_port, ports=ports,
+                              protocols=protos, default_proto=default_pid)
             except FileExistsError:
-                self._dialog(Gtk.MessageType.ERROR, "That connection already exists")
+                self._dialog(Gtk.MessageType.ERROR,
+                             "That connection already exists")
                 return
-            self.say(f"created {g}/{n}" if g else f"created {n}")
+            rcm.conns_cached(refresh=True)
+            target = rcm.find(f"{g}/{n}" if g else n)
+            self.say(f"created {target.sel}")
         else:
-            rcm.set_fields(c, host=h, username=u, port=p, ports=ports,
-                           protocols=protos, default_proto=new_default)
-            self.say(f"saved {c.sel}")
+            target = c
+            if (g, n) != (c.group, c.name):
+                try:
+                    target = rcm.move_connection(c, g, n)
+                except (FileExistsError, ValueError, RuntimeError) as e:
+                    self._dialog(Gtk.MessageType.ERROR, "Cannot move", str(e))
+                    return
+                self.say(f"moved {c.sel} → {target.sel}")
+            rcm.set_fields(target, host=h, username=u, port=rdp_port,
+                           ports=ports, protocols=protos,
+                           default_proto=default_pid)
 
-        sel = f"{g}/{n}" if g else n
+        sel = target.sel
         if drop_pw:
             rcm.secret_clear(sel)
             self.say(f"saved {sel}; its own password removed (now inherited)")
@@ -876,22 +2100,17 @@ class Win(Gtk.Window):
             if rcm.secret_set(sel, new_pw):
                 self.say(f"saved {sel} with its own password")
             else:
-                self._dialog(Gtk.MessageType.ERROR, "Could not store the password",
+                self._dialog(Gtk.MessageType.ERROR,
+                             "Could not store the password",
                              "No keyring is available.")
-
         if new_binding != cur_binding:
-            g, s = rcm.load_shortcuts()
+            gkeys, per_session = rcm.load_shortcuts()
             if new_binding:
-                s[sel] = new_binding
+                per_session[sel] = new_binding
             else:
-                s.pop(sel, None)
-            if c and c.sel != sel:
-                s.pop(c.sel, None)
-            rcm.save_shortcuts(g, s)
+                per_session.pop(sel, None)
+            rcm.save_shortcuts(gkeys, per_session)
             rcm.shortcuts_install()
-            self.say(f"saved {sel}; shortcut "
-                     + (f"set to {pretty_key(new_binding)}" if new_binding else "removed"))
-
         rcm.gen_launcher()
         self.reload()
 
@@ -1578,6 +2797,11 @@ def run() -> int:
     w = Win()
     install_css(protocols_safe(), w)
     w.reload()
+    # The offline guide regenerates whenever the registry grew or the code moved.
+    try:
+        rcm.dump_help_html()
+    except OSError:
+        pass
     if migrated:
         w.say("launchers.conf upgraded to protocols.conf")
     elif created:

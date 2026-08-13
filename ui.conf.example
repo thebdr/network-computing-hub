@@ -1,0 +1,16 @@
+# Manager window state. The GUI writes this; editing it by hand is equally fine.
+
+[ui]
+# Which window layout the manager uses: rail | spotlight | cockpit | inspector
+# | classic. The Layout button in the headerbar writes this same key.
+layout = rail
+
+[tabs]
+# Pinned filter tabs, shared by every layout. One per line:
+#   tab.<n> = <label>|<group filter>|<text filter>
+# The "All" tab is built in and not listed here.
+
+[help]
+# Editor used by Help's "Open code" links, e.g. `code --goto {file}:{line}`.
+# Leave empty to auto-detect; Help asks once when nothing is found.
+editor =
