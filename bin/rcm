@@ -1205,6 +1205,16 @@ def classify_process_protocol(args: str, protos: dict[str, Protocol] | None = No
     return None
 
 
+@dataclass
+class Session:
+    """One live remote session, matched back to a saved connection when possible."""
+    proto: str      # protocol label as configured, e.g. "RDP"
+    label: str      # connection sel, or best-effort name when unmatched
+    host: str
+    pid: int
+    window: str = ""   # X11 window id, empty when none was found
+
+
 def sessions() -> list[Session]:
     """Live sessions from any configured launcher, matched back to connections."""
     out: list[Session] = []
