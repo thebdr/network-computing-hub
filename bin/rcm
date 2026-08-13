@@ -53,9 +53,13 @@ UI_CONF = APP / "ui.conf"
 WORKSPACES_CONF = APP / "workspaces.conf"
 LOGS_DIR = APP / "logs"
 
-# Window layouts a user can switch between; "rail" is the designed default and
-# "classic" is the pre-redesign window kept for continuity.
-LAYOUTS = ("rail", "spotlight", "cockpit", "inspector", "classic")
+# Window layouts a user can switch between. Browse absorbed the three flat
+# variants of the original design (rail / spotlight / cockpit): they were one
+# layout differing only in sidebar, filter emphasis and where live sessions
+# rendered, so those became toggles inside Browse instead of modes beside it.
+LAYOUTS = ("browse", "inspector", "classic")
+LEGACY_LAYOUT_NAMES = {"rail": "browse", "spotlight": "browse",
+                       "cockpit": "browse"}
 LEGACY_CREDS = Path.home() / ".config" / "radmin" / "creds.conf"
 
 DESKTOP_FILE = Path.home() / ".local/share/applications/rdp-menu.desktop"
@@ -861,9 +865,11 @@ DEFAULT||
 # Manager window state. The GUI writes this; editing it by hand is equally fine.
 
 [ui]
-# Which window layout the manager uses: rail | spotlight | cockpit | inspector
-# | classic. The Layout button in the headerbar writes this same key.
-layout = rail
+# Which window layout the manager uses: browse | inspector | classic.
+# The Layout button in the headerbar writes this same key.
+layout = browse
+# Browse only: show the group sidebar. The ⊞ button toggles this.
+sidebar = on
 
 [tabs]
 # Pinned filter tabs, shared by every layout. One per line:
@@ -1817,24 +1823,27 @@ def set_connection_extra(c: Conn, key: str, value: str) -> None:
 @help_topic("layouts", "Window layouts", ("rail", "spotlight", "cockpit",
             "inspector", "classic", "layout menu"), section="The window")
 def load_ui_state() -> dict:
-    """The manager offers five switchable window layouts.
+    """The manager offers three window layouts.
 
-    Rail (the default) pairs a group sidebar with the connection list; Spotlight
-    is a filter-first flat list; Cockpit leads with live-session cards;
-    Inspector is a read-only audit of credentials and configuration health;
-    Classic is the original window, kept for continuity.
+    Browse (the default) is the everyday view: a filter-first flat list with a
+    collapsible group sidebar, and live sessions appearing as a card strip only
+    while any exist. Inspector is a read-only audit of credentials and
+    configuration health. Classic is the original window, kept for continuity.
 
     The choice is saved as `layout =` in ui.conf and survives restarts, as do
-    the pinned filter tabs, which are shared by every layout.
+    the pinned filter tabs and the sidebar toggle, shared by every layout.
+    Older files naming rail, spotlight or cockpit are read as Browse.
     """
-    state = {"layout": "rail", "tabs": [], "editor": ""}
+    state = {"layout": "browse", "tabs": [], "editor": "", "sidebar": True}
     if not UI_CONF.is_file():
         return state
     parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
     parser.optionxform = str
     parser.read(UI_CONF)
-    layout = parser.get("ui", "layout", fallback="rail").strip().lower()
-    state["layout"] = layout if layout in LAYOUTS else "rail"
+    layout = parser.get("ui", "layout", fallback="browse").strip().lower()
+    layout = LEGACY_LAYOUT_NAMES.get(layout, layout)
+    state["layout"] = layout if layout in LAYOUTS else "browse"
+    state["sidebar"] = parser.getboolean("ui", "sidebar", fallback=True)
     if parser.has_section("tabs"):
         for _key, raw in sorted(parser.items("tabs")):
             parts = (raw.split("|") + ["", "", ""])[:3]
@@ -1848,7 +1857,9 @@ def save_ui_state(state: dict) -> None:
     """Rewrite ui.conf. Header comments come from the documented default."""
     header, _, _ = DEFAULT_CONFIGS["ui.conf"].partition("[ui]")
     lines = [header.rstrip("\n"), "", "[ui]",
-             f"layout = {state.get('layout', 'rail')}", "", "[tabs]"]
+             f"layout = {state.get('layout', 'browse')}",
+             f"sidebar = {'on' if state.get('sidebar', True) else 'off'}",
+             "", "[tabs]"]
     for index, (label, group, text) in enumerate(state.get("tabs", []), start=1):
         lines.append(f"tab.{index} = {label}|{group}|{text}")
     lines += ["", "[help]", f"editor = {state.get('editor', '')}"]

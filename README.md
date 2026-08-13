@@ -190,13 +190,15 @@ Two independent mechanisms, on purpose:
 
 ## The manager
 
-The window has five switchable layouts (the Layout button, saved as `layout =` in
-`ui.conf`): **Rail** — group sidebar with counts, flat list, active pane; **Spotlight**
-— one big filter over everything, matches highlighted; **Cockpit** — live-session
-cards first; **Inspector** — a read-only audit showing where every connection's
-password comes from and whether its protocols are healthy; **Classic** — the original
-window. Pinned filter tabs (Ctrl+T) sit under the headerbar and are shared by every
-layout. Configuration problems never block the window: they surface in the status
+The window has three layouts (the Layout button, saved as `layout =` in `ui.conf`):
+**Browse** — the everyday view: a filter-first flat list with match highlighting, a
+collapsible group sidebar (the ⊞ button), Live and per-protocol filter chips, and
+live sessions appearing as a card strip only while any exist; **Inspector** — a
+read-only audit showing where every connection's password comes from and whether its
+protocols are healthy; **Classic** — the original window. (Earlier builds shipped
+Browse's variants as separate Rail/Spotlight/Cockpit modes; they were one layout
+differing in toggles, so now they are toggles — old `layout =` values migrate.)
+Pinned filter tabs (Ctrl+T) sit under the headerbar and are shared by every layout. Configuration problems never block the window: they surface in the status
 bar, on the Setup badge, and per-row.
 
 The hamburger menu is gone — **Setup** (sidebar footer, or the Layout menu) carries

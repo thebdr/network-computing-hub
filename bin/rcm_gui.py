@@ -262,9 +262,7 @@ class Win(Gtk.Window):
         GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
 
     LAYOUT_DESCRIPTIONS = {
-        "rail": "group sidebar · flat list · active pane",
-        "spotlight": "one big filter over everything",
-        "cockpit": "live sessions first, list below",
+        "browse": "filter, list, sidebar toggle · live sessions as cards",
         "inspector": "read-only audit of credentials and config",
         "classic": "the original window",
     }
@@ -427,7 +425,7 @@ class Win(Gtk.Window):
             child.destroy()
         for name in ("tree", "store", "slist", "sstore", "button_box", "sidebar",
                      "setup_badge", "filter_entry", "inspector_store",
-                     "cockpit_cards"):
+                     "cockpit_cards", "cards_revealer"):
             setattr(self, name, None)
 
     def apply_layout(self, layout_id: str) -> None:
@@ -445,8 +443,8 @@ class Win(Gtk.Window):
         self.filter_entry = None
         self.inspector_store = None
         self.cockpit_cards = None
-        self.flat_list = layout_id in ("rail", "spotlight", "cockpit")
-        self.highlight_matches = layout_id == "spotlight"
+        self.flat_list = layout_id == "browse"
+        self.highlight_matches = layout_id == "browse"
         self.current_layout = layout_id
         if not rcm.conns_cached(refresh=True) and \
                 not getattr(self, "first_run_skipped", False):
@@ -689,20 +687,72 @@ class Win(Gtk.Window):
         self.rebuild_buttons()
         return self.button_box
 
-    # ---- Rail ----------------------------------------------------------- #
-    def build_rail_layout(self):
-        """Design 8a: group sidebar, flat list, active pane."""
-        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_position(190)
+    # ---- Browse --------------------------------------------------------- #
+    @help_topic_gui("browse-layout", "The Browse layout",
+                    ("browse", "sidebar", "filter", "cards", "live"),
+                    section="The window")
+    def build_browse_layout(self):
+        """Browse is the everyday view; its variants are toggles, not modes.
 
+        The filter is always front and centre, and matches highlight while you
+        type. The group sidebar collapses with the ⊞ button (remembered in
+        ui.conf), turning the same layout from sidebar-navigation into a pure
+        filter view. Live sessions appear as a strip of cards — protocol chip,
+        name, Focus/Disconnect — only while any exist, so an idle window gives
+        every pixel to the list. The Live and per-protocol chips beside the
+        filter narrow the list to matching rows.
+        """
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        outer.set_border_width(8)
+
+        # Live sessions: present only when there is something to show.
+        self.cards_revealer = Gtk.Revealer()
+        self.cockpit_cards = Gtk.FlowBox()
+        self.cockpit_cards.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.cockpit_cards.set_max_children_per_line(6)
+        self.cockpit_cards.set_min_children_per_line(2)
+        self.cards_revealer.add(self.cockpit_cards)
+        outer.pack_start(self.cards_revealer, False, False, 0)
+
+        row = Gtk.Box(spacing=6)
+        sidebar_toggle = Gtk.ToggleButton(label="⊞")
+        sidebar_toggle.set_tooltip_text("Show or hide the group sidebar")
+        sidebar_toggle.set_active(self.ui_state.get("sidebar", True))
+        row.pack_start(sidebar_toggle, False, False, 0)
+        self.filter_entry = Gtk.SearchEntry()
+        self.filter_entry.set_placeholder_text(
+            "matches name · host · group · user   (Ctrl+T pins as tab)")
+        self.filter_entry.set_text(self.query_text)
+        self.filter_entry.connect("search-changed", self.on_filter_changed)
+        row.pack_start(self.filter_entry, True, True, 0)
+        self.live_chip = Gtk.ToggleButton(label="Live")
+        self.live_chip.set_tooltip_text("Only rows with a live session")
+        self.live_chip.connect("toggled", lambda *_: self.reload())
+        row.pack_start(self.live_chip, False, False, 0)
+        self.proto_chips = {}
+        for proto in protocols_safe().values():
+            chip = Gtk.ToggleButton(label=proto.label)
+            chip.connect("toggled", lambda *_: self.reload())
+            self.proto_chips[proto.id] = chip
+            row.pack_start(chip, False, False, 0)
+        recheck = Gtk.Button(label="Recheck")
+        recheck.set_tooltip_text("Re-probe the visible rows now")
+        recheck.connect("clicked", lambda *_: self.recheck_visible())
+        row.pack_start(recheck, False, False, 0)
+        new_button = Gtk.Button(label="New")
+        new_button.connect("clicked", lambda *_: self.edit_dialog(None))
+        row.pack_start(new_button, False, False, 0)
+        outer.pack_start(row, False, False, 0)
+
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        side.set_border_width(6)
+        side.set_border_width(2)
         self.sidebar = Gtk.TreeView(headers_visible=False)
         self.sidebar.get_style_context().add_class("sidebar")
-        self.sidebar_store = Gtk.TreeStore(str, str)   # markup, group path
+        self.sidebar_store = Gtk.TreeStore(str, str)
         self.sidebar.set_model(self.sidebar_store)
-        renderer = Gtk.CellRendererText()
-        self.sidebar.append_column(Gtk.TreeViewColumn("", renderer, markup=0))
+        self.sidebar.append_column(Gtk.TreeViewColumn(
+            "", Gtk.CellRendererText(), markup=0))
         self.sidebar.get_selection().connect("changed", self.on_sidebar_selected)
         side_scroller = Gtk.ScrolledWindow()
         side_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -714,19 +764,24 @@ class Win(Gtk.Window):
         self.setup_badge.connect("clicked", lambda *_: self.on_setup())
         side.pack_start(self.setup_badge, False, False, 0)
         paned.pack1(side, False, False)
+        paned.pack2(self.build_connection_list(), True, False)
+        paned.set_position(190 if sidebar_toggle.get_active() else 0)
+        outer.pack_start(paned, True, True, 0)
 
-        right = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        right.set_position(600)
-        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        main.set_border_width(8)
-        main.pack_start(self.build_filter_row(
-            "filter name, host, user…  (Ctrl+T pins as tab)"), False, False, 0)
-        main.pack_start(self.build_connection_list(), True, True, 0)
-        main.pack_start(self.build_connect_button_box(), False, False, 0)
-        right.pack1(main, True, False)
-        right.pack2(self.build_active_pane(), False, False)
-        paned.pack2(right, True, False)
-        return paned
+        def on_sidebar_toggled(button):
+            visible = button.get_active()
+            paned.set_position(190 if visible else 0)
+            side.set_visible(visible)
+            if not visible:
+                self.query_group = ""
+                self.reload()
+            self.ui_state["sidebar"] = visible
+            rcm.save_ui_state(self.ui_state)
+        sidebar_toggle.connect("toggled", on_sidebar_toggled)
+        self._browse_side_box = side
+
+        outer.pack_start(self.build_connect_button_box(), False, False, 0)
+        return outer
 
     def on_sidebar_selected(self, selection) -> None:
         model, it = selection.get_selected()
@@ -752,273 +807,13 @@ class Win(Gtk.Window):
         problems = len(rcm.config_health())
         self.setup_badge.set_label(
             f"⚙ Setup{f'  ({problems}⚠)' if problems else ''}")
-
-    @help_topic_gui("setup-page", "The Setup page",
-                    ("setup", "settings", "warnings", "import", "export"),
-                    section="Setup")
-    def on_setup(self) -> None:
-        """Everything that used to hide in the menu lives on the Setup page.
-
-        Four cards — Protocols, Credentials, Keyboard shortcuts, Import/Export
-        — each fronting the same plain files you can edit by hand. Warnings
-        from the health check appear as a banner with a one-click action, and
-        the badge on the Setup entry counts them.
-        """
-        self.reset_body_references()
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        page.set_border_width(14)
-
-        bar = Gtk.Box(spacing=8)
-        back = Gtk.Button(label="‹ Back")
-        back.connect("clicked", lambda *_: self.apply_layout(self.ui_state["layout"]))
-        bar.pack_start(back, False, False, 0)
-        heading = Gtk.Label(xalign=0)
-        heading.set_markup("<b>Setup</b>")
-        bar.pack_start(heading, False, False, 0)
-        page.pack_start(bar, False, False, 0)
-
-        problems = rcm.config_health()
-        if problems:
-            banner = Gtk.Frame()
-            inner = Gtk.Box(spacing=8)
-            inner.set_border_width(8)
-            text = Gtk.Label(xalign=0)
-            text.set_markup(f'<span foreground="#b5890a">⚠ '
-                            f'{GLib.markup_escape_text(problems[0].message)}</span>')
-            text.set_line_wrap(True)
-            inner.pack_start(text, True, True, 0)
-            if problems[0].setup_section == "credentials":
-                act = Gtk.Button(label="Set default credentials")
-                act.get_style_context().add_class("suggested-action")
-                act.connect("clicked", lambda *_: self.set_default_credentials())
-                inner.pack_end(act, False, False, 0)
-            banner.add(inner)
-            page.pack_start(banner, False, False, 0)
-
-        cards = Gtk.Grid(row_spacing=10, column_spacing=10,
-                         row_homogeneous=True, column_homogeneous=True)
-        page.pack_start(cards, True, True, 0)
-
-        def card(title, subtitle, extra_widget, buttons):
-            frame = Gtk.Frame()
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            box.set_border_width(10)
-            head = Gtk.Label(xalign=0)
-            head.set_markup(f"<b>{title}</b>")
-            box.pack_start(head, False, False, 0)
-            sub = Gtk.Label(xalign=0, label=subtitle)
-            sub.set_line_wrap(True)
-            sub.get_style_context().add_class("dim-label")
-            box.pack_start(sub, False, False, 0)
-            if extra_widget is not None:
-                box.pack_start(extra_widget, False, False, 0)
-            row = Gtk.Box(spacing=6)
-            for label, handler, suggested in buttons:
-                b = Gtk.Button(label=label)
-                if suggested:
-                    b.get_style_context().add_class("suggested-action")
-                b.connect("clicked", lambda _w, h=handler: h())
-                row.pack_start(b, False, False, 0)
-            box.pack_start(row, False, False, 0)
-            frame.add(box)
-            return frame
-
-        chips = Gtk.Label(xalign=0)
-        chips.set_markup(protocol_badges(list(protocols_safe()),
-                                         protocols_safe()))
-        cards.attach(card("Protocols",
-                          "buttons, commands, session detection, credential typing",
-                          chips,
-                          [("Edit…", self.on_protocols, False),
-                           ("Add protocol", self.on_protocols, False)]), 0, 0, 1, 1)
-
-        scopes = ", ".join(k for k in rcm.creds_scopes() if k != "DEFAULT") or "—"
-        missing_default = any(w.warning_id == "no-default-credential"
-                              for w in problems)
-        cards.attach(card("Credentials" + ("  ⚠ no DEFAULT" if missing_default else ""),
-                          "usernames in creds.conf, passwords in the OS keyring "
-                          "— never on disk",
-                          Gtk.Label(xalign=0, label=f"scopes: {scopes}"),
-                          [("Set default…", self.set_default_credentials,
-                            missing_default),
-                           ("Manage…", self.on_credentials, False)]), 1, 0, 1, 1)
-
-        globals_, per_session = rcm.load_shortcuts()
-        summary = " · ".join(f"{pretty_key(v)} {k}" for k, v in globals_.items()
-                             if v) or "none configured"
-        cards.attach(card("Keyboard shortcuts",
-                          f"{summary} · {len(per_session)} connection key(s)",
-                          None,
-                          [("Edit…", self.on_shortcuts, False),
-                           ("Reinstall", lambda: (rcm.shortcuts_install(),
-                                                  self.say("shortcuts reinstalled"))[1],
-                            False)]), 0, 1, 1, 1)
-
-        cards.attach(card("Import / Export",
-                          "CSV round-trips everything; .rdp files and Radmin "
-                          "phonebook export",
-                          None,
-                          [("Import CSV…", self.on_import, False),
-                           ("Export…", self.on_export, False),
-                           ("Phonebook…", self.on_phonebook, False)]), 1, 1, 1, 1)
-
-        foot = Gtk.Label(xalign=0)
-        foot.set_markup("<small>everything here is a plain file — protocols.conf, "
-                        "creds.conf, shortcuts.conf — this page is a convenience "
-                        "over the same files</small>")
-        foot.get_style_context().add_class("dim-label")
-        page.pack_start(foot, False, False, 0)
-        self.layout_container.pack_start(page, True, True, 0)
-        self.layout_container.show_all()
-
-    def set_default_credentials(self) -> None:
-        """The DEFAULT credential backs every connection with no closer match."""
-        d = Gtk.Dialog(title="Set default credentials", transient_for=self,
-                       modal=True)
-        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                      Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
-        box = d.get_content_area()
-        box.set_spacing(6)
-        box.set_border_width(12)
-        box.add(Gtk.Label(xalign=0, label="Username (blank = from each .rdp):"))
-        user_entry = Gtk.Entry(activates_default=True)
-        box.add(user_entry)
-        box.add(Gtk.Label(xalign=0, label="Password (stored in the OS keyring):"))
-        pw_entry = Gtk.Entry(visibility=False, activates_default=True)
-        box.add(pw_entry)
-        d.set_default_response(Gtk.ResponseType.OK)
-        d.show_all()
-        response = d.run()
-        username, password = user_entry.get_text().strip(), pw_entry.get_text()
-        d.destroy()
-        if response != Gtk.ResponseType.OK:
-            return
-        rcm.creds_set_user("DEFAULT", username)
-        if password:
-            rcm.secret_set("DEFAULT", password)
-        self.say("DEFAULT credentials saved")
-        self.on_setup()
-
-    @help_topic_gui("first-run", "First-run checklist",
-                    ("empty", "getting started", "checklist"), section="Setup")
-    def build_first_run(self):
-        """With no connections yet, the window opens as a setup checklist.
-
-        Each row is a step with its done-state checked live: detect installed
-        clients, install the keyboard shortcuts, set default credentials,
-        create the first connection, or import a CSV. Skipping shows the
-        normal (empty) window.
-        """
-        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        page.set_border_width(30)
-        title = Gtk.Label()
-        title.set_markup("<span size='x-large'><b>Set up your hub</b></span>")
-        page.pack_start(title, False, False, 4)
-
-        registry = protocols_safe()
-        any_launcher = any(
-            rcm.launcher_exe(proto, tmpl) and
-            (shutil.which(rcm.launcher_exe(proto, tmpl)) or
-             Path(rcm.launcher_exe(proto, tmpl)).is_file())
-            for proto in registry.values() for tmpl in proto.launchers.values())
-        shortcuts_installed = bool(rcm.parse_gsettings_list(
-            rcm.run_gsettings("get", rcm.GS_LIST, "custom-list")))
-        have_default = bool(rcm.secret_get("DEFAULT"))
-        steps = [
-            ("Detect installed clients", any_launcher, self.on_protocols, False),
-            ("Install keyboard shortcuts", shortcuts_installed,
-             lambda: (rcm.shortcuts_install(), self.reload()), False),
-            ("Set default credentials", have_default,
-             self.set_default_credentials, False),
-            ("Create first connection", False,
-             lambda: self.edit_dialog(None), True),
-            ("Import CSV", False, self.on_import, False),
-        ]
-        done = sum(1 for _t, state, _h, _s in steps if state)
-        progress = Gtk.Label()
-        progress.set_markup(f"<small>{done} of {len(steps)} done</small>")
-        progress.get_style_context().add_class("dim-label")
-        page.pack_start(progress, False, False, 0)
-
-        for text, done_state, handler, suggested in steps:
-            row = Gtk.Box(spacing=10)
-            mark = Gtk.Label(label="✓" if done_state else "○")
-            row.pack_start(mark, False, False, 0)
-            row.pack_start(Gtk.Label(xalign=0, label=text), True, True, 0)
-            button = Gtk.Button(label="Done" if done_state else "Go")
-            button.set_sensitive(not done_state)
-            if suggested and not done_state:
-                button.get_style_context().add_class("suggested-action")
-            button.connect("clicked", lambda _w, h=handler: h())
-            row.pack_end(button, False, False, 0)
-            page.pack_start(row, False, False, 2)
-
-        skip = Gtk.Button(label="Skip — show me the empty list")
-        skip.set_relief(Gtk.ReliefStyle.NONE)
-        skip.connect("clicked", lambda *_: (setattr(self, "first_run_skipped", True),
-                                            self.apply_layout(self.ui_state["layout"])))
-        page.pack_start(skip, False, False, 8)
-        return page
-
-    # ---- Spotlight ------------------------------------------------------ #
-    def build_spotlight_layout(self):
-        """Design 6a: the filter is the whole navigation."""
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.set_border_width(8)
-        self.filter_entry = Gtk.SearchEntry()
-        self.filter_entry.set_placeholder_text(
-            "matches name · host · group · user")
-        self.filter_entry.set_text(self.query_text)
-        # 15px query text per the design tokens.
-        self.filter_entry.modify_font(Pango.FontDescription("15"))
-        self.filter_entry.connect("search-changed", self.on_filter_changed)
-        box.pack_start(self.filter_entry, False, False, 0)
-
-        chips = Gtk.Box(spacing=6)
-        self.live_chip = Gtk.ToggleButton(label="Live")
-        self.live_chip.connect("toggled", lambda *_: self.reload())
-        chips.pack_start(self.live_chip, False, False, 0)
-        self.proto_chips = {}
-        for proto in protocols_safe().values():
-            chip = Gtk.ToggleButton(label=proto.label)
-            chip.connect("toggled", lambda *_: self.reload())
-            self.proto_chips[proto.id] = chip
-            chips.pack_start(chip, False, False, 0)
-        box.pack_start(chips, False, False, 0)
-        box.pack_start(self.build_connection_list(), True, True, 0)
-        box.pack_start(self.build_connect_button_box(), False, False, 0)
-        return box
-
-    def spotlight_row_allowed(self, c) -> bool:
-        if getattr(self, "live_chip", None) and self.live_chip.get_active():
-            if c.sel not in rcm.active_sels():
-                return False
-        chips = getattr(self, "proto_chips", None) or {}
-        wanted = [pid for pid, chip in chips.items() if chip.get_active()]
-        if wanted and not any(pid in c.protocols for pid in wanted):
-            return False
-        return True
-
-    # ---- Cockpit -------------------------------------------------------- #
-    def build_cockpit_layout(self):
-        """Design 6b: live sessions as the headline strip."""
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        box.set_border_width(8)
-        strip_label = Gtk.Label(xalign=0)
-        strip_label.set_markup("<b>Active</b>")
-        box.pack_start(strip_label, False, False, 0)
-        self.cockpit_cards = Gtk.FlowBox()
-        self.cockpit_cards.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.cockpit_cards.set_max_children_per_line(6)
-        self.cockpit_cards.set_min_children_per_line(2)
-        box.pack_start(self.cockpit_cards, False, False, 0)
-        box.pack_start(Gtk.Separator(), False, False, 0)
-        box.pack_start(self.build_filter_row("filter…"), False, False, 0)
-        box.pack_start(self.build_connection_list(), True, True, 0)
-        box.pack_start(self.build_connect_button_box(), False, False, 0)
-        return box
+        # Hidden sidebar stays hidden across reloads.
+        if not self.ui_state.get("sidebar", True) and \
+                getattr(self, "_browse_side_box", None) is not None:
+            self._browse_side_box.hide()
 
     def refresh_cockpit_cards(self) -> None:
+        """Paint the live-session card strip; hidden entirely when idle."""
         if getattr(self, "cockpit_cards", None) is None:
             return
         for child in self.cockpit_cards.get_children():
@@ -1026,17 +821,15 @@ class Win(Gtk.Window):
         registry = protocols_safe()
         keys = rcm.session_bindings()
         sessions = rcm.sessions()
-        if not sessions:
-            empty = Gtk.Label(label="no active sessions")
-            empty.get_style_context().add_class("dim-label")
-            self.cockpit_cards.add(empty)
+        if getattr(self, "cards_revealer", None) is not None:
+            self.cards_revealer.set_reveal_child(bool(sessions))
         for session in sessions:
             card = Gtk.Frame()
             inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
             inner.set_border_width(8)
             head = Gtk.Label(xalign=0)
-            proto = next((p for p in registry.values()
-                          if p.label == session.proto), None)
+            proto = next((q for q in registry.values()
+                          if q.label == session.proto), None)
             chip = (f'<span background="{resolve_colour(proto.color)}" '
                     f'foreground="#ffffff"> {GLib.markup_escape_text(session.proto)} '
                     f'</span>  ') if proto else ""
@@ -1065,6 +858,17 @@ class Win(Gtk.Window):
             card.add(inner)
             self.cockpit_cards.add(card)
         self.cockpit_cards.show_all()
+
+    def chip_filters_allow(self, c) -> bool:
+        """Chip filters beside the Browse filter box (Live / per-protocol)."""
+        if getattr(self, "live_chip", None) and self.live_chip.get_active():
+            if c.sel not in rcm.active_sels():
+                return False
+        chips = getattr(self, "proto_chips", None) or {}
+        wanted = [pid for pid, chip in chips.items() if chip.get_active()]
+        if wanted and not any(pid in c.protocols for pid in wanted):
+            return False
+        return True
 
     # ---- Inspector ------------------------------------------------------ #
     def build_inspector_layout(self):
@@ -1563,8 +1367,7 @@ class Win(Gtk.Window):
             for c in rcm.conns_cached():
                 if not self.connection_matches_query(c):
                     continue
-                if self.current_layout == "spotlight" and \
-                        not self.spotlight_row_allowed(c):
+                if not self.chip_filters_allow(c):
                     continue
                 if c.group != last_group and c.group:
                     heading = GLib.markup_escape_text(c.group.replace("/", " / "))
@@ -1600,7 +1403,7 @@ class Win(Gtk.Window):
         if getattr(self, "count_lbl", None):
             self.count_lbl.set_text(f"({visible})" if visible == total
                                     else f"({visible} of {total})")
-        if self.current_layout == "spotlight" and self.filter_entry:
+        if self.filter_entry is not None:
             self.filter_entry.set_tooltip_text(f"{visible} of {total} match")
         self.refresh_sidebar()
         self.refresh_live()
