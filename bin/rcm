@@ -89,6 +89,16 @@ class Conn:
         return tuple(p for p in known if p in want) or known
 
     @property
+    def tags(self) -> tuple[str, ...]:
+        """Free labels orthogonal to groups, stored as rcm-tags in the .rdp.
+
+        The same host may legitimately exist twice on different LANs, so tags
+        never deduplicate; they only filter.
+        """
+        raw = (self.extra.get("rcm-tags") or "").strip()
+        return tuple(t.strip() for t in raw.split(",") if t.strip())
+
+    @property
     def default_protocol(self) -> str:
         """Which protocol a double-click uses. Falls back to the first enabled."""
         want = (self.extra.get("rcm-default-proto") or "").strip().lower()
@@ -793,6 +803,24 @@ phonebook =
 # inject.window_title = Password
 # inject.wait = 20
 # inject.steps = type:{password} | key:Return
+
+# Proof that protocols are only config: ssh and web need nothing from the code.
+[protocol:ssh]
+label = SSH
+color = #613583
+order = 50
+port = 22
+default = Terminal
+launcher.Terminal = gnome-terminal -- ssh {user}@{host} -p {port}
+detect.process = (^|/)ssh\s+.*@
+
+[protocol:web]
+label = Web
+color = #5a6470
+order = 60
+port = 443
+default = Browser
+launcher.Browser = xdg-open https://{host}:{port}/
 """,
     "creds.conf": """\
 # Credentials for rcm. Passwords are NOT stored here -- they live in the OS
@@ -1032,6 +1060,19 @@ def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
     if not shutil.which(argv[0]) and not Path(argv[0]).is_file():
         raise RuntimeError(f"{argv[0]} is not installed "
                            f"(launcher {launcher or p.default!r} for {p.label})")
+    # Pre-hook: must exit 0 or the launch stops -- that is the contract that
+    # makes gateway tunnels and mount scripts safe to rely on.
+    pre_command = (c.extra.get("rcm-pre") or "").strip()
+    if pre_command:
+        rendered = pre_command.format(**launch_placeholder_values(c, p))
+        completed = subprocess.run(rendered, shell=True, capture_output=True,
+                                   text=True, timeout=120)
+        log_event("pre-hook", sel=c.sel, command=rendered,
+                  exit_code=completed.returncode)
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"pre hook failed (exit {completed.returncode}): "
+                f"{completed.stderr.strip() or rendered}")
     if p.injects:
         result = inject_credentials(c, p, argv)
     else:
@@ -1039,6 +1080,10 @@ def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
         result = f"{p.label} -> {c.sel} ({c.host}) via {Path(argv[0]).name}"
     log_event("launch", sel=c.sel, host=c.host, protocol=p.id,
               launcher=launcher or p.default)
+    post_command = (c.extra.get("rcm-post") or "").strip()
+    if post_command:
+        spawn_detached(["/bin/sh", "-c",
+                        post_command.format(**launch_placeholder_values(c, p))])
     # Remember the MAC while the host is surely on: that is what Wake needs later.
     mac = learn_mac(c.host)
     if mac and c.extra.get("rcm-mac") != mac:
