@@ -453,6 +453,63 @@ def prune_empty_parents(start: Path) -> list[str]:
     return removed
 
 
+@help_topic("rename-regroup", "Renaming and regrouping a connection",
+            ("rename", "move", "group", "edit"), section="Connections")
+def move_connection(c: Conn, new_group: str, new_name: str) -> Conn:
+    """Renaming or regrouping moves the .rdp file — everything follows.
+
+    The connection's identity is its file path, so a rename is a move. The
+    parts that hang off that identity move with it in the same operation: the
+    keyring password entries (the connection's own and any per-protocol ones)
+    are re-stored under the new name, and a keyboard shortcut bound to the old
+    name is rebound. Typing a group that does not exist yet creates it, and a
+    group folder left empty is removed, exactly as on delete.
+    """
+    new_group = new_group.strip().strip("/")
+    new_name = new_name.strip()
+    if not new_name:
+        raise ValueError("a connection needs a name")
+    if re.search(r"[/\\]", new_name) or "\\" in new_group:
+        raise ValueError("'/' belongs in the group, not the name")
+    if (new_group, new_name) == (c.group, c.name):
+        return c
+
+    dest_dir = RDP_DIR / new_group if new_group else RDP_DIR
+    dest = dest_dir / f"{new_name}.rdp"
+    if dest.exists():
+        raise FileExistsError(dest)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    old_sel, old_parent = c.sel, c.path.parent
+    c.path.rename(dest)
+    prune_empty_parents(old_parent)
+
+    new_sel = f"{new_group}/{new_name}" if new_group else new_name
+    # Keyring entries: the connection's own, plus one per protocol.
+    for suffix in ("", *(f"@{pid}" for pid in protocol_ids())):
+        secret = secret_get(old_sel + suffix)
+        if secret:
+            secret_set(new_sel + suffix, secret)
+            secret_clear(old_sel + suffix)
+    # creds.conf username rows keyed to the old name.
+    table = creds_conf_table()
+    for key, (username, _legacy) in list(table.items()):
+        if key == old_sel or key.startswith(old_sel + "@"):
+            creds_delete(key)
+            creds_set_user(key.replace(old_sel, new_sel, 1), username)
+    # A shortcut bound to the old name follows too.
+    global_keys, per_session = load_shortcuts()
+    if old_sel in per_session:
+        per_session[new_sel] = per_session.pop(old_sel)
+        save_shortcuts(global_keys, per_session)
+        shortcuts_install()
+
+    conns_cached(refresh=True)
+    moved = find(new_sel)
+    if moved is None:
+        raise RuntimeError(f"moved {old_sel} but cannot find {new_sel} after rescan")
+    return moved
+
+
 def delete_conn(c: Conn) -> list[str]:
     """Delete a connection. Returns any group folders that emptied out with it."""
     c.path.unlink()
