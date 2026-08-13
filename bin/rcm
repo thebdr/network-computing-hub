@@ -50,6 +50,7 @@ PROTOCOLS_FILE = APP / "protocols.conf"
 LEGACY_LAUNCHERS = APP / "protocols.conf"
 SHORTCUTS = APP / "shortcuts.conf"
 UI_CONF = APP / "ui.conf"
+WORKSPACES_CONF = APP / "workspaces.conf"
 LOGS_DIR = APP / "logs"
 
 # Window layouts a user can switch between; "rail" is the designed default and
@@ -841,6 +842,16 @@ launcher.Browser = xdg-open https://{host}:{port}/
 
 DEFAULT||
 """,
+    "workspaces.conf": """\
+# Workspaces: named sets of connections opened together.
+#
+#   [workspace:<name>]
+#   member.1 = <group/name>|<protocol>|<monitor>
+#
+# protocol and monitor are optional; blank means the connection's default and
+# no placement. Connect one with `rcm workspace <name>`, or give it a keyboard
+# shortcut under [sessions] in shortcuts.conf as `workspace:<name> = <combo>`.
+""",
     "ui.conf": """\
 # Manager window state. The GUI writes this; editing it by hand is equally fine.
 
@@ -1548,6 +1559,72 @@ def export_phonebook(dest: Path, conns: list[Conn] | None = None,
 
 
 # --------------------------------------------------------------------------- #
+# workspaces: named sets of connections opened together
+# --------------------------------------------------------------------------- #
+@help_topic("workspaces", "Workspaces", ("workspace", "connect all", "sets"),
+            section="Connections")
+def load_workspaces() -> dict[str, list[dict]]:
+    """A workspace opens a named set of connections in one go.
+
+    workspaces.conf holds one [workspace:<name>] section per set; each member
+    line is `member.<n> = <sel>|<protocol>|<monitor>` (protocol and monitor
+    optional). Connecting a workspace walks its members with the usual launch
+    stagger; members that are already live are focused, never relaunched. A
+    workspace can carry its own keyboard shortcut like any connection.
+    """
+    if not WORKSPACES_CONF.is_file():
+        return {}
+    parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
+    parser.optionxform = str
+    parser.read(WORKSPACES_CONF)
+    out: dict[str, list[dict]] = {}
+    for section in parser.sections():
+        if not section.startswith("workspace:"):
+            continue
+        name = section.split(":", 1)[1].strip()
+        members = []
+        for _key, raw in sorted(parser.items(section)):
+            if not _key.startswith("member"):
+                continue
+            parts = (raw.split("|") + ["", ""])[:3]
+            if parts[0].strip():
+                members.append({"sel": parts[0].strip(),
+                                "protocol": parts[1].strip(),
+                                "monitor": parts[2].strip()})
+        out[name] = members
+    return out
+
+
+def connect_workspace(name: str) -> list[str]:
+    """Open every member; focus the ones already live. Returns status lines."""
+    members = load_workspaces().get(name)
+    if members is None:
+        raise ConfigError(f"{WORKSPACES_CONF}: no [workspace:{name}] section")
+    live = active_sels()
+    lines = []
+    for position, member in enumerate(members):
+        c = find(member["sel"])
+        if not c:
+            lines.append(f"{member['sel']}: not found")
+            continue
+        if member["sel"] in live:
+            for session in sessions():
+                if session.label == member["sel"] and session.window:
+                    focus_session(session)
+                    break
+            lines.append(f"{member['sel']}: already live — focused")
+            continue
+        if position:
+            time.sleep(2)
+        try:
+            lines.append(launch(c, member["protocol"] or c.default_protocol))
+        except (RuntimeError, ConfigError) as problem:
+            lines.append(f"{member['sel']}: {problem}")
+    log_event("workspace", name=name, members=len(members))
+    return lines
+
+
+# --------------------------------------------------------------------------- #
 # event log: one JSONL line per user-visible event
 # --------------------------------------------------------------------------- #
 @help_topic("logging", "The event log", ("logs", "jsonl", "history"),
@@ -2112,7 +2189,7 @@ USAGE = """rcm -- remote connection manager
   rcm import <file.csv> [--overwrite] [--dry-run]
   rcm export [file.csv]          default: export/connections.csv
   rcm phonebook [out.rpb]        experimental Radmin phonebook (never overwrites live)
-  rcm wake <sel>                 send a Wake-on-LAN magic packet\n  rcm history [sel]              recent events from the JSONL log\n  rcm gen-launcher               rebuild the .desktop jump list
+  rcm workspace [name]           open a named set of connections\n  rcm wake <sel>                 send a Wake-on-LAN magic packet\n  rcm history [sel]              recent events from the JSONL log\n  rcm gen-launcher               rebuild the .desktop jump list
   rcm install-icon               install the app icon into your icon theme
 """
 
@@ -2388,6 +2465,23 @@ def main(argv: list[str]) -> int:
 
     if cmd == "gen-launcher":
         print(f"{gen_launcher()} connection(s) -> {DESKTOP_FILE}")
+        return 0
+
+    if cmd == "workspace":
+        spaces = load_workspaces()
+        if not rest or rest[0] == "list":
+            for name, members in spaces.items():
+                print(f"  {name}: {', '.join(m['sel'] for m in members)}")
+            if not spaces:
+                print(f"  none defined — add [workspace:<name>] sections to "
+                      f"{WORKSPACES_CONF}")
+            return 0
+        try:
+            for line in connect_workspace(rest[0]):
+                print(f"  {line}")
+        except ConfigError as problem:
+            print(f"rcm: {problem}", file=sys.stderr)
+            return 1
         return 0
 
     if cmd == "wake":

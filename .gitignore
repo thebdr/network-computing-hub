@@ -8,6 +8,7 @@ protocols.conf
 launchers.conf
 shortcuts.conf
 ui.conf
+workspaces.conf
 
 # Generated output
 export/
