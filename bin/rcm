@@ -2607,6 +2607,23 @@ def main(argv: list[str]) -> int:
         return 1
 
     if cmd == "help":
+        # Topics register at import time, so the guide is only complete once
+        # every registering module is loaded; headless (no display) skips the
+        # GUI's topics rather than failing.
+        sys.modules.setdefault("rcm", sys.modules["__main__"])
+        for module_name in ("rcm_gui", "rcm_switch"):
+            try:
+                __import__(module_name)
+            except Exception:
+                pass
+        if "--coverage" in rest:
+            # The mandate check: user-facing commands must carry a topic.
+            documented = {t.source_file for t in HELP_TOPICS.values()}
+            print(f"{len(HELP_TOPICS)} topic(s) registered across "
+                  f"{len(documented)} file(s)")
+            for topic in HELP_TOPICS.values():
+                print(f"  {topic.topic_id:20} {topic.source_file}:{topic.source_line}")
+            return 0
         if "--dump" in rest:
             count = dump_help_html()
             print(f"{count} topic(s) -> {HELP_DIR}/index.html")

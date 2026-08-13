@@ -188,6 +188,34 @@ Two independent mechanisms, on purpose:
   specific program, edit, delete, or **Export ▸** the selection as `.rdp` files, a
   re-importable CSV, or a Radmin phonebook. A selected group means all of it.
 
+## The manager
+
+The window has five switchable layouts (the Layout button, saved as `layout =` in
+`ui.conf`): **Rail** — group sidebar with counts, flat list, active pane; **Spotlight**
+— one big filter over everything, matches highlighted; **Cockpit** — live-session
+cards first; **Inspector** — a read-only audit showing where every connection's
+password comes from and whether its protocols are healthy; **Classic** — the original
+window. Pinned filter tabs (Ctrl+T) sit under the headerbar and are shared by every
+layout. Configuration problems never block the window: they surface in the status
+bar, on the Setup badge, and per-row.
+
+The hamburger menu is gone — **Setup** (sidebar footer, or the Layout menu) carries
+Protocols, Credentials, Keyboard shortcuts and Import/Export as cards over the same
+plain files. With zero connections the window opens as a first-run checklist.
+
+**F1 opens the Help window** anywhere: the guide is generated from the source
+docstrings that implement each behaviour, and every topic ends with an Open-code
+link to that file and line.
+
+The **Net** column probes reachability (one TCP connect at a time, visible rows
+first, paused while hidden — cheap even at hundreds of hosts); offline rows with a
+learned MAC offer **⚡ Wake** (`rcm wake <sel>`). Right-click also gives **Open
+terminal** (embedded VTE tabs when the library is present), **Run script** across the
+selection with per-host verdicts, and **History**. Everything notable — launches,
+scripts, probes, wakes — is one JSONL line under `logs/`, browsable on the Logs page.
+**Workspaces** (`workspaces.conf`, `rcm workspace <name>`) open named sets together,
+focusing members that are already live.
+
 ## Keyboard shortcuts
 
 Set a connection's shortcut in its **Edit** dialog; the general keys live under
