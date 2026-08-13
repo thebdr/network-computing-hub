@@ -205,6 +205,17 @@ class Win(Gtk.Window):
         b.connect("clicked", lambda *_: self.reload())
         hb.pack_end(b)
 
+        # Layout switcher (design 6c): a popover of radio rows, one per layout,
+        # each with a one-line description. The choice persists as `layout =`
+        # in ui.conf. Layouts not yet built in this branch are insensitive.
+        self.ui_state = rcm.load_ui_state()
+        self.layout_button = Gtk.MenuButton()
+        self.layout_button.set_tooltip_text("Window layout — saved in ui.conf")
+        self.layout_label = Gtk.Label(label=f"Layout: {self.ui_state['layout'].title()} ▾")
+        self.layout_button.add(self.layout_label)
+        self.layout_button.set_popover(self.build_layout_popover())
+        hb.pack_end(self.layout_button)
+
         menu_btn = Gtk.MenuButton()
         menu_btn.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
         menu = Gtk.Menu()
@@ -226,6 +237,15 @@ class Win(Gtk.Window):
         menu.show_all()
         menu_btn.set_popup(menu)
         hb.pack_end(menu_btn)
+
+        # Tab strip (design 7a): pinned filter queries shared by every layout.
+        # "All" is permanent; Ctrl+T (or ＋) pins the current filter; ✕ closes.
+        self.query_group = ""
+        self.query_text = ""
+        self.tab_strip = Gtk.Box(spacing=2)
+        self.tab_strip.set_border_width(4)
+        outer.pack_start(self.tab_strip, False, False, 0)
+        self.rebuild_tab_strip()
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
         paned.set_position(660)
@@ -337,14 +357,162 @@ class Win(Gtk.Window):
         b.connect("clicked", lambda *_: self.on_disconnect())
         row3.pack_start(b, True, True, 0)
 
+        # Status bar: transient messages left, standing config-health warnings
+        # right (fed by rcm.config_health(), same source as the Setup badge).
+        status_row = Gtk.Box(spacing=10)
+        status_row.set_margin_start(10)
+        status_row.set_margin_end(10)
+        status_row.set_margin_bottom(6)
         self.status = Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END)
-        self.status.set_margin_start(10)
-        self.status.set_margin_end(10)
-        self.status.set_margin_bottom(6)
-        outer.pack_start(self.status, False, False, 0)
+        status_row.pack_start(self.status, True, True, 0)
+        self.health_label = Gtk.Label(xalign=1, ellipsize=Pango.EllipsizeMode.END)
+        status_row.pack_end(self.health_label, False, False, 0)
+        outer.pack_start(status_row, False, False, 0)
+
+        self.connect("key-press-event", self.on_window_key)
 
         self.reload()
         GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
+
+    LAYOUT_DESCRIPTIONS = {
+        "rail": "group sidebar · flat list · active pane",
+        "spotlight": "one big filter over everything",
+        "cockpit": "live sessions first, list below",
+        "inspector": "read-only audit of credentials and config",
+        "classic": "the original window",
+    }
+    IMPLEMENTED_LAYOUTS = ("classic",)   # widened as layouts land in this branch
+
+    def build_layout_popover(self) -> Gtk.Popover:
+        popover = Gtk.Popover()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_border_width(8)
+        group_button = None
+        for layout_id in rcm.LAYOUTS:
+            row = Gtk.RadioButton.new_from_widget(group_button)
+            group_button = group_button or row
+            label = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            title = Gtk.Label(xalign=0, label=layout_id.title())
+            desc = Gtk.Label(xalign=0)
+            desc.set_markup(f"<small>{self.LAYOUT_DESCRIPTIONS[layout_id]}</small>")
+            desc.get_style_context().add_class("dim-label")
+            label.pack_start(title, False, False, 0)
+            label.pack_start(desc, False, False, 0)
+            row.add(label)
+            row.set_active(layout_id == self.ui_state["layout"])
+            row.set_sensitive(layout_id in self.IMPLEMENTED_LAYOUTS)
+            row.connect("toggled", self.on_layout_chosen, layout_id)
+            box.pack_start(row, False, False, 2)
+        foot = Gtk.Label(xalign=0)
+        foot.set_markup("<small>saved as <tt>layout =</tt> in ui.conf</small>")
+        foot.get_style_context().add_class("dim-label")
+        foot.set_margin_top(6)
+        box.pack_start(foot, False, False, 0)
+        box.show_all()
+        popover.add(box)
+        return popover
+
+    def on_layout_chosen(self, radio, layout_id: str) -> None:
+        if not radio.get_active() or layout_id == self.ui_state["layout"]:
+            return
+        self.ui_state["layout"] = layout_id
+        rcm.save_ui_state(self.ui_state)
+        self.layout_label.set_text(f"Layout: {layout_id.title()} ▾")
+        self.say(f"layout switched to {layout_id} — saved in ui.conf")
+
+    def rebuild_tab_strip(self) -> None:
+        for child in self.tab_strip.get_children():
+            child.destroy()
+
+        def add_tab(label: str, group: str, text: str, closable: bool):
+            active = (group, text) == (self.query_group, self.query_text)
+            button = Gtk.ToggleButton()
+            inner = Gtk.Box(spacing=4)
+            inner.add(Gtk.Label(label=label))
+            button.add(inner)
+            button.set_active(active)
+            button.connect("toggled", self.on_tab_toggled, group, text)
+            self.tab_strip.pack_start(button, False, False, 0)
+            if closable:
+                close = Gtk.Button.new_from_icon_name("window-close-symbolic",
+                                                      Gtk.IconSize.MENU)
+                close.set_relief(Gtk.ReliefStyle.NONE)
+                close.set_tooltip_text(f"Close tab {label!r}")
+                close.connect("clicked", self.on_tab_closed, label)
+                inner.add(close)
+
+        add_tab("All", "", "", closable=False)
+        for label, group, text in self.ui_state.get("tabs", []):
+            add_tab(label, group, text, closable=True)
+        pin = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.MENU)
+        pin.set_relief(Gtk.ReliefStyle.NONE)
+        pin.set_tooltip_text("Pin the current filter as a tab (Ctrl+T)")
+        pin.connect("clicked", lambda *_: self.pin_current_query())
+        self.tab_strip.pack_start(pin, False, False, 0)
+        self.tab_strip.show_all()
+
+    def on_tab_toggled(self, button, group: str, text: str) -> None:
+        if not button.get_active():
+            # Re-activate: the strip behaves like radio tabs, one always active.
+            if (group, text) == (self.query_group, self.query_text):
+                button.set_active(True)
+            return
+        self.query_group, self.query_text = group, text
+        self.rebuild_tab_strip()
+        self.reload()
+
+    def on_tab_closed(self, _button, label: str) -> None:
+        self.ui_state["tabs"] = [t for t in self.ui_state["tabs"] if t[0] != label]
+        rcm.save_ui_state(self.ui_state)
+        if not any((g, x) == (self.query_group, self.query_text)
+                   for _l, g, x in self.ui_state["tabs"]):
+            self.query_group = self.query_text = ""
+        self.rebuild_tab_strip()
+        self.reload()
+
+    def pin_current_query(self) -> None:
+        """Ctrl+T: the current group/text filter becomes a persistent tab."""
+        if not (self.query_group or self.query_text):
+            self.say("nothing to pin — the All tab is already permanent")
+            return
+        label = self.query_text or self.query_group.rsplit("/", 1)[-1]
+        if any(t[0] == label for t in self.ui_state["tabs"]):
+            self.say(f"tab {label!r} already exists")
+            return
+        self.ui_state["tabs"].append((label, self.query_group, self.query_text))
+        rcm.save_ui_state(self.ui_state)
+        self.rebuild_tab_strip()
+        self.say(f"pinned {label!r} — tabs live in ui.conf")
+
+    def on_window_key(self, _widget, event) -> bool:
+        if (event.state & Gdk.ModifierType.CONTROL_MASK) and \
+                Gdk.keyval_name(event.keyval) in ("t", "T"):
+            self.pin_current_query()
+            return True
+        return False
+
+    def connection_matches_query(self, c) -> bool:
+        if self.query_group and not (c.group == self.query_group or
+                                     c.group.startswith(self.query_group + "/")):
+            return False
+        if self.query_text:
+            haystack = " ".join([c.sel, c.host, c.username]).lower()
+            if self.query_text.lower() not in haystack:
+                return False
+        return True
+
+    def refresh_health(self) -> None:
+        problems = rcm.config_health()
+        if not problems:
+            self.health_label.set_text("")
+            return
+        worst = problems[0]
+        colour = "#c04040" if worst.severity == "error" else "#b5890a"
+        extra = f"  (+{len(problems) - 1} more)" if len(problems) > 1 else ""
+        self.health_label.set_markup(
+            f'<span foreground="{colour}">⚠ {GLib.markup_escape_text(worst.message)}'
+            f'{extra}</span>')
+        self.health_label.set_tooltip_text("\n".join(w.message for w in problems))
 
     def rebuild_buttons(self) -> None:
         """Redraw the Connect row from protocols.conf."""
@@ -393,6 +561,8 @@ class Win(Gtk.Window):
             return nodes[path]
 
         for c in rcm.conns_cached():
+            if not self.connection_matches_query(c):
+                continue
             labels = protocol_badges(c.protocols, registry, c.default_protocol)
             self.store.append(group_iter(c.group),
                               [c.sel in ticked, "", c.name, c.host, c.username,
@@ -402,8 +572,12 @@ class Win(Gtk.Window):
         for path in sorted(nodes, key=lambda p: p.count("/"), reverse=True):
             self._sync_group_check(nodes[path])
         self.tree.expand_all()
-        self.count_lbl.set_text(f"({len(rcm.conns_cached())})")
+        visible = sum(1 for c in rcm.conns_cached() if self.connection_matches_query(c))
+        total = len(rcm.conns_cached())
+        self.count_lbl.set_text(f"({visible})" if visible == total
+                                else f"({visible} of {total})")
         self.refresh_live()
+        self.refresh_health()
 
     def refresh_live(self) -> None:
         """Repaint the active-session list and the live markers in the tree."""
