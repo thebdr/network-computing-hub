@@ -10,22 +10,21 @@ external programs you configure — Thincast, `mstsc`, xfreerdp, Remmina, TigerV
 Radmin Viewer, AnyDesk, anything with a command line — so you keep the clients you like
 and get grouping, batch import, live session tracking and global shortcuts on top.
 
-**Protocols are configuration, not code.** RDP, VNC and Radmin ship as three sections in
+**Protocols are configurable** RDP, VNC and Radmin ship as three sections in
 `protocols.conf`; adding a fourth needs no changes to the program. A protocol defines its
 own button label and colour, its commands, how a live session is recognised, and — if the
-client insists on a password prompt — the keystrokes to fill it in.
+client does not provide a credentials management, automate the insertion on a password prompt via keystrokes.
 
 - **Any protocol you can launch**, defined in config: label, colour, commands,
-  session detection, and optional credential typing. The colour belongs to the
-  protocol — its button and its chip in the connection list are two views of it
+  session detection, and optional credential typing. 
 - **Connections in one tree**, grouped, defined by ordinary `.rdp` files
 - **Credentials in the OS keyring** (libsecret / GNOME Keyring), never on disk, with a
   precedence chain from per-connection down to a global default, and per-protocol
-  entries where a host needs different accounts for RDP and Radmin
-- **Any client you like**, per protocol, configured as command lines with placeholders
+  entries for the same host.
+- **Any client you have installed**, per protocol, configured as command lines with placeholders
 - **Live session list** — see what is connected, focus it, disconnect it
 - **System-wide shortcuts** and an Alt-Tab-style switcher across active sessions
-- **Batch CSV import/export**, and an experimental Radmin phonebook export
+- **Batch CSV import/export**, .rdp, and an experimental Radmin phonebook export
 - **Tick connections** to queue them up for the Connect buttons; right-click any
   selection to export it as `.rdp` files, a CSV, or a Radmin phonebook
 
