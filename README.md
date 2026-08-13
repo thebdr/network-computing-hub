@@ -25,6 +25,8 @@ client insists on a password prompt — the keystrokes to fill it in.
 - **Live session list** — see what is connected, focus it, disconnect it
 - **System-wide shortcuts** and an Alt-Tab-style switcher across active sessions
 - **Batch CSV import/export**, and an experimental Radmin phonebook export
+- **Tick connections** to queue them up for the Connect buttons; right-click any
+  selection to export it as `.rdp` files, a CSV, or a Radmin phonebook
 
 Linux/X11 (developed on Cinnamon). A Windows port is planned — see [Roadmap](#roadmap).
 
@@ -55,9 +57,11 @@ rcm import hosts.csv           # or add connections in the GUI
 rcm gui                        # the manager
 ```
 
-CSV columns are `group,name,host,username,port`; only `name` and `host` are required.
-Imported connections are generated from `templates/default.rdp`, so whatever you set
-there is inherited by every host.
+CSV columns are `group,name,host,username,port`, plus `port_<protocol>`, `protocols`
+and `shortcut` — only `name` and `host` are required. A full export writes all of them,
+so exporting and re-importing round-trips a connection unchanged. Imported connections
+are generated from `templates/default.rdp`, so whatever you set there is inherited by
+every host.
 
 ## How connections are stored
 
@@ -158,6 +162,16 @@ rcm creds list          # where each password lives, never the value
 rcm creds set Group     # prompts without echo
 rcm creds migrate       # move leftover plaintext into the keyring
 ```
+
+## Selecting and exporting
+
+Two independent mechanisms, on purpose:
+
+- **Tick boxes** choose what the Connect buttons act on. Ticking a group ticks all of
+  its members. (With nothing ticked the buttons fall back to the highlighted rows.)
+- **Ctrl/Shift selection** chooses what the right-click menu acts on — connect with a
+  specific program, edit, delete, or **Export ▸** the selection as `.rdp` files, a
+  re-importable CSV, or a Radmin phonebook. A selected group means all of it.
 
 ## Keyboard shortcuts
 

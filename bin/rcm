@@ -1151,16 +1151,46 @@ def kill_session(s: Session) -> None:
 CSV_FIELDS = ["group", "name", "host", "username", "port"]
 
 
-def export_csv(dest: Path) -> int:
+def csv_fields() -> list[str]:
+    """Every column a full export writes, so it can be imported back unchanged.
+
+    Per-protocol ports get a port_<id> column each, generated from the registry
+    rather than listed, so a new protocol needs no change here.
+    """
+    extra = [f"port_{pid}" for pid in protocol_ids() if pid != "rdp"]
+    return CSV_FIELDS + extra + ["protocols", "shortcut"]
+
+
+def export_csv(dest: Path, conns: list[Conn] | None = None) -> int:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    rows = conns_cached(refresh=True)
+    rows = conns if conns is not None else conns_cached(refresh=True)
+    fields = csv_fields()
+    keys = session_bindings()
     with dest.open("w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+        w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
         for c in rows:
-            w.writerow({"group": c.group, "name": c.name, "host": c.host,
-                        "username": c.username, "port": c.port})
+            row = {"group": c.group, "name": c.name, "host": c.host,
+                   "username": c.username, "port": c.port,
+                   "protocols": ",".join(c.protocols),
+                   "shortcut": keys.get(c.sel, "")}
+            for f in fields:
+                if f.startswith("port_"):
+                    row[f] = c.port_for(f[5:])
+            w.writerow(row)
     return len(rows)
+
+
+def export_rdp_files(conns: list[Conn], dest_dir: Path) -> int:
+    """Copy the selected .rdp files out, keeping their group folders."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    n = 0
+    for c in conns:
+        target = (dest_dir / c.group) if c.group else dest_dir
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(c.path, target / c.path.name)
+        n += 1
+    return n
 
 
 def import_csv(src: Path, overwrite: bool = False,
@@ -1192,10 +1222,24 @@ def import_csv(src: Path, overwrite: bool = False,
             if target.exists() and not overwrite:
                 skipped.append(f"{group}/{name}: already exists")
                 continue
+            ports = {}
+            for col, val in row.items():
+                if col and col.startswith("port_") and (val or "").strip():
+                    try:
+                        ports[col[5:]] = int(val.strip())
+                    except ValueError:
+                        pass
+            protos = (row.get("protocols") or "").strip()
             if dry_run:
                 created.append(f"{group}/{name} -> {host}:{port} (dry run)")
                 continue
-            write_rdp(group, name, host, user, port, overwrite=True)
+            write_rdp(group, name, host, user, port, overwrite=True,
+                      ports=ports, protocols=protos)
+            binding = (row.get("shortcut") or "").strip()
+            if binding:
+                g, sess = load_shortcuts()
+                sess[f"{group}/{name}" if group else name] = binding
+                save_shortcuts(g, sess)
             created.append(f"{group}/{name} -> {host}:{port}")
     conns_cached(refresh=True)
     return created, skipped

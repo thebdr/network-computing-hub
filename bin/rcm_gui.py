@@ -76,8 +76,11 @@ def install_css(protos=None) -> None:
         Gtk.StyleContext.add_provider_for_screen(
             screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-# TreeStore columns
-C_LABEL, C_HOST, C_USER, C_KEY, C_SEL, C_MARK, C_WEIGHT = range(7)
+# TreeStore columns. Checkboxes and selection are deliberately independent:
+# the Connect buttons act on what is ticked, the context menu on what is
+# highlighted, so you can queue up a set and still right-click something else.
+(C_CHECK, C_MARK, C_LABEL, C_HOST, C_USER, C_PROTOS, C_KEY, C_SEL,
+ C_WEIGHT, C_STYLE) = range(10)
 
 def protocols_safe() -> dict:
     """The protocol registry, or {} if the config is broken.
@@ -148,7 +151,7 @@ class ShortcutButton(Gtk.Button):
 class Win(Gtk.Window):
     def __init__(self):
         super().__init__(title="Remote Connections")
-        self.set_default_size(980, 580)
+        self.set_default_size(1080, 600)
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.add(outer)
@@ -190,7 +193,7 @@ class Win(Gtk.Window):
         hb.pack_end(menu_btn)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        paned.set_position(560)
+        paned.set_position(660)
         outer.pack_start(paned, True, True, 0)
 
         # ---- left: saved connections ---------------------------------------- #
@@ -207,40 +210,45 @@ class Win(Gtk.Window):
         head.pack_start(self.count_lbl, False, False, 0)
         left.pack_start(head, False, False, 0)
 
-        self.store = Gtk.TreeStore(str, str, str, str, str, str, int)
+        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str,
+                                   int, int)
         self.tree = Gtk.TreeView(model=self.store)
         # Ctrl and Shift range-select come free with MULTIPLE.
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.set_rubber_banding(True)
 
+        toggle = Gtk.CellRendererToggle()
+        toggle.set_activatable(True)
+        toggle.connect("toggled", self.on_check_toggled)
+        col = Gtk.TreeViewColumn("", toggle, active=C_CHECK)
+        col.set_min_width(30)
+        self.tree.append_column(col)
+
         r = Gtk.CellRendererText()
         col = Gtk.TreeViewColumn("", r, text=C_MARK)
-        col.set_min_width(24)
+        col.set_min_width(22)
         self.tree.append_column(col)
-        for idx, title, minw in ((C_LABEL, "Connection", 140),
-                                 (C_HOST, "Host", 125), (C_USER, "User", 85),
-                                 (C_KEY, "Key", 95)):
+
+        for idx, title, minw in ((C_LABEL, "Connection", 130),
+                                 (C_HOST, "Host", 118), (C_USER, "User", 78),
+                                 (C_PROTOS, "Protocols", 148),
+                                 (C_KEY, "Key", 86)):
             r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
             col = Gtk.TreeViewColumn(title, r, text=idx)
             col.add_attribute(r, "weight", C_WEIGHT)   # bold = a session is live
+            col.add_attribute(r, "style", C_STYLE)     # italic = a group header
             col.set_resizable(True)
             col.set_min_width(minw)
             col.set_expand(idx == C_LABEL)
             self.tree.append_column(col)
 
-        self.tree.connect("row-activated", lambda *_: self.connect_selected("rdp"))
+        self.tree.connect("row-activated", self.on_row_activated)
         self.tree.connect("button-press-event", self.on_tree_click)
         sw = Gtk.ScrolledWindow()
         sw.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         sw.add(self.tree)
         sw.set_shadow_type(Gtk.ShadowType.IN)
         left.pack_start(sw, True, True, 0)
-
-        hint = Gtk.Label(xalign=0)
-        hint.set_markup("<small>Ctrl/Shift for multiple · select a group to take all "
-                        "of it · right-click for other programs</small>")
-        hint.get_style_context().add_class("dim-label")
-        left.pack_start(hint, False, False, 0)
 
         # Edit / Duplicate / Delete live in the right-click menu, not here.
         # One button per configured protocol; a FlowBox so ten of them wrap
@@ -329,19 +337,28 @@ class Win(Gtk.Window):
     def reload(self) -> None:
         rcm.conns_cached(refresh=True)
         keys = rcm.session_bindings()
+        ticked = self.checked_sels()
+        registry = protocols_safe()
         self.store.clear()
         parents: dict[str, Gtk.TreeIter] = {}
         for c in rcm.conns_cached():
             it = None
             if c.group:
                 if c.group not in parents:
-                    # Field order must match C_LABEL, C_HOST, C_USER, C_KEY,
-                    # C_SEL, C_MARK, C_WEIGHT -- not the visual column order.
+                    # Field order follows the C_* constants, not the visual order.
                     parents[c.group] = self.store.append(
-                        None, [c.group, "", "", "", "", "", 400])
+                        None, [False, "", c.group, "", "", "", "", "",
+                               700, Pango.Style.ITALIC])
                 it = parents[c.group]
-            self.store.append(it, [c.name, c.host, c.username,
-                                   pretty_key(keys.get(c.sel, "")), c.sel, "", 400])
+            labels = " ".join(registry[pid].label for pid in c.protocols
+                              if pid in registry)
+            self.store.append(it, [c.sel in ticked, "", c.name, c.host, c.username,
+                                   labels, pretty_key(keys.get(c.sel, "")), c.sel,
+                                   400, Pango.Style.NORMAL])
+        for group, it in parents.items():
+            kids = self._children(it)
+            self.store[it][C_CHECK] = bool(kids) and all(
+                self.store[k][C_CHECK] for k in kids)
         self.tree.expand_all()
         self.count_lbl.set_text(f"({len(rcm.conns_cached())})")
         self.refresh_live()
@@ -370,7 +387,7 @@ class Win(Gtk.Window):
                 if child:
                     lit = paint(child)
                     self.store[it][C_MARK] = "●" if lit else ""
-                    self.store[it][C_WEIGHT] = 700 if lit else 400
+                    self.store[it][C_WEIGHT] = 700   # group headers stay bold
                     any_live |= lit
                 else:
                     sel = self.store[it][C_SEL]
@@ -382,6 +399,55 @@ class Win(Gtk.Window):
             return any_live
 
         paint(self.store.get_iter_first())
+
+    def _children(self, it) -> list:
+        out, k = [], self.store.iter_children(it)
+        while k:
+            out.append(k)
+            k = self.store.iter_next(k)
+        return out
+
+    def on_check_toggled(self, _renderer, path) -> None:
+        """Tick a row. A group carries its whole membership with it."""
+        it = self.store.get_iter(path)
+        new = not self.store[it][C_CHECK]
+        self.store[it][C_CHECK] = new
+        for k in self._children(it):
+            self.store[k][C_CHECK] = new
+        parent = self.store.iter_parent(it)
+        if parent is not None:
+            kids = self._children(parent)
+            self.store[parent][C_CHECK] = bool(kids) and all(
+                self.store[k][C_CHECK] for k in kids)
+        n = len(self.checked_sels())
+        self.say(f"{n} connection(s) ticked" if n else "nothing ticked")
+
+    def checked_sels(self) -> set[str]:
+        out: set[str] = set()
+
+        def walk(it):
+            while it:
+                sel = self.store[it][C_SEL]
+                if sel and self.store[it][C_CHECK]:
+                    out.add(sel)
+                child = self.store.iter_children(it)
+                if child:
+                    walk(child)
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
+        return out
+
+    def _checked_conns(self) -> list[rcm.Conn]:
+        sels = self.checked_sels()
+        return [c for c in rcm.conns_cached() if c.sel in sels]
+
+    def _button_targets(self) -> list[rcm.Conn]:
+        """What the Connect buttons act on: ticked rows, else the selection.
+
+        Falling back keeps the buttons useful before anything is ticked, without
+        making the tickboxes decorative once they are.
+        """
+        return self._checked_conns() or self._selected_conns()
 
     def _selected_conns(self) -> list[rcm.Conn]:
         """Selected connections; a selected group row stands for all its members."""
@@ -428,10 +494,11 @@ class Win(Gtk.Window):
         d.destroy()
 
     # ---- connecting --------------------------------------------------------- #
-    def connect_selected(self, proto: str, launcher: str = "") -> None:
-        cs = self._selected_conns()
+    def connect_selected(self, proto: str, launcher: str = "",
+                         conns: list | None = None) -> None:
+        cs = conns if conns is not None else self._button_targets()
         if not cs:
-            self.say("select a connection first")
+            self.say("tick or select a connection first")
             return
         skipped = [c.sel for c in cs if proto not in c.protocols]
         cs = [c for c in cs if proto in c.protocols]
@@ -459,6 +526,15 @@ class Win(Gtk.Window):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def on_row_activated(self, _tv, path, _col) -> None:
+        it = self.store.get_iter(path)
+        sel = self.store[it][C_SEL]
+        c = rcm.find(sel) if sel else None
+        protos = protocols_safe()
+        if c and protos:
+            pid = next((i for i in protos if i in c.protocols), next(iter(protos)))
+            self.connect_selected(pid, "", [c])
+
     def on_tree_click(self, _w, event):
         if event.button != 3:
             return False
@@ -483,16 +559,33 @@ class Win(Gtk.Window):
             top = Gtk.MenuItem(label=f"Connect {pr.label}")
             top.set_sensitive(bool(cs) and pr.id in offered and bool(pr.launchers))
             if len(pr.launchers) <= 1:
-                top.connect("activate", lambda _m, pid=pr.id: self.connect_selected(pid))
+                top.connect("activate",
+                            lambda _m, pid=pr.id: self.connect_selected(pid, "", cs))
             else:
                 sub = Gtk.Menu()
                 for nm in pr.launchers:
                     mi = Gtk.MenuItem(label=f"{nm}  (default)" if nm == pr.default else nm)
                     mi.connect("activate",
-                               lambda _m, pid=pr.id, n=nm: self.connect_selected(pid, n))
+                               lambda _m, pid=pr.id, n=nm:
+                               self.connect_selected(pid, n, cs))
                     sub.append(mi)
                 top.set_submenu(sub)
             menu.append(top)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Export acts on the selection, and a selected group means all of it.
+        exp = Gtk.MenuItem(label=f"Export ({len(cs)})" if cs else "Export")
+        exp.set_sensitive(bool(cs))
+        esub = Gtk.Menu()
+        for label, handler in ((".rdp files…", self.export_rdp),
+                               ("Radmin phonebook…", self.export_phonebook_sel),
+                               ("CSV (re-importable)…", self.export_csv_sel)):
+            mi = Gtk.MenuItem(label=label)
+            mi.connect("activate", lambda _m, h=handler, sel=cs: h(sel))
+            esub.append(mi)
+        exp.set_submenu(esub)
+        menu.append(exp)
 
         menu.append(Gtk.SeparatorMenuItem())
         for label, cb, need_one in (("Edit", self.on_edit, True),
@@ -744,6 +837,48 @@ class Win(Gtk.Window):
                 rcm.kill_session(s)
             self.say(f"disconnected {len(ss)} session(s)")
             GLib.timeout_add_seconds(1, lambda: (self.refresh_live(), False)[1])
+
+    # ---- export of a selection ------------------------------------------------ #
+    def export_rdp(self, conns: list) -> None:
+        if not conns:
+            return
+        d = Gtk.FileChooserDialog(
+            title=f"Export {len(conns)} .rdp file(s) to…", transient_for=self,
+            action=Gtk.FileChooserAction.SELECT_FOLDER)
+        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                      Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        d.set_current_folder(str(rcm.EXPORT_DIR))
+        resp, path = d.run(), d.get_filename()
+        d.destroy()
+        if resp != Gtk.ResponseType.OK or not path:
+            return
+        n = rcm.export_rdp_files(conns, Path(path))
+        self.say(f"exported {n} .rdp file(s) to {path}")
+
+    def export_csv_sel(self, conns: list) -> None:
+        if not conns:
+            return
+        p = self._file_dialog(f"Export {len(conns)} connection(s) to CSV",
+                              Gtk.FileChooserAction.SAVE, name="connections.csv")
+        if p:
+            n = rcm.export_csv(p, conns)
+            self.say(f"exported {n} connection(s) to {p} — re-importable")
+
+    def export_phonebook_sel(self, conns: list) -> None:
+        if not conns:
+            return
+        p = self._file_dialog(f"Export {len(conns)} connection(s) as a Radmin phonebook",
+                              Gtk.FileChooserAction.SAVE, name="radmin.rpb",
+                              patterns=(("Radmin phonebook", "*.rpb"),))
+        if not p:
+            return
+        try:
+            n = rcm.export_phonebook(p, conns)
+        except RuntimeError as e:
+            self._dialog(Gtk.MessageType.ERROR, "Phonebook export failed", str(e))
+            return
+        self._dialog(Gtk.MessageType.INFO, f"Wrote {n} record(s)",
+                     "Your real phonebook was not touched.")
 
     # ---- import / export ----------------------------------------------------- #
     def _file_dialog(self, title, action, name=None, patterns=(("CSV", "*.csv"),)):
