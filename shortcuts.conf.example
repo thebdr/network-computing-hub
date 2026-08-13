@@ -1,0 +1,19 @@
+# System-wide keyboard shortcuts.
+#
+# Edited from the manager (menu -> Keyboard shortcuts...) or by hand.
+# Run `rcm shortcuts install` after editing by hand.
+#
+# Binding syntax is Cinnamon's: <Super> <Ctrl> <Alt> <Shift> plus a key,
+# e.g. <Super>r, <Super><Alt>1, <Super>grave.
+
+[global]
+# Raise the manager
+focus = <Super>r
+# Next active session
+next = <Super>w
+# Previous active session
+prev = <Super>q
+
+[sessions]
+# Focuses the connection if a session is live, otherwise connects it.
+# One line per connection, e.g.:  GROUP/Host = <Super><Alt>1

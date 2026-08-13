@@ -1,0 +1,1766 @@
+#!/usr/bin/env python3
+"""rcm -- remote connection manager.
+
+Keeps connections in one place and launches them with whatever external client
+you configure; credentials live in the OS keyring, not on disk.
+
+Everything lives under one directory:
+
+    bin/            these scripts
+    RDP/GROUP/      the .rdp files -- source of truth for host + username
+    templates/      default.rdp, used to generate connections on import
+    export/         generated CSV / phonebook output
+    launchers.conf  which program connects each protocol, plus [radmin]
+    creds.conf      scope -> username only; passwords are in the keyring
+    shortcuts.conf  system-wide keys
+
+Config is never guessed: a missing or wrong value raises ConfigError naming the
+file and the key, rather than silently falling back to a built-in.
+
+A group folder renamed with a leading dot (Plant -> .Plant) disappears everywhere.
+"""
+from __future__ import annotations
+
+import configparser
+import csv
+import getpass
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+APP = Path(__file__).resolve().parent.parent
+RDP_DIR = APP / "RDP"
+TEMPLATE = APP / "templates" / "default.rdp"
+EXPORT_DIR = APP / "export"
+CREDS = APP / "creds.conf"
+LAUNCHERS = APP / "launchers.conf"
+SHORTCUTS = APP / "shortcuts.conf"
+LEGACY_CREDS = Path.home() / ".config" / "radmin" / "creds.conf"
+
+PROTOCOLS = ("rdp", "vnc", "radmin")
+DEFAULT_VNC_PORT = 5900
+
+THINCAST = ["flatpak", "run", "com.thincast.client"]
+
+# Everything about Radmin lives in launchers.conf [radmin]; see radmin_config().
+# Nothing here is guessed from the code -- a missing or wrong value is an error,
+# not a silent fallback onto whatever happened to be true on the author's machine.
+RADMIN_KEYS = ("exe", "wine", "wineprefix", "port", "phonebook", "dialog_wait",
+               "settle", "type_delay", "window_class", "title_match", "inject_order")
+
+DESKTOP_FILE = Path.home() / ".local/share/applications/rdp-menu.desktop"
+MAX_JUMPLIST = 10
+
+
+# --------------------------------------------------------------------------- #
+# model
+# --------------------------------------------------------------------------- #
+@dataclass
+class Conn:
+    group: str
+    name: str
+    path: Path
+    host: str = ""
+    username: str = ""
+    port: int = 3389
+    extra: dict = field(default_factory=dict)
+
+    @property
+    def sel(self) -> str:
+        return f"{self.group}/{self.name}" if self.group else self.name
+
+    @property
+    def vnc_port(self) -> int:
+        try:
+            return int(self.extra.get("rcm-vnc-port") or DEFAULT_VNC_PORT)
+        except ValueError:
+            return DEFAULT_VNC_PORT
+
+    @property
+    def protocols(self) -> tuple[str, ...]:
+        """Which protocols this host offers. Absent key means "all of them"."""
+        raw = (self.extra.get("rcm-protocols") or "").strip()
+        if not raw:
+            return PROTOCOLS
+        want = [p.strip().lower() for p in raw.split(",") if p.strip()]
+        return tuple(p for p in PROTOCOLS if p in want) or PROTOCOLS
+
+    def port_for(self, proto: str) -> int:
+        return self.vnc_port if proto == "vnc" else self.port
+
+
+def parse_rdp(path: Path) -> dict:
+    out = {}
+    for line in path.read_text(errors="replace").splitlines():
+        m = re.match(r"^([^:]+):([sib]):(.*)$", line)
+        if m:
+            out[m.group(1)] = m.group(3).strip("\r")
+    return out
+
+
+def scan() -> list[Conn]:
+    """All connections, skipping dot-prefixed groups."""
+    conns: list[Conn] = []
+    if not RDP_DIR.is_dir():
+        return conns
+    for p in sorted(RDP_DIR.rglob("*.rdp")):
+        rel = p.relative_to(RDP_DIR)
+        # Any dot-prefixed path component hides the connection.
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        f = parse_rdp(p)
+        conns.append(Conn(
+            group=rel.parts[0] if len(rel.parts) > 1 else "",
+            name=p.stem,
+            path=p,
+            host=f.get("full address", ""),
+            username=f.get("username", ""),
+            port=int(f.get("server port") or 3389),
+            extra=f,
+        ))
+    return conns
+
+
+def groups() -> list[str]:
+    return sorted({c.group for c in conns_cached() if c.group})
+
+
+_cache: list[Conn] | None = None
+
+
+def conns_cached(refresh: bool = False) -> list[Conn]:
+    global _cache
+    if _cache is None or refresh:
+        _cache = scan()
+    return _cache
+
+
+def find(sel: str) -> Conn | None:
+    for c in conns_cached():
+        if c.sel == sel:
+            return c
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# credentials
+# --------------------------------------------------------------------------- #
+def creds_path() -> Path | None:
+    for p in (CREDS, LEGACY_CREDS):
+        if p.is_file():
+            return p
+    return None
+
+
+# Passwords live in the login keyring (libsecret), encrypted at rest and unlocked
+# with the session. creds.conf keeps only "key|username" -- no secret material.
+# A third field there is still honoured so pre-keyring files keep working.
+_SECRET = None
+
+
+def _secret():
+    global _SECRET
+    if _SECRET is None:
+        try:
+            import gi
+            gi.require_version("Secret", "1")
+            from gi.repository import Secret
+            _SECRET = (Secret, Secret.Schema.new(
+                "org.hyper.rcm", Secret.SchemaFlags.NONE,
+                {"app": Secret.SchemaAttributeType.STRING,
+                 "key": Secret.SchemaAttributeType.STRING}))
+        except Exception:
+            _SECRET = (None, None)
+    return _SECRET
+
+
+def keyring_available() -> bool:
+    return _secret()[0] is not None
+
+
+def secret_get(key: str) -> str:
+    Secret, schema = _secret()
+    if not Secret:
+        return ""
+    try:
+        return Secret.password_lookup_sync(schema, {"app": "rcm", "key": key}, None) or ""
+    except Exception:
+        return ""
+
+
+def secret_set(key: str, password: str) -> bool:
+    Secret, schema = _secret()
+    if not Secret:
+        return False
+    return bool(Secret.password_store_sync(
+        schema, {"app": "rcm", "key": key}, Secret.COLLECTION_DEFAULT,
+        f"rcm credential for {key}", password, None))
+
+
+def secret_clear(key: str) -> bool:
+    Secret, schema = _secret()
+    if not Secret:
+        return False
+    try:
+        return bool(Secret.password_clear_sync(schema, {"app": "rcm", "key": key}, None))
+    except Exception:
+        return False
+
+
+def _creds_table() -> dict[str, tuple[str, str]]:
+    """key -> (username, legacy_plaintext_password_or_empty)."""
+    p = creds_path()
+    table: dict[str, tuple[str, str]] = {}
+    if not p:
+        return table
+    for line in p.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("|")
+        if len(parts) >= 2:
+            table.setdefault(parts[0], (parts[1], parts[2] if len(parts) > 2 else ""))
+    return table
+
+
+def creds_keys() -> list[str]:
+    return sorted(_creds_table())
+
+
+def creds_chain(sel: str, proto: str = "") -> list[str]:
+    """Credential keys to try, most specific first.
+
+    Scope specificity outranks protocol: a credential set for one host is more
+    precise than a protocol-wide default.
+
+        Group/Host@radmin -> Group/Host -> Group@radmin -> Group -> DEFAULT@radmin -> DEFAULT
+    """
+    chain = []
+    for scope in (sel, sel.split("/")[0], "DEFAULT"):
+        if not scope:
+            continue
+        if proto:
+            chain.append(f"{scope}@{proto}")
+        if scope not in chain:
+            chain.append(scope)
+    return chain
+
+
+def creds_lookup(sel: str, fallback_user: str = "", proto: str = "") -> tuple[str, str]:
+    """(username, password) for a connection, optionally for one protocol."""
+    table = _creds_table()
+    user, pw = fallback_user, ""
+    for key in creds_chain(sel, proto):
+        secret = secret_get(key)
+        entry = table.get(key)
+        if secret or entry:
+            if entry and entry[0]:
+                user = entry[0]
+            pw = secret or (entry[1] if entry else "")
+            if pw:
+                break
+    return user.split("\\")[-1], pw
+
+
+def creds_scopes() -> list[str]:
+    """Editable credential scopes: DEFAULT, every group, then any per-host overrides.
+
+    Protocol-qualified keys ("Group@radmin") are scopes in their own right, so they
+    show up in the editor next to the generic entry they refine.
+    """
+    groups = sorted({c.group for c in conns_cached() if c.group})
+    base = ["DEFAULT"] + groups
+    extra = {k for k in _creds_table() if k not in base}
+    extra |= {c.sel for c in conns_cached() if secret_get(c.sel)}
+    for scope in list(base):
+        for proto in PROTOCOLS:
+            if secret_get(f"{scope}@{proto}"):
+                extra.add(f"{scope}@{proto}")
+    return base + sorted(extra)
+
+
+def secret_keys_known() -> list[str]:
+    """Per-connection keys that have a stored password (checked, not enumerated)."""
+    return [c.sel for c in conns_cached() if secret_get(c.sel)]
+
+
+def creds_status(key: str) -> tuple[str, bool, bool]:
+    """(username, password_in_keyring, password_plaintext_in_file) for one scope."""
+    entry = _creds_table().get(key, ("", ""))
+    return entry[0], bool(secret_get(key)), bool(entry[1])
+
+
+def creds_set_user(key: str, username: str) -> None:
+    """Upsert a scope's username in creds.conf. Passwords never go in this file."""
+    path = CREDS
+    lines = path.read_text().splitlines() if path.is_file() else []
+    out, done = [], False
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and s.split("|")[0] == key:
+            if not done:
+                out.append(f"{key}|{username}|")
+                done = True
+            continue
+        out.append(line)
+    if not done:
+        out.append(f"{key}|{username}|")
+    path.write_text("\n".join(out) + "\n")
+    path.chmod(0o600)
+
+
+def creds_delete(key: str) -> None:
+    """Drop a scope entirely: its creds.conf line and its keyring password."""
+    secret_clear(key)
+    if not CREDS.is_file():
+        return
+    out = [ln for ln in CREDS.read_text().splitlines()
+           if not (ln.strip() and not ln.strip().startswith("#")
+                   and ln.strip().split("|")[0] == key)]
+    CREDS.write_text("\n".join(out) + "\n")
+    CREDS.chmod(0o600)
+
+
+def creds_migrate() -> tuple[int, int]:
+    """Move plaintext passwords out of creds.conf into the keyring.
+
+    Returns (moved, skipped). Rewrites creds.conf with the password column blank.
+    """
+    if not keyring_available():
+        raise RuntimeError("no keyring available (libsecret/gnome-keyring not usable)")
+    p = creds_path()
+    if not p:
+        raise RuntimeError("no creds.conf found")
+    moved = skipped = 0
+    out: list[str] = []
+    for line in p.read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            out.append(line)
+            continue
+        parts = s.split("|")
+        if len(parts) >= 3 and parts[2] and parts[2] != "CHANGEME":
+            if secret_set(parts[0], parts[2]):
+                moved += 1
+                out.append(f"{parts[0]}|{parts[1]}|")
+                continue
+            skipped += 1
+            out.append(line)
+        else:
+            skipped += 1
+            out.append(line)
+    target = CREDS
+    target.write_text("\n".join(out) + "\n")
+    target.chmod(0o600)
+    return moved, skipped
+
+
+# --------------------------------------------------------------------------- #
+# writing connections
+# --------------------------------------------------------------------------- #
+def write_rdp(group: str, name: str, host: str, username: str,
+              port: int = 3389, overwrite: bool = False,
+              vnc_port: int = DEFAULT_VNC_PORT,
+              protocols: str = "") -> Path:
+    if not TEMPLATE.is_file():
+        raise SystemExit(f"missing template: {TEMPLATE}")
+    dest_dir = RDP_DIR / group if group else RDP_DIR
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{name}.rdp"
+    if dest.exists() and not overwrite:
+        raise FileExistsError(dest)
+    body = TEMPLATE.read_text()
+    body = body.replace("{{HOST}}", host).replace("{{USERNAME}}", username)
+    body = re.sub(r"^server port:i:.*$", f"server port:i:{port}", body, flags=re.M)
+    # rcm-* keys are our own extensions. RDP clients ignore keys they don't know.
+    body = body.rstrip("\n") + f"\nrcm-vnc-port:i:{vnc_port}\n"
+    if protocols:
+        body += f"rcm-protocols:s:{protocols}\n"
+    dest.write_text(body)
+    return dest
+
+
+def delete_conn(c: Conn) -> None:
+    c.path.unlink()
+
+
+def copy_conn(c: Conn, new_name: str) -> Path:
+    dest = c.path.with_name(f"{new_name}.rdp")
+    if dest.exists():
+        raise FileExistsError(dest)
+    shutil.copy2(c.path, dest)
+    return dest
+
+
+def set_fields(c: Conn, host: str | None = None, username: str | None = None,
+               port: int | None = None, vnc_port: int | None = None,
+               protocols: str | None = None) -> None:
+    """Rewrite the per-host fields in place, leaving every other setting alone."""
+    lines = c.path.read_text().splitlines()
+    def repl(key, val):
+        pat = re.compile(rf"^{re.escape(key)}:([sib]):")
+        for i, ln in enumerate(lines):
+            if pat.match(ln):
+                kind = pat.match(ln).group(1)
+                lines[i] = f"{key}:{kind}:{val}"
+                return
+        lines.append(f"{key}:s:{val}")
+    if host is not None:
+        repl("full address", host)
+        repl("alternate full address", host)
+    if username is not None:
+        repl("username", username)
+    if port is not None:
+        repl("server port", str(port))
+    if vnc_port is not None:
+        repl("rcm-vnc-port", str(vnc_port))
+    if protocols is not None:
+        repl("rcm-protocols", protocols)
+    c.path.write_text("\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# launching
+# --------------------------------------------------------------------------- #
+def _spawn(argv: list[str], env: dict | None = None) -> None:
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    subprocess.Popen(argv, env=e, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def load_launchers() -> dict[str, dict]:
+    """{proto: {"default": name, "items": {name: cmdline}}} from launchers.conf."""
+    cp = configparser.ConfigParser()
+    cp.optionxform = str  # keep launcher names case-sensitive
+    if LAUNCHERS.is_file():
+        cp.read(LAUNCHERS)
+    out: dict[str, dict] = {}
+    for proto in ("rdp", "vnc"):
+        items, dflt = {}, ""
+        if cp.has_section(proto):
+            for k, v in cp.items(proto):
+                if k == "default":
+                    dflt = v.strip()
+                elif v.strip():
+                    items[k] = v.strip()
+        if not dflt or dflt not in items:
+            dflt = next(iter(items), "")
+        out[proto] = {"default": dflt, "items": items}
+    # Radmin's command line is fixed -- it needs its own Wine prefix and the
+    # xdotool credential dance, so it is not user-configurable.
+    out["radmin"] = {"default": "Radmin Viewer", "items": {"Radmin Viewer": ""}}
+    return out
+
+
+class ConfigError(RuntimeError):
+    """Configuration is missing or wrong. Always names the file and the key."""
+
+
+# First-run defaults. These are written to disk as real, commented, hand-editable
+# files -- they are never used as invisible in-code fallbacks. That is what makes
+# "fail loudly on bad config" livable: a fresh clone gets files it can see.
+DEFAULT_CONFIGS: dict[str, str] = {
+    "launchers.conf": """\
+# Connection programs, per protocol.
+#
+# Each section is a protocol. Every other key is a launcher name mapped to its
+# command line. "default" names the launcher the toolbar buttons use; right-click
+# a connection in the manager to pick any of the others.
+#
+# Placeholders, substituted per token (so paths with spaces stay one argument):
+#   {file}  full path to the .rdp file
+#   {host}  hostname or IP
+#   {user}  username
+#   {port}  protocol port (RDP: "server port", VNC: rcm-vnc-port, default 5900)
+#   {name}  connection name
+
+[rdp]
+default = Thincast
+Thincast = flatpak run com.thincast.client {file}
+xfreerdp = xfreerdp3 /v:{host}:{port} /u:{user} +clipboard +fonts /dynamic-resolution /cert:ignore
+Remmina = remmina -c {file}
+mstsc = mstsc {file}
+
+[vnc]
+default = Remmina
+Remmina = remmina -c vnc://{host}:{port}
+TigerVNC = vncviewer {host}::{port}
+
+# Radmin Viewer. Nothing here is guessed by the code -- if a value is missing or
+# points at something that does not exist, rcm says so instead of falling back.
+# Run `rcm radmin detect --write` to fill in `exe` automatically.
+[radmin]
+exe =
+# Wine binary. Leave EMPTY when Radmin runs natively (Windows, or a native build).
+wine =
+wineprefix =
+port = 4899
+# Only `rcm phonebook` needs this; it uses the file as a structural template.
+phonebook =
+
+# Credential-dialog handling. Raise the delays if characters go missing.
+dialog_wait = 20
+settle = 0.3
+type_delay = 40
+window_class = [Rr]admin
+title_match = security
+#   user-tab-pass : username field focused on open -> user, Tab, pass, Enter
+#   pass-only     : password field focused, username prefilled -> pass, Enter
+inject_order = user-tab-pass
+""",
+    "creds.conf": """\
+# Credentials for rcm. Passwords are NOT stored here -- they live in the OS
+# keyring. This file only maps a scope to a username.
+#
+# Format:  key|username|
+#
+#   key       "GROUP/Name", "GROUP", or "DEFAULT", optionally with "@protocol"
+#             (rdp / vnc / radmin). Looked up most specific first, and within a
+#             scope a protocol-specific entry beats the generic one:
+#
+#               GROUP/Name@radmin -> GROUP/Name -> GROUP@radmin
+#                                 -> GROUP -> DEFAULT@radmin -> DEFAULT
+#
+#   username  leave EMPTY to use username:s: from the matching .rdp file.
+#
+# Edit here, or in the manager under Credentials...
+
+DEFAULT||
+""",
+    "shortcuts.conf": """\
+# System-wide keyboard shortcuts.
+#
+# Edited from the manager (menu -> Keyboard shortcuts...) or by hand.
+# Run `rcm shortcuts install` after editing by hand.
+#
+# Binding syntax is Cinnamon's: <Super> <Ctrl> <Alt> <Shift> plus a key,
+# e.g. <Super>r, <Super><Alt>1, <Super>grave.
+
+[global]
+# Raise the manager
+focus = <Super>r
+# Next active session
+next = <Super>w
+# Previous active session
+prev = <Super>q
+
+[sessions]
+# Focuses the connection if a session is live, otherwise connects it.
+# One line per connection, e.g.:  GROUP/Host = <Super><Alt>1
+""",
+}
+
+
+def missing_configs() -> list[str]:
+    return [name for name in DEFAULT_CONFIGS if not (APP / name).is_file()]
+
+
+def write_default_configs(names: list[str] | None = None) -> list[str]:
+    """Create any missing config file from its documented default."""
+    written = []
+    for name in (names if names is not None else missing_configs()):
+        dest = APP / name
+        if dest.is_file():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(DEFAULT_CONFIGS[name])
+        if name == "creds.conf":
+            dest.chmod(0o600)
+        written.append(name)
+    return written
+
+
+def _expand(value: str) -> str:
+    return os.path.expandvars(os.path.expanduser(value.strip()))
+
+
+def radmin_config(require_exe: bool = True) -> dict:
+    """The [radmin] section of launchers.conf, expanded and validated.
+
+    Deliberately has no built-in defaults: if the section is absent or a value is
+    wrong, say so and name the file, rather than quietly using a path that only
+    happens to exist on one machine.
+    """
+    if not LAUNCHERS.is_file():
+        raise ConfigError(f"no {LAUNCHERS} -- run `rcm radmin detect`, "
+                          "or start the manager once to write a default")
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    cp.read(LAUNCHERS)
+    if not cp.has_section("radmin"):
+        raise ConfigError(f"{LAUNCHERS} has no [radmin] section -- "
+                          "run `rcm radmin detect` to create one")
+
+    raw = {k: v.strip() for k, v in cp.items("radmin")}
+    missing = [k for k in RADMIN_KEYS if k not in raw and k not in ("phonebook",)]
+    if missing:
+        raise ConfigError(f"{LAUNCHERS} [radmin] is missing: {', '.join(missing)}")
+
+    def num(key, cast):
+        try:
+            return cast(raw[key])
+        except (KeyError, ValueError):
+            raise ConfigError(f"{LAUNCHERS} [radmin] {key}={raw.get(key)!r} "
+                              f"is not a valid {cast.__name__}") from None
+
+    cfg = {
+        "exe": Path(_expand(raw["exe"])),
+        "wine": raw["wine"],                      # empty = run the exe directly
+        "wineprefix": _expand(raw["wineprefix"]),
+        "port": num("port", int),
+        "phonebook": Path(_expand(raw["phonebook"])) if raw.get("phonebook") else None,
+        "dialog_wait": num("dialog_wait", float),
+        "settle": num("settle", float),
+        "type_delay": num("type_delay", int),
+        "window_class": raw["window_class"],
+        "title_match": raw["title_match"],
+        "inject_order": raw["inject_order"],
+    }
+    if cfg["inject_order"] not in ("user-tab-pass", "pass-only"):
+        raise ConfigError(f"{LAUNCHERS} [radmin] inject_order="
+                          f"{cfg['inject_order']!r} must be user-tab-pass or pass-only")
+    if not raw["exe"]:
+        raise ConfigError(f"{LAUNCHERS} [radmin] exe is not set -- "
+                          "run `rcm radmin detect --write`")
+    if require_exe and not cfg["exe"].is_file():
+        raise ConfigError(f"{LAUNCHERS} [radmin] exe does not exist: {cfg['exe']}\n"
+                          "  run `rcm radmin detect` to find an install")
+    if require_exe and cfg["wine"] and not shutil.which(cfg["wine"]):
+        raise ConfigError(f"{LAUNCHERS} [radmin] wine={cfg['wine']!r} is not installed "
+                          "(leave it empty for a native install)")
+    return cfg
+
+
+def radmin_argv(cfg: dict, host: str) -> tuple[list[str], dict]:
+    """(argv, env) to connect Radmin to a host, with or without Wine."""
+    target = [str(cfg["exe"]), f"/connect:{host}:{cfg['port']}"]
+    if cfg["wine"]:
+        return [cfg["wine"], *target], {"WINEPREFIX": cfg["wineprefix"]}
+    return target, {}
+
+
+def radmin_detect() -> list[Path]:
+    """Candidate Radmin.exe paths, best first.
+
+    Ranked, not first-hit: a machine can easily have a real install, an abandoned
+    Wine prefix with no exe, and a couple of portable copies in Downloads.
+    """
+    home = Path.home()
+    roots = [home / ".local/share/wineprefixes", home, home / "WindowsApps",
+             home / "Downloads", Path("/opt")]
+    for env in ("ProgramFiles(x86)", "ProgramFiles"):
+        if os.environ.get(env):
+            roots.append(Path(os.environ[env]))
+    seen, found = set(), []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            for p in root.glob("**/Radmin.exe"):
+                rp = p.resolve()
+                if rp not in seen and rp.is_file():
+                    seen.add(rp)
+                    found.append(rp)
+        except (OSError, PermissionError):
+            continue
+
+    def rank(p: Path) -> tuple:
+        s = str(p)
+        return (
+            0 if "wineprefixes" in s or "Program Files" in s else 1,  # installed first
+            0 if "Downloads" not in s else 1,                          # not a download
+            -p.stat().st_size,
+            s,
+        )
+    return sorted(found, key=rank)
+
+
+def save_launchers(reg: dict, radmin: dict) -> None:
+    """Rewrite launchers.conf from the GUI.
+
+    Regenerates the documentation comments rather than round-tripping arbitrary
+    ones -- configparser cannot preserve comments, and a silently de-commented
+    config is worse than a re-commented one. Hand edits to *values* survive,
+    because the GUI reads the file before it writes it.
+    """
+    head, _, _ = DEFAULT_CONFIGS["launchers.conf"].partition("\n[rdp]")
+    L = [head.rstrip("\n"), ""]
+    for proto in ("rdp", "vnc"):
+        d = reg.get(proto, {})
+        L.append(f"[{proto}]")
+        if d.get("default"):
+            L.append(f"default = {d['default']}")
+        for name, cmd in d.get("items", {}).items():
+            L.append(f"{name} = {cmd}")
+        L.append("")
+    L += ["# Radmin Viewer. `rcm radmin detect --write` fills in `exe` for you.",
+          "# Leave `wine` empty when Radmin runs natively (Windows).",
+          "[radmin]"]
+    for key in RADMIN_KEYS:
+        val = radmin.get(key, "")
+        L.append(f"{key} = {'' if val is None else val}")
+    LAUNCHERS.write_text("\n".join(L) + "\n")
+
+
+def launcher_names(proto: str) -> list[str]:
+    return list(load_launchers().get(proto, {}).get("items", {}))
+
+
+def build_argv(c: Conn, proto: str, launcher: str = "") -> list[str]:
+    reg = load_launchers().get(proto, {})
+    name = launcher or reg.get("default", "")
+    tmpl = reg.get("items", {}).get(name, "")
+    if not tmpl:
+        raise RuntimeError(f"no launcher configured for {proto}"
+                           + (f" named {name!r}" if name else ""))
+    vals = {"file": str(c.path), "host": c.host, "user": c.username,
+            "port": str(c.port_for(proto)), "name": c.name}
+    # Substitute per token so a path with spaces stays a single argument.
+    return [tok.format(**vals) for tok in shlex.split(tmpl)]
+
+
+def launch(c: Conn, proto: str = "rdp", launcher: str = "") -> str:
+    if proto == "radmin":
+        return launch_radmin(c)
+    argv = build_argv(c, proto, launcher)
+    if not shutil.which(argv[0]):
+        raise RuntimeError(f"{argv[0]} is not installed (launcher "
+                           f"{launcher or load_launchers()[proto]['default']!r})")
+    _spawn(argv)
+    return f"{proto.upper()} -> {c.sel} ({c.host}) via {argv[0]}"
+
+
+def launch_rdp(c: Conn) -> None:
+    launch(c, "rdp")
+
+
+def x(*args: str) -> str:
+    try:
+        return subprocess.run(["xdotool", *args], capture_output=True,
+                              text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+
+def capture_window(win: str, dest: Path) -> Path | None:
+    """Save a picture of one window, or None if the tools are missing.
+
+    Wine draws dialog controls inside a single X window, so no X query can say
+    which field holds the caret. A picture can.
+    """
+    if not shutil.which("gnome-screenshot"):
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    geom = {}
+    for line in x("getwindowgeometry", "--shell", win).splitlines():
+        if "=" in line:
+            k, _, v = line.partition("=")
+            geom[k.strip()] = v.strip()
+    try:
+        gx, gy = int(geom["X"]), int(geom["Y"])
+        gw, gh = int(geom["WIDTH"]), int(geom["HEIGHT"])
+    except (KeyError, ValueError):
+        return None
+    full = Path(tempfile.mkstemp(suffix=".png")[1])
+    try:
+        subprocess.run(["gnome-screenshot", "--file", str(full)], capture_output=True)
+        if not full.stat().st_size:
+            return None
+        im = Image.open(full)
+        pad = 10
+        im.crop((max(0, gx - pad), max(0, gy - pad),
+                 min(im.width, gx + gw + pad),
+                 min(im.height, gy + gh + pad))).save(dest)
+        return dest
+    except (OSError, ValueError):
+        return None
+    finally:
+        full.unlink(missing_ok=True)
+
+
+def _radmin_windows(wclass: str) -> set[str]:
+    out = x("search", "--onlyvisible", "--class", wclass)
+    return {w for w in out.splitlines() if w.strip()}
+
+
+def launch_radmin(c: Conn, inject: bool = True) -> str:
+    """Connect via Radmin, injecting credentials into the auth dialog.
+
+    Returns a status string. Raises RuntimeError on a hard failure.
+    """
+    cfg = radmin_config()
+    # xdotool cannot inject under Wayland; without this it fails silently.
+    if os.environ.get("XDG_SESSION_TYPE", "x11") != "x11":
+        raise RuntimeError(
+            f"session is {os.environ.get('XDG_SESSION_TYPE')}, not X11 -- "
+            "injection will not work (ydotool is the fallback)")
+
+    user, pw = creds_lookup(c.sel, c.username, proto="radmin")
+    win = _open_radmin_dialog(cfg, c.host)[0]
+
+    if not inject:
+        return "launched (no injection requested)"
+    if not pw or pw == "CHANGEME":
+        return f"dialog open on {c.host}; no password set -- type it manually"
+
+    # xdotool type --window uses XSendEvent, which Wine ignores outright.
+    # Always activate first, then type to the focused window via XTEST.
+    x("windowactivate", "--sync", win)
+    time.sleep(cfg["settle"])
+    delay = str(cfg["type_delay"])
+    if cfg["inject_order"] == "user-tab-pass":
+        x("type", "--delay", delay, "--", user)
+        x("key", "Tab")
+    x("type", "--delay", delay, "--", pw)
+    x("key", "Return")
+    return f"connected {c.sel} ({c.host}) as {user}"
+
+
+def _open_radmin_dialog(cfg: dict, host: str) -> tuple[str, list[str]]:
+    """Launch Radmin at a host and wait for its auth dialog. (window, all new)."""
+    before = _radmin_windows(cfg["window_class"])
+    argv, env = radmin_argv(cfg, host)
+    _spawn(argv, env=env)
+
+    deadline = time.time() + cfg["dialog_wait"]
+    new: list[str] = []
+    while time.time() < deadline:
+        new = sorted(_radmin_windows(cfg["window_class"]) - before)
+        if new:
+            break
+        time.sleep(0.25)
+    if not new:
+        raise RuntimeError(
+            f"no Radmin window appeared within {cfg['dialog_wait']:.0f}s")
+
+    # Prefer the auth dialog by title -- "Radmin security: <host>" -- and fall
+    # back to the newest window if the wording ever changes.
+    for w in new:
+        nm = x("getwindowname", w)
+        if cfg["title_match"].lower() in nm.lower() and host in nm:
+            return w, new
+    return new[-1], new
+
+
+# --------------------------------------------------------------------------- #
+# active sessions
+# --------------------------------------------------------------------------- #
+@dataclass
+class Session:
+    proto: str      # "RDP" | "Radmin"
+    label: str
+    host: str
+    pid: int
+    window: str = ""
+
+
+def _ps() -> list[tuple[int, str]]:
+    out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
+                         text=True).stdout
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid, _, args = line.partition(" ")
+        try:
+            rows.append((int(pid), args.strip()))
+        except ValueError:
+            pass
+    return rows
+
+
+def _classify(args: str) -> str | None:
+    """Which protocol a command line represents, or None if it isn't a session."""
+    # A shell invoked with -c carries its whole script in argv, so a command that
+    # merely mentions a host or a .rdp path would otherwise register as a session.
+    if re.match(r"^\S*(ba|z|k)?sh\s+-c\b", args):
+        return None
+    if "Radmin.exe" in args and "/connect:" in args:
+        return "Radmin"
+    if re.search(r"vnc://", args) or re.search(r"(^|/)(vncviewer|xtigervncviewer)\b", args):
+        return "VNC"
+    # Thincast execs into "rdc <path>.rdp" inside its flatpak sandbox; bwrap is the
+    # sandbox wrapper around the same argv, so counting it would double every row.
+    if re.search(r"(^|/)rdc\s", args) and ".rdp" in args and "bwrap" not in args:
+        return "RDP"
+    if re.search(r"(^|/)(xfreerdp3?|freerdp)\b", args):
+        return "RDP"
+    if re.search(r"(^|/)remmina\b", args) and "-c" in args:
+        return "VNC" if "vnc" in args.lower() else "RDP"
+    return None
+
+
+def sessions() -> list[Session]:
+    """Live sessions from any configured launcher, matched back to connections."""
+    out: list[Session] = []
+    by_path = {str(c.path): c for c in conns_cached()}
+    seen: set[tuple[str, str, str]] = set()
+
+    mine = {os.getpid(), os.getppid()}
+    for pid, args in _ps():
+        if pid in mine:
+            continue
+        proto = _classify(args)
+        if not proto:
+            continue
+
+        # Match the full .rdp path as a substring. A regex like (\S+\.rdp) breaks
+        # the moment a connection is named "Line 1.rdp" -- it captures "1.rdp".
+        c = next((cand for cand in by_path.values() if str(cand.path) in args), None)
+        if c is None:
+            # Fall back to matching the host anywhere in the command line.
+            for cand in conns_cached():
+                if cand.host and re.search(rf"(?<![\d.]){re.escape(cand.host)}(?![\d.])", args):
+                    c = cand
+                    break
+        if c is not None:
+            host, label = c.host, c.sel
+        else:
+            m = re.search(r"(\S+\.rdp)", args)
+            host = ""
+            label = Path(m.group(1)).stem if m else "?"
+
+        key = (proto, label, host)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        win = ""
+        if host:
+            for w in x("search", "--name", host).splitlines():
+                if w.strip():
+                    win = w.strip()
+                    break
+        if not win and host:
+            for w in x("search", "--name", f"on {host}").splitlines():
+                if w.strip():
+                    win = w.strip()
+                    break
+        out.append(Session(proto, label, host, pid, win))
+
+    # Stable, meaningful order: follow the saved list, then protocol. next/prev
+    # would otherwise jump around, since ps order is not guaranteed.
+    order = {c.sel: i for i, c in enumerate(conns_cached())}
+    out.sort(key=lambda s: (order.get(s.label, 10_000), s.proto, s.pid))
+    return out
+
+
+def active_sels() -> dict[str, list[str]]:
+    """{connection sel: [protocols currently connected]} -- for the GUI highlight."""
+    live: dict[str, list[str]] = {}
+    for s in sessions():
+        live.setdefault(s.label, [])
+        if s.proto not in live[s.label]:
+            live[s.label].append(s.proto)
+    return live
+
+
+def focus_session(s: Session) -> bool:
+    if s.window:
+        x("windowactivate", "--sync", s.window)
+        return True
+    return False
+
+
+def kill_session(s: Session) -> None:
+    try:
+        os.kill(s.pid, 15)
+    except ProcessLookupError:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# CSV import / export
+# --------------------------------------------------------------------------- #
+CSV_FIELDS = ["group", "name", "host", "username", "port"]
+
+
+def export_csv(dest: Path) -> int:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    rows = conns_cached(refresh=True)
+    with dest.open("w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
+        w.writeheader()
+        for c in rows:
+            w.writerow({"group": c.group, "name": c.name, "host": c.host,
+                        "username": c.username, "port": c.port})
+    return len(rows)
+
+
+def import_csv(src: Path, overwrite: bool = False,
+               dry_run: bool = False) -> tuple[list[str], list[str]]:
+    """Returns (created, skipped) as human-readable lines."""
+    created, skipped = [], []
+    with src.open(newline="") as fh:
+        reader = csv.DictReader(fh)
+        missing = {"name", "host"} - set(reader.fieldnames or [])
+        if missing:
+            raise SystemExit(f"CSV missing required column(s): {', '.join(sorted(missing))}")
+        for i, row in enumerate(reader, start=2):
+            name = (row.get("name") or "").strip()
+            host = (row.get("host") or "").strip()
+            if not name or not host:
+                skipped.append(f"line {i}: blank name or host")
+                continue
+            group = (row.get("group") or "").strip()
+            user = (row.get("username") or "").strip()
+            try:
+                port = int((row.get("port") or "3389").strip() or 3389)
+            except ValueError:
+                skipped.append(f"line {i}: bad port {row.get('port')!r}")
+                continue
+            if re.search(r"[/\\]", name) or re.search(r"[/\\]", group):
+                skipped.append(f"line {i}: '/' not allowed in group or name")
+                continue
+            target = (RDP_DIR / group / f"{name}.rdp") if group else RDP_DIR / f"{name}.rdp"
+            if target.exists() and not overwrite:
+                skipped.append(f"{group}/{name}: already exists")
+                continue
+            if dry_run:
+                created.append(f"{group}/{name} -> {host}:{port} (dry run)")
+                continue
+            write_rdp(group, name, host, user, port, overwrite=True)
+            created.append(f"{group}/{name} -> {host}:{port}")
+    conns_cached(refresh=True)
+    return created, skipped
+
+
+# --------------------------------------------------------------------------- #
+# Radmin phonebook export (experimental, never writes the live phonebook)
+# --------------------------------------------------------------------------- #
+# The .rpb is a fixed-stride record file: a small header, then N records of
+# equal size (the stride is stored in the header at 0x0c, the count at 0x00).
+# It is 99% zero padding, with UTF-16LE strings at fixed offsets inside each
+# record. We clone real records as templates and patch only those strings.
+PB_OFF_HOST = 4904
+PB_OFF_NAME = 5104
+PB_OFF_USER = 5908
+PB_FIELD_CAP = 128  # bytes; conservative, verified against the live file
+
+
+def _pb_layout(raw: bytes) -> tuple[int, int, int]:
+    count = int.from_bytes(raw[0:4], "little")
+    stride = int.from_bytes(raw[12:16], "little")
+    if not stride or count <= 0:
+        raise RuntimeError("unrecognised phonebook header")
+    header = len(raw) - count * stride
+    if header < 0 or header > stride:
+        raise RuntimeError(
+            f"phonebook layout does not add up (size={len(raw)} count={count} stride={stride})")
+    return header, stride, count
+
+
+def _pb_patch(rec: bytearray, off: int, value: str, marker: str = "") -> None:
+    """Write a UTF-16LE string at off, optionally followed by a packed marker.
+
+    Folder records store their type string ("folder") immediately after the name's
+    terminator, so its position shifts with the name length -- it is packed, not at
+    a fixed offset. Zeroing a flat span without rewriting it destroys the marker and
+    Radmin stops seeing the record as a folder.
+    """
+    enc = value.encode("utf-16-le") + b"\x00\x00"
+    if marker:
+        enc += marker.encode("utf-16-le") + b"\x00\x00"
+    if len(enc) > PB_FIELD_CAP:
+        raise RuntimeError(f"value too long for phonebook field: {value!r}")
+    rec[off:off + PB_FIELD_CAP] = b"\x00" * PB_FIELD_CAP
+    rec[off:off + len(enc)] = enc
+
+
+def export_phonebook(dest: Path, conns: list[Conn] | None = None,
+                     source: Path | None = None) -> int:
+    src = source or radmin_config(require_exe=False)["phonebook"]
+    if not src:
+        raise RuntimeError(f"{LAUNCHERS} [radmin] has no phonebook path; "
+                           "the export needs one as a structural template")
+    if not src.is_file():
+        raise RuntimeError(f"no source phonebook to use as a template: {src}")
+    if dest.resolve() == src.resolve():
+        raise RuntimeError("refusing to overwrite the live phonebook")
+    raw = src.read_bytes()
+    header_len, stride, count = _pb_layout(raw)
+    recs = [raw[header_len + i * stride: header_len + (i + 1) * stride]
+            for i in range(count)]
+
+    # A host record has an IP at PB_OFF_HOST; anything else is a folder record.
+    def is_host(r: bytes) -> bool:
+        s = r[PB_OFF_HOST:PB_OFF_HOST + 64].decode("utf-16-le", "ignore").split("\x00")[0]
+        return bool(re.match(r"^[0-9]{1,3}(\.[0-9]{1,3}){3}$|^[A-Za-z]", s)) and bool(s)
+
+    host_tpl = next((r for r in recs if is_host(r)), None)
+    if host_tpl is None:
+        raise RuntimeError("no host record found to use as a template")
+    folder_tpl = next((r for r in recs if not is_host(r)), None)
+
+    conns = conns if conns is not None else conns_cached(refresh=True)
+    out_recs: list[bytes] = []
+    for g in sorted({c.group for c in conns if c.group}):
+        if folder_tpl is not None:
+            fr = bytearray(folder_tpl)
+            _pb_patch(fr, PB_OFF_NAME, g, marker="folder")
+            out_recs.append(bytes(fr))
+    for c in conns:
+        r = bytearray(host_tpl)
+        _pb_patch(r, PB_OFF_HOST, c.host)
+        _pb_patch(r, PB_OFF_NAME, c.name)
+        _pb_patch(r, PB_OFF_USER, c.username)
+        out_recs.append(bytes(r))
+
+    head = bytearray(raw[:header_len])
+    head[0:4] = len(out_recs).to_bytes(4, "little")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(bytes(head) + b"".join(out_recs))
+    return len(out_recs)
+
+
+# --------------------------------------------------------------------------- #
+# window focus / shortcuts
+# --------------------------------------------------------------------------- #
+GUI_TITLE = "Remote Connections"
+DCONF_ROOT = "/org/cinnamon/desktop/keybindings/custom-keybindings"
+GS_LIST = "org.cinnamon.desktop.keybindings"
+GS_ITEM = "org.cinnamon.desktop.keybindings.custom-keybinding"
+
+
+def notify(msg: str) -> None:
+    """Desktop notification -- shortcuts run detached, so stdout goes nowhere."""
+    subprocess.run(["notify-send", "-a", "Remote Connections", "-t", "2500",
+                    "Remote Connections", msg], capture_output=True)
+
+
+def gui_window() -> str:
+    for w in x("search", "--name", f"^{GUI_TITLE}$").splitlines():
+        if w.strip():
+            return w.strip()
+    return ""
+
+
+def focus_gui() -> str:
+    """Raise the manager, starting it if it isn't running."""
+    win = gui_window()
+    if win:
+        x("windowactivate", "--sync", win)
+        return "focused the manager"
+    _spawn([sys.executable, str(Path(__file__).resolve()), "gui"])
+    return "starting the manager"
+
+
+def goto(sel: str) -> str:
+    """Focus a connection's live session, or connect it if there isn't one."""
+    c = find(sel)
+    if not c:
+        return f"no such connection: {sel}"
+    for s in sessions():
+        if s.label == sel and s.window:
+            x("windowactivate", "--sync", s.window)
+            return f"focused {sel} ({s.proto})"
+    proto = next((p for p in PROTOCOLS if p in c.protocols), "rdp")
+    try:
+        return launch(c, proto)
+    except RuntimeError as e:
+        return f"{sel}: {e}"
+
+
+def step_session(delta: int) -> str:
+    """Focus the next/previous active session, relative to the focused window."""
+    # Only windowed sessions can be focused. Including the others would park the
+    # cycle on an entry it can never move off, so skip them entirely.
+    ss = [s for s in sessions() if s.window]
+    if not ss:
+        return "no active sessions to focus"
+    cur = x("getwindowfocus")
+    idx = next((i for i, s in enumerate(ss) if s.window == cur), None)
+    if idx is None:
+        # Nothing of ours focused: Super+W starts at the top, Super+Q at the end.
+        idx = -1 if delta > 0 else 0
+    nxt = ss[(idx + delta) % len(ss)]
+    focus_session(nxt)
+    return f"focused {nxt.label} ({nxt.proto})"
+
+
+# "cycle" is deliberately not here any more: next/prev raise the switcher
+# themselves, so a separate popup binding would just be a second way in.
+GLOBAL_ACTIONS = (("focus", "Raise the manager"),
+                  ("next", "Next active session"),
+                  ("prev", "Previous active session"))
+
+SWITCH_PIDFILE = Path.home() / ".cache" / "rcm-switcher.pid"
+
+
+def switcher_pid() -> int:
+    """Pid of a running switcher, or 0.
+
+    Cinnamon's keybinding is a passive X grab that still fires while our popup
+    holds its own grab, so a repeat press launches a *second* rcm. That process
+    must drive the popup already on screen rather than exit -- otherwise the
+    selection never moves, which is exactly how this failed the first time.
+    """
+    try:
+        pid = int(SWITCH_PIDFILE.read_text().strip())
+    except (OSError, ValueError):
+        return 0
+    if pid == os.getpid():
+        return 0
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return 0
+    return pid
+
+
+def session_bindings() -> dict[str, str]:
+    """{connection sel: binding} -- for showing keys in the manager."""
+    return {k: v for k, v in load_shortcuts()[1].items() if v}
+
+
+def save_shortcuts(globals_: dict[str, str], per_session: dict[str, str]) -> None:
+    """Rewrite shortcuts.conf. Managed file, so the header is regenerated too."""
+    L = [
+        "# System-wide keyboard shortcuts.",
+        "#",
+        "# Edited from the manager (menu -> Keyboard shortcuts...) or by hand.",
+        "# Run `rcm shortcuts install` after editing by hand.",
+        "#",
+        "# Binding syntax is Cinnamon's: <Super> <Ctrl> <Alt> <Shift> plus a key,",
+        "# e.g. <Super>r, <Super><Alt>1, <Super>grave.",
+        "",
+        "[global]",
+    ]
+    for key, desc in GLOBAL_ACTIONS:
+        val = globals_.get(key, "").strip()
+        L.append(f"# {desc}")
+        L.append(f"{key} = {val}")
+    L += ["", "[sessions]",
+          "# Focuses the connection if a session is live, otherwise connects it."]
+    for sel, binding in per_session.items():
+        L.append(f"{sel} = {binding.strip()}")
+    SHORTCUTS.write_text("\n".join(L) + "\n")
+
+
+def load_shortcuts() -> tuple[dict[str, str], dict[str, str]]:
+    """(global_bindings, per_session_bindings) from shortcuts.conf."""
+    cp = configparser.ConfigParser()
+    cp.optionxform = str  # connection names are case-sensitive
+    if SHORTCUTS.is_file():
+        cp.read(SHORTCUTS)
+    g = dict(cp.items("global")) if cp.has_section("global") else {}
+    s = dict(cp.items("sessions")) if cp.has_section("sessions") else {}
+    return g, s
+
+
+def _gs(*args: str) -> str:
+    return subprocess.run(["gsettings", *args], capture_output=True, text=True).stdout.strip()
+
+
+def _binding_conflicts(binding: str) -> list[str]:
+    """Existing Cinnamon bindings that already use this combo."""
+    out = []
+    for schema in ("org.cinnamon.desktop.keybindings.wm",
+                   "org.cinnamon.desktop.keybindings.media-keys",
+                   "org.cinnamon.muffin.keybindings"):
+        for line in _gs("list-recursively", schema).splitlines():
+            if f"'{binding}'" in line:
+                out.append(" ".join(line.split()[:2]))
+    return out
+
+
+def shortcut_specs() -> list[tuple[str, str, str, str]]:
+    """(id, name, command, binding) for everything in shortcuts.conf."""
+    me = str(Path(__file__).resolve())
+    g, s = load_shortcuts()
+    specs: list[tuple[str, str, str, str]] = []
+    for action, desc in GLOBAL_ACTIONS:
+        if g.get(action):
+            specs.append((f"rcm-{action}", f"rcm: {desc.lower()}",
+                          f"{me} {action}", g[action]))
+    for sel, binding in s.items():
+        if not binding:
+            continue
+        specs.append((f"rcm-goto-{_slug(sel)}", f"rcm: {sel}",
+                      f"{me} goto {shlex.quote(sel)}", binding))
+    return specs
+
+
+def shortcuts_install() -> tuple[int, list[str]]:
+    specs = shortcut_specs()
+    warnings = []
+    for _id, _name, _cmd, binding in specs:
+        for conflict in _binding_conflicts(binding):
+            warnings.append(f"{binding} is already used by {conflict}")
+    current = _parse_gs_list(_gs("get", GS_LIST, "custom-list"))
+    keep = [i for i in current if not i.startswith("rcm-")]
+    ids = [s[0] for s in specs]
+    # Clear rcm- entries that are no longer configured, or removing a shortcut
+    # would leave its Cinnamon binding live and still firing.
+    for stale in [i for i in current if i.startswith("rcm-") and i not in ids]:
+        subprocess.run(["dconf", "reset", "-f", f"{DCONF_ROOT}/{stale}/"],
+                       capture_output=True)
+    for _id, name, cmd, binding in specs:
+        path = f"{DCONF_ROOT}/{_id}/"
+        _gs("set", f"{GS_ITEM}:{path}", "name", name)
+        _gs("set", f"{GS_ITEM}:{path}", "command", cmd)
+        _gs("set", f"{GS_ITEM}:{path}", "binding", "['" + binding + "']")
+    _gs("set", GS_LIST, "custom-list", str(keep + ids).replace('"', "'"))
+    return len(specs), warnings
+
+
+def shortcuts_remove() -> int:
+    current = _parse_gs_list(_gs("get", GS_LIST, "custom-list"))
+    mine = [i for i in current if i.startswith("rcm-")]
+    for _id in mine:
+        subprocess.run(["dconf", "reset", "-f", f"{DCONF_ROOT}/{_id}/"],
+                       capture_output=True)
+    keep = [i for i in current if not i.startswith("rcm-")]
+    _gs("set", GS_LIST, "custom-list", str(keep).replace('"', "'"))
+    return len(mine)
+
+
+def _parse_gs_list(raw: str) -> list[str]:
+    raw = raw.strip()
+    if not raw or raw in ("@as []", "[]"):
+        return []
+    return [p.strip().strip("'\"") for p in raw.strip("[]").split(",") if p.strip()]
+
+
+# --------------------------------------------------------------------------- #
+# .desktop jump list
+# --------------------------------------------------------------------------- #
+def _slug(s: str) -> str:
+    return re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]", "-", s.lower())).strip("-")
+
+
+def _dq(s: str) -> str:
+    """Quote one Exec= argument per the Desktop Entry spec.
+
+    Connection names may contain spaces ("Line 1.rdp"); unquoted, the launcher
+    splits them into separate arguments and the connection silently fails to open.
+    desktop-file-validate does not flag this.
+    """
+    if not re.search(r"""[\s"'\\$`<>~|&;*?#()]""", s):
+        return s
+    esc = (s.replace("\\", "\\\\").replace('"', '\\"')
+            .replace("`", "\\`").replace("$", "\\$"))
+    return f'"{esc}"'
+
+
+def gen_launcher() -> int:
+    me = Path(__file__).resolve()
+    cs = conns_cached(refresh=True)
+    gs = sorted({c.group for c in cs if c.group})
+    actions = ([_slug(c.sel) for c in cs[:MAX_JUMPLIST]]
+               + [f"all-{_slug(g)}" for g in gs] + ["switcher"])
+    L = ["[Desktop Entry]", "Type=Application", "Name=Remote Connections",
+         f"Comment=RDP, VNC and Radmin sessions from {RDP_DIR}",
+         f"Exec={me} gui", "Icon=xsi-network-symbolic", "Terminal=false",
+         "Categories=Network;RemoteAccess;", "StartupNotify=false"]
+    # An empty "Actions=;" is a validation error, so omit it when nothing is listed.
+    if actions:
+        L.append("Actions=" + ";".join(actions) + ";")
+    for c in cs[:MAX_JUMPLIST]:
+        L += ["", f"[Desktop Action {_slug(c.sel)}]",
+              f"Name={c.sel.replace('_', ' ').replace('/', ' / ')}",
+              # Absolute paths only -- Exec= does not expand ~ and fails silently.
+              f"Exec={' '.join(THINCAST)} {_dq(str(c.path))}"]
+    for g in gs:
+        L += ["", f"[Desktop Action all-{_slug(g)}]", f"Name=Connect all ({g})",
+              f"Exec={_dq(str(me))} connect-all {_dq(g)}"]
+    L += ["", "[Desktop Action switcher]", "Name=Switch active session...",
+          f"Exec={me} cycle"]
+    DESKTOP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DESKTOP_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(L) + "\n")
+    tmp.chmod(0o644)
+    tmp.replace(DESKTOP_FILE)
+    subprocess.run(["update-desktop-database", str(DESKTOP_FILE.parent)],
+                   capture_output=True)
+    return len(cs)
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+USAGE = """rcm -- remote connection manager
+
+  rcm init                       write any missing config file from its default
+  rcm list                       list connections
+  rcm sessions                   show active sessions (RDP / VNC / Radmin)
+  rcm connect <sel> [--rdp|--vnc|--radmin] [--via <launcher>]
+  rcm connect-all <group> [--rdp|--vnc|--radmin] [--via <launcher>]
+  rcm launchers                  show configured connection programs
+  rcm radmin show|detect [--write]   Radmin config from launchers.conf [radmin]
+  rcm creds list|set|clear|migrate   credentials (passwords live in the keyring)
+  rcm gui                        open the manager window
+  rcm focus                      raise the manager (starts it if needed)
+  rcm cycle                      Alt-Tab-style switcher over active sessions
+  rcm next | rcm prev            focus the next/previous active session
+  rcm goto <sel>                 focus that session, or connect it if it isn't up
+  rcm shortcuts list|install|remove   system-wide keys, from shortcuts.conf
+  rcm calibrate <sel>            open Radmin's auth dialog, report it, type nothing
+  rcm import <file.csv> [--overwrite] [--dry-run]
+  rcm export [file.csv]          default: export/connections.csv
+  rcm phonebook [out.rpb]        experimental Radmin phonebook (never overwrites live)
+  rcm gen-launcher               rebuild the .desktop jump list
+"""
+
+
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help"):
+        print(USAGE)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+
+    # Report, don't write: the CLI should not create files behind your back. The
+    # GUI does write them, because that is a deliberate first-run setup step.
+    if cmd not in ("init", "gui"):
+        gone = missing_configs()
+        if gone:
+            print(f"rcm: missing config: {', '.join(gone)}\n"
+                  f"     create them with `rcm init` (or open the manager once)",
+                  file=sys.stderr)
+
+    if cmd == "init":
+        written = write_default_configs()
+        for name in written:
+            print(f"  created {APP / name}")
+        print(f"{len(written)} file(s) created" if written else "nothing missing")
+        return 0
+
+    if cmd == "list":
+        for c in conns_cached():
+            print(f"{c.sel:24} {c.host:16} {c.username or '-':12} :{c.port}")
+        return 0
+
+    if cmd == "sessions":
+        ss = sessions()
+        if not ss:
+            print("no active sessions")
+        for s in ss:
+            print(f"{s.proto:7} {s.label:22} {s.host:16} pid={s.pid} win={s.window or '-'}")
+        return 0
+
+    if cmd in ("connect", "connect-all"):
+        proto = "rdp"
+        for flag, p in (("--radmin", "radmin"), ("--vnc", "vnc"), ("--rdp", "rdp")):
+            if flag in rest:
+                proto = p
+                rest = [a for a in rest if a != flag]
+        via = ""
+        if "--via" in rest:
+            i = rest.index("--via")
+            if i + 1 >= len(rest):
+                print("--via needs a launcher name", file=sys.stderr)
+                return 2
+            via = rest[i + 1]
+            rest = rest[:i] + rest[i + 2:]
+        if not rest:
+            print(f"usage: rcm {cmd} <{'group' if cmd=='connect-all' else 'group/name'}>"
+                  " [--rdp|--vnc|--radmin] [--via <launcher>]", file=sys.stderr)
+            return 2
+
+        if cmd == "connect":
+            c = find(rest[0])
+            if not c:
+                print(f"no such connection: {rest[0]}", file=sys.stderr)
+                return 1
+            targets = [c]
+        else:
+            targets = [c for c in conns_cached() if c.group == rest[0]]
+            if not targets:
+                print(f"group '{rest[0]}' has no connections", file=sys.stderr)
+                return 1
+
+        rc = 0
+        for i, c in enumerate(targets):
+            if i:
+                time.sleep(2)
+            try:
+                msg = launch(c, proto, via)
+                if msg:
+                    print(msg)
+            except RuntimeError as e:
+                print(f"rcm: {e}", file=sys.stderr)
+                rc = 1
+        return rc
+
+    if cmd == "launchers":
+        reg = load_launchers()
+        for proto in PROTOCOLS:
+            d = reg.get(proto, {})
+            print(f"[{proto}]  default: {d.get('default') or '(none)'}")
+            for nm, tmpl in d.get("items", {}).items():
+                mark = "*" if nm == d.get("default") else " "
+                have = "" if not tmpl else ("" if shutil.which(shlex.split(tmpl)[0])
+                                            else "   (not installed)")
+                print(f"  {mark} {nm:14} {tmpl}{have}")
+        return 0
+
+    if cmd == "radmin":
+        sub = rest[0] if rest else "show"
+        if sub == "show":
+            try:
+                cfg = radmin_config(require_exe=False)
+            except ConfigError as e:
+                print(f"rcm: {e}", file=sys.stderr)
+                return 1
+            for k in RADMIN_KEYS:
+                v = cfg.get(k)
+                note = ""
+                if k == "exe":
+                    note = "" if v and Path(v).is_file() else "   <-- does not exist"
+                if k == "wine" and not v:
+                    note = "   (native, no Wine)"
+                print(f"  {k:12} {v}{note}")
+            return 0
+        if sub == "detect":
+            found = radmin_detect()
+            if not found:
+                print("no Radmin.exe found", file=sys.stderr)
+                return 1
+            print("Radmin installs found, best first:")
+            for i, p in enumerate(found):
+                print(f"  [{i}] {p}")
+            if "--write" not in rest:
+                print(f"\nre-run with --write to put [0] into {LAUNCHERS}")
+                return 0
+            best = found[0]
+            cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
+            cp.optionxform = str
+            if LAUNCHERS.is_file():
+                cp.read(LAUNCHERS)
+            if not cp.has_section("radmin"):
+                cp.add_section("radmin")
+            cp.set("radmin", "exe", str(best))
+            # A Wine prefix path implies Wine; a native path implies none.
+            parts = best.parts
+            if "drive_c" in parts:
+                prefix = Path(*parts[:parts.index("drive_c")])
+                cp.set("radmin", "wine", cp.get("radmin", "wine", fallback="wine-stable"))
+                cp.set("radmin", "wineprefix", str(prefix))
+            else:
+                cp.set("radmin", "wine", "")
+            for k, v in (("port", "4899"), ("dialog_wait", "20"), ("settle", "0.3"),
+                         ("type_delay", "40"), ("window_class", "[Rr]admin"),
+                         ("title_match", "security"),
+                         ("inject_order", "user-tab-pass")):
+                if not cp.has_option("radmin", k):
+                    cp.set("radmin", k, v)
+            with LAUNCHERS.open("w") as fh:
+                cp.write(fh)
+            print(f"\nwrote exe={best} to {LAUNCHERS}")
+            print("note: comments in that file are not preserved by this write")
+            return 0
+        print(f"unknown radmin subcommand: {sub}", file=sys.stderr)
+        return 2
+
+    if cmd == "creds":
+        sub = rest[0] if rest else "list"
+        if sub == "list":
+            print(f"keyring: {'available' if keyring_available() else 'NOT AVAILABLE'}")
+            table = _creds_table()
+            keys = sorted(set(table) | {"DEFAULT"})
+            for k in keys:
+                u = table.get(k, ("", ""))[0]
+                legacy = table.get(k, ("", ""))[1]
+                where = ("keyring" if secret_get(k) else
+                         "PLAINTEXT in creds.conf" if legacy else "not set")
+                print(f"  {k:16} user={u or '(from .rdp)':14} password: {where}")
+            return 0
+        if sub == "set":
+            if len(rest) < 2:
+                print("usage: rcm creds set <key>", file=sys.stderr)
+                return 2
+            if not keyring_available():
+                print("rcm: no keyring available", file=sys.stderr)
+                return 1
+            pw = getpass.getpass(f"password for {rest[1]} (not echoed): ")
+            if not pw:
+                print("aborted, nothing stored")
+                return 1
+            print("stored in keyring" if secret_set(rest[1], pw) else "store failed")
+            return 0
+        if sub == "clear":
+            if len(rest) < 2:
+                print("usage: rcm creds clear <key>", file=sys.stderr)
+                return 2
+            print("cleared" if secret_clear(rest[1]) else "nothing to clear")
+            return 0
+        if sub == "migrate":
+            try:
+                moved, skipped = creds_migrate()
+            except RuntimeError as e:
+                print(f"rcm: {e}", file=sys.stderr)
+                return 1
+            print(f"{moved} password(s) moved into the keyring, {skipped} left alone")
+            if moved:
+                print(f"{CREDS} now holds only key|username -- no secrets")
+            return 0
+        print(f"unknown creds subcommand: {sub}", file=sys.stderr)
+        return 2
+
+    if cmd == "import":
+        if not rest:
+            print("usage: rcm import <file.csv> [--overwrite] [--dry-run]", file=sys.stderr)
+            return 2
+        created, skipped = import_csv(Path(rest[0]).expanduser(),
+                                      overwrite="--overwrite" in rest,
+                                      dry_run="--dry-run" in rest)
+        for line in created:
+            print("  +", line)
+        for line in skipped:
+            print("  -", line)
+        print(f"{len(created)} created, {len(skipped)} skipped")
+        if created and "--dry-run" not in rest:
+            gen_launcher()
+        return 0
+
+    if cmd == "export":
+        dest = Path(rest[0]).expanduser() if rest else EXPORT_DIR / "connections.csv"
+        n = export_csv(dest)
+        print(f"{n} connection(s) -> {dest}")
+        return 0
+
+    if cmd == "phonebook":
+        dest = Path(rest[0]).expanduser() if rest else EXPORT_DIR / "radmin.rpb"
+        try:
+            n = export_phonebook(dest)
+        except RuntimeError as e:
+            print(f"rcm: {e}", file=sys.stderr)
+            return 1
+        print(f"{n} record(s) -> {dest}")
+        print("EXPERIMENTAL. Test without touching your real phonebook:")
+        try:
+            cfg = radmin_config(require_exe=False)
+            pre = f'WINEPREFIX="{cfg["wineprefix"]}" {cfg["wine"]} ' if cfg["wine"] else ""
+            print(f'  {pre}"{cfg["exe"]}" /pbpath:"{dest}"')
+        except ConfigError:
+            print(f'  <radmin exe> /pbpath:"{dest}"')
+        return 0
+
+    if cmd == "calibrate":
+        # Kept from the standalone radmin-menu: opens the auth dialog, reports what
+        # it is, and types nothing. Use it if Radmin's dialog ever changes.
+        if not rest:
+            print("usage: rcm calibrate <group/name>", file=sys.stderr)
+            return 2
+        c = find(rest[0])
+        if not c:
+            print(f"no such connection: {rest[0]}", file=sys.stderr)
+            return 1
+        try:
+            cfg = radmin_config()
+        except ConfigError as e:
+            print(f"rcm: {e}", file=sys.stderr)
+            return 1
+        user, pw = creds_lookup(c.sel, c.username, proto="radmin")
+        # Never interpolate the password: "${pw:-X}" style masking prints the value.
+        print(f"host={c.host} user={user} password: "
+              f"{'set (%d chars)' % len(pw) if pw and pw != 'CHANGEME' else 'NOT SET'}")
+        try:
+            _, new = _open_radmin_dialog(cfg, c.host)
+        except RuntimeError as e:
+            print(f"rcm: {e}", file=sys.stderr)
+            return 1
+        for w in sorted(new):
+            print(f"--- window {w}")
+            print(f"  name    : {x('getwindowname', w)}")
+            print(f"  geometry: {x('getwindowgeometry', '--shell', w).replace(chr(10), ' ')}")
+        foc = x("getwindowfocus")
+        print(f"focused   : {foc} ({x('getwindowname', foc)})")
+        shot = capture_window(sorted(new)[-1], Path.home() / "radmin-calibrate.png")
+        print(f"image     : {shot}" if shot else
+              "image     : skipped (needs gnome-screenshot + python3-pil)")
+        print("\nDialog left open, nothing typed. The image shows which field holds "
+              "the caret\nand whether the username is prefilled -- that is what sets "
+              "inject_order.")
+        return 0
+
+    if cmd == "gen-launcher":
+        print(f"{gen_launcher()} connection(s) -> {DESKTOP_FILE}")
+        return 0
+
+    if cmd == "focus":
+        msg = focus_gui()
+        print(msg)
+        return 0
+
+    if cmd == "goto":
+        if not rest:
+            print("usage: rcm goto <group/name>", file=sys.stderr)
+            return 2
+        msg = goto(rest[0])
+        print(msg)
+        # Bound to a hotkey, so nothing is watching stdout.
+        if msg.startswith("no such") or ": " in msg and "focused" not in msg:
+            notify(msg)
+        return 0
+
+    if cmd in ("next", "prev", "cycle"):
+        delta = -1 if cmd == "prev" else 1
+        # A switcher is already on screen: tell it to move and get out of the way.
+        pid = switcher_pid()
+        if pid:
+            try:
+                os.kill(pid, signal.SIGUSR1 if delta > 0 else signal.SIGUSR2)
+            except OSError:
+                pass
+            return 0
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        sys.modules.setdefault("rcm", sys.modules["__main__"])
+        import rcm_switch
+        return rcm_switch.run(delta)
+
+    if cmd == "shortcuts":
+        sub = rest[0] if rest else "list"
+        if sub == "list":
+            specs = shortcut_specs()
+            active = _parse_gs_list(_gs("get", GS_LIST, "custom-list"))
+            if not specs:
+                print("nothing configured in", SHORTCUTS)
+            for _id, name, cmdline, binding in specs:
+                state = "installed" if _id in active else "not installed"
+                print(f"  {binding:22} {name:28} [{state}]")
+                for conflict in _binding_conflicts(binding):
+                    print(f"      conflict: also bound to {conflict}")
+            return 0
+        if sub == "install":
+            n, warnings = shortcuts_install()
+            for w in warnings:
+                print(f"  warning: {w}")
+            print(f"{n} shortcut(s) registered with Cinnamon")
+            print(f"remove them again with: {Path(__file__).resolve()} shortcuts remove")
+            return 0
+        if sub == "remove":
+            print(f"{shortcuts_remove()} shortcut(s) removed")
+            return 0
+        print(f"unknown shortcuts subcommand: {sub}", file=sys.stderr)
+        return 2
+
+    if cmd == "gui":
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        # This file has no .py suffix, so "import rcm" cannot find it. Publish the
+        # already-loaded __main__ under that name so the GUI shares this module
+        # (and its caches) instead of loading a second copy.
+        sys.modules.setdefault("rcm", sys.modules["__main__"])
+        import rcm_gui
+        return rcm_gui.run()
+
+    print(f"unknown command: {cmd}\n\n{USAGE}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,22 @@
+# Your connections. These carry real hosts, usernames and site naming.
+RDP/
+
+# Machine-local config. Ship the .example files instead; `rcm init` or opening
+# the manager recreates these from documented defaults.
+creds.conf
+launchers.conf
+shortcuts.conf
+
+# Generated output
+export/
+*.rpb
+*.csv
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+*.swp
+*~
+.DS_Store

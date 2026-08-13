@@ -1,0 +1,17 @@
+# Credentials for rcm. Passwords are NOT stored here -- they live in the OS
+# keyring. This file only maps a scope to a username.
+#
+# Format:  key|username|
+#
+#   key       "GROUP/Name", "GROUP", or "DEFAULT", optionally with "@protocol"
+#             (rdp / vnc / radmin). Looked up most specific first, and within a
+#             scope a protocol-specific entry beats the generic one:
+#
+#               GROUP/Name@radmin -> GROUP/Name -> GROUP@radmin
+#                                 -> GROUP -> DEFAULT@radmin -> DEFAULT
+#
+#   username  leave EMPTY to use username:s: from the matching .rdp file.
+#
+# Edit here, or in the manager under Credentials...
+
+DEFAULT||
