@@ -34,7 +34,7 @@
 
 [protocol:rdp]
 label = RDP
-color = accent
+color = #4e9a25
 order = 10
 port = 3389
 default = Thincast

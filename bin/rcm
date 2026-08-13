@@ -77,6 +77,15 @@ class Conn:
         want = [p.strip().lower() for p in raw.split(",") if p.strip()]
         return tuple(p for p in known if p in want) or known
 
+    @property
+    def default_protocol(self) -> str:
+        """Which protocol a double-click uses. Falls back to the first enabled."""
+        want = (self.extra.get("rcm-default-proto") or "").strip().lower()
+        enabled = self.protocols
+        if want and want in enabled:
+            return want
+        return enabled[0] if enabled else ""
+
     def port_for(self, proto) -> int:
         """Per-connection port for a protocol, else the protocol's default.
 
@@ -372,7 +381,7 @@ def creds_migrate() -> tuple[int, int]:
 def write_rdp(group: str, name: str, host: str, username: str,
               port: int = 3389, overwrite: bool = False,
               ports: dict | None = None,
-              protocols: str = "") -> Path:
+              protocols: str = "", default_proto: str = "") -> Path:
     if not TEMPLATE.is_file():
         raise SystemExit(f"missing template: {TEMPLATE}")
     dest_dir = RDP_DIR / group if group else RDP_DIR
@@ -389,6 +398,8 @@ def write_rdp(group: str, name: str, host: str, username: str,
         body += f"rcm-port-{pid}:i:{val}\n"
     if protocols:
         body += f"rcm-protocols:s:{protocols}\n"
+    if default_proto:
+        body += f"rcm-default-proto:s:{default_proto}\n"
     dest.write_text(body)
     return dest
 
@@ -407,7 +418,8 @@ def copy_conn(c: Conn, new_name: str) -> Path:
 
 def set_fields(c: Conn, host: str | None = None, username: str | None = None,
                port: int | None = None, ports: dict | None = None,
-               protocols: str | None = None) -> None:
+               protocols: str | None = None,
+               default_proto: str | None = None) -> None:
     """Rewrite the per-host fields in place, leaving every other setting alone."""
     lines = c.path.read_text().splitlines()
     def repl(key, val):
@@ -429,6 +441,8 @@ def set_fields(c: Conn, host: str | None = None, username: str | None = None,
         repl(f"rcm-port-{pid}", str(val))
     if protocols is not None:
         repl("rcm-protocols", protocols)
+    if default_proto is not None:
+        repl("rcm-default-proto", default_proto)
     c.path.write_text("\n".join(lines) + "\n")
 
 
@@ -613,7 +627,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
 
 [protocol:rdp]
 label = RDP
-color = accent
+color = #4e9a25
 order = 10
 port = 3389
 default = Thincast
@@ -1158,7 +1172,7 @@ def csv_fields() -> list[str]:
     rather than listed, so a new protocol needs no change here.
     """
     extra = [f"port_{pid}" for pid in protocol_ids() if pid != "rdp"]
-    return CSV_FIELDS + extra + ["protocols", "shortcut"]
+    return CSV_FIELDS + extra + ["protocols", "default_protocol", "shortcut"]
 
 
 def export_csv(dest: Path, conns: list[Conn] | None = None) -> int:
@@ -1173,6 +1187,7 @@ def export_csv(dest: Path, conns: list[Conn] | None = None) -> int:
             row = {"group": c.group, "name": c.name, "host": c.host,
                    "username": c.username, "port": c.port,
                    "protocols": ",".join(c.protocols),
+                   "default_protocol": c.default_protocol,
                    "shortcut": keys.get(c.sel, "")}
             for f in fields:
                 if f.startswith("port_"):
@@ -1234,7 +1249,8 @@ def import_csv(src: Path, overwrite: bool = False,
                 created.append(f"{group}/{name} -> {host}:{port} (dry run)")
                 continue
             write_rdp(group, name, host, user, port, overwrite=True,
-                      ports=ports, protocols=protos)
+                      ports=ports, protocols=protos,
+                      default_proto=(row.get("default_protocol") or "").strip())
             binding = (row.get("shortcut") or "").strip()
             if binding:
                 g, sess = load_shortcuts()
@@ -1379,7 +1395,7 @@ def goto(sel: str) -> str:
         if s.label == sel and s.window:
             x("windowactivate", "--sync", s.window)
             return f"focused {sel} ({s.proto})"
-    proto = next(iter(c.protocols), "")
+    proto = c.default_protocol
     try:
         return launch(c, proto)
     except RuntimeError as e:

@@ -37,6 +37,34 @@ def _shift(hex_colour: str, factor: float) -> str:
     return f"#{f(r):02x}{f(g):02x}{f(b):02x}"
 
 
+_ACCENT = "#3584e4"   # replaced at startup by the theme's real accent
+
+
+def resolve_colour(colour: str) -> str:
+    """A protocol's colour as a literal hex, since Pango markup needs one."""
+    colour = (colour or "").strip()
+    return _ACCENT if not colour or colour == "accent" else colour
+
+
+def protocol_badges(pids, registry, default_pid: str = "") -> str:
+    """Pango markup: one coloured chip per enabled protocol.
+
+    The colour lives on the protocol, so the button and the chip are two views
+    of the same setting rather than two settings to keep in sync.
+    """
+    out = []
+    for pid in pids:
+        pr = registry.get(pid)
+        if not pr:
+            continue
+        bg = resolve_colour(pr.color)
+        label = GLib.markup_escape_text(pr.label)
+        if pid == default_pid:
+            label = f"<u>{label}</u>"
+        out.append(f'<span background="{bg}" foreground="#ffffff"> {label} </span>')
+    return " ".join(out)
+
+
 def protocol_css_class(pid: str) -> str:
     return "rcm-proto-" + re.sub(r"[^a-z0-9]+", "-", pid.lower()).strip("-")
 
@@ -68,7 +96,14 @@ def pretty_key(binding: str) -> str:
     return "+".join([m.replace("Primary", "Ctrl") for m in mods] + [key])
 
 
-def install_css(protos=None) -> None:
+def install_css(protos=None, widget=None) -> None:
+    # Pull the theme's real accent so "accent" protocols match their button.
+    global _ACCENT
+    if widget is not None:
+        ok, rgba = widget.get_style_context().lookup_color("theme_selected_bg_color")
+        if ok:
+            _ACCENT = "#{:02x}{:02x}{:02x}".format(
+                int(rgba.red * 255), int(rgba.green * 255), int(rgba.blue * 255))
     prov = Gtk.CssProvider()
     prov.load_from_data(build_protocol_css(protos or {}))
     screen = Gdk.Screen.get_default()
@@ -225,16 +260,19 @@ class Win(Gtk.Window):
         self.tree.append_column(col)
 
         r = Gtk.CellRendererText()
-        col = Gtk.TreeViewColumn("", r, text=C_MARK)
-        col.set_min_width(22)
+        col = Gtk.TreeViewColumn("Live", r, text=C_MARK)
+        col.set_min_width(36)
         self.tree.append_column(col)
 
         for idx, title, minw in ((C_LABEL, "Connection", 130),
                                  (C_HOST, "Host", 118), (C_USER, "User", 78),
-                                 (C_PROTOS, "Protocols", 148),
+                                 (C_PROTOS, "Protocols", 168),
                                  (C_KEY, "Key", 86)):
             r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
-            col = Gtk.TreeViewColumn(title, r, text=idx)
+            if idx == C_PROTOS:
+                col = Gtk.TreeViewColumn(title, r, markup=idx)
+            else:
+                col = Gtk.TreeViewColumn(title, r, text=idx)
             col.add_attribute(r, "weight", C_WEIGHT)   # bold = a session is live
             col.add_attribute(r, "style", C_STYLE)     # italic = a group header
             col.set_resizable(True)
@@ -350,8 +388,7 @@ class Win(Gtk.Window):
                         None, [False, "", c.group, "", "", "", "", "",
                                700, Pango.Style.ITALIC])
                 it = parents[c.group]
-            labels = " ".join(registry[pid].label for pid in c.protocols
-                              if pid in registry)
+            labels = protocol_badges(c.protocols, registry, c.default_protocol)
             self.store.append(it, [c.sel in ticked, "", c.name, c.host, c.username,
                                    labels, pretty_key(keys.get(c.sel, "")), c.sel,
                                    400, Pango.Style.NORMAL])
@@ -530,10 +567,8 @@ class Win(Gtk.Window):
         it = self.store.get_iter(path)
         sel = self.store[it][C_SEL]
         c = rcm.find(sel) if sel else None
-        protos = protocols_safe()
-        if c and protos:
-            pid = next((i for i in protos if i in c.protocols), next(iter(protos)))
-            self.connect_selected(pid, "", [c])
+        if c and c.default_protocol:
+            self.connect_selected(c.default_protocol, "", [c])
 
     def on_tree_click(self, _w, event):
         if event.button != 3:
@@ -698,9 +733,28 @@ class Win(Gtk.Window):
             pbox.pack_start(cb, False, False, 0)
         grid.attach(pbox, 1, len(rows), 1, 1)
 
+        # Which protocol a double-click (and `rcm goto`) uses.
+        grid.attach(Gtk.Label(label="Default", xalign=1), 0, len(rows) + 1, 1, 1)
+        dbox = Gtk.Box(spacing=6)
+        default_combo = Gtk.ComboBoxText()
+        cur_default = c.default_protocol if c else ""
+        for pr in registry.values():
+            default_combo.append(pr.id, pr.label)
+        if cur_default:
+            default_combo.set_active_id(cur_default)
+        elif registry:
+            default_combo.set_active(0)
+        dbox.pack_start(default_combo, False, False, 0)
+        dhint = Gtk.Label(xalign=0)
+        dhint.set_markup("<small>used by double-click and its shortcut; "
+                         "underlined in the list</small>")
+        dhint.get_style_context().add_class("dim-label")
+        dbox.pack_start(dhint, False, False, 0)
+        grid.attach(dbox, 1, len(rows) + 1, 1, 1)
+
         # Per-connection credential override. Blank password = inherit the group's
         # entry, then Default. Only written when the user actually types one.
-        r = len(rows) + 1
+        r = len(rows) + 2
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         sep.set_margin_top(6)
         grid.attach(sep, 0, r, 2, 1)
@@ -765,6 +819,7 @@ class Win(Gtk.Window):
         new_pw = epw.get_text()
         drop_pw = clear_pw.get_active()
         new_binding = sc_btn.binding
+        new_default = default_combo.get_active_id() or ""
         d.destroy()
 
         if not n or not h:
@@ -772,13 +827,15 @@ class Win(Gtk.Window):
             return
         if new:
             try:
-                rcm.write_rdp(g, n, h, u, p, ports=ports, protocols=protos)
+                rcm.write_rdp(g, n, h, u, p, ports=ports, protocols=protos,
+                              default_proto=new_default)
             except FileExistsError:
                 self._dialog(Gtk.MessageType.ERROR, "That connection already exists")
                 return
             self.say(f"created {g}/{n}" if g else f"created {n}")
         else:
-            rcm.set_fields(c, host=h, username=u, port=p, ports=ports, protocols=protos)
+            rcm.set_fields(c, host=h, username=u, port=p, ports=ports,
+                           protocols=protos, default_proto=new_default)
             self.say(f"saved {c.sel}")
 
         sel = f"{g}/{n}" if g else n
@@ -1470,8 +1527,9 @@ def run() -> int:
     # than invisible in-code defaults.
     migrated = rcm.migrate_launchers()
     created = rcm.write_default_configs()
-    install_css(protocols_safe())
     w = Win()
+    install_css(protocols_safe(), w)
+    w.reload()
     if migrated:
         w.say("launchers.conf upgraded to protocols.conf")
     elif created:

@@ -16,7 +16,8 @@ own button label and colour, its commands, how a live session is recognised, and
 client insists on a password prompt — the keystrokes to fill it in.
 
 - **Any protocol you can launch**, defined in config: label, colour, commands,
-  session detection, and optional credential typing
+  session detection, and optional credential typing. The colour belongs to the
+  protocol — its button and its chip in the connection list are two views of it
 - **Connections in one tree**, grouped, defined by ordinary `.rdp` files
 - **Credentials in the OS keyring** (libsecret / GNOME Keyring), never on disk, with a
   precedence chain from per-connection down to a global default, and per-protocol
@@ -57,8 +58,8 @@ rcm import hosts.csv           # or add connections in the GUI
 rcm gui                        # the manager
 ```
 
-CSV columns are `group,name,host,username,port`, plus `port_<protocol>`, `protocols`
-and `shortcut` — only `name` and `host` are required. A full export writes all of them,
+CSV columns are `group,name,host,username,port`, plus `port_<protocol>`, `protocols`,
+`default_protocol` and `shortcut` — only `name` and `host` are required. A full export writes all of them,
 so exporting and re-importing round-trips a connection unchanged. Imported connections
 are generated from `templates/default.rdp`, so whatever you set there is inherited by
 every host.
@@ -71,8 +72,12 @@ recognise:
 
 ```
 rcm-protocols:s:rdp,vnc,radmin
+rcm-default-proto:s:rdp
 rcm-port-vnc:i:5900
 ```
+
+`rcm-default-proto` is what a double-click and that connection's shortcut use; it is
+underlined in the Protocols column. Set it in the connection's Edit dialog.
 
 `rcm-port-<protocol>` overrides that protocol's default port for one host, so a new
 protocol needs no code change. RDP keeps using the file's own `server port`.
