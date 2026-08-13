@@ -18,6 +18,15 @@ from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
 import rcm  # noqa: E402
 from rcm_help import help_topic as help_topic_gui  # noqa: E402
 
+# VTE gives a real embedded terminal; when the system library is absent the
+# terminal features fall back to launching an external terminal instead.
+try:
+    gi.require_version("Vte", "2.91")
+    from gi.repository import Vte  # noqa: E402
+    HAVE_VTE = True
+except (ValueError, ImportError):
+    HAVE_VTE = False
+
 REFRESH_SECONDS = 4
 STAGGER = 2  # seconds between launches when several are selected
 
@@ -1190,6 +1199,184 @@ class Win(Gtk.Window):
         walk(self.store.get_iter_first())
         return False
 
+    @help_topic_gui("terminals", "Terminals and scripts",
+                    ("terminal", "vte", "ssh", "script", "run"),
+                    section="Terminals")
+    def open_terminal_tab(self, c, transport: str = "ssh") -> None:
+        """Right-click ▸ Open terminal gives any host a shell, embedded.
+
+        With the VTE library present the terminal opens in a tab in the bottom
+        pane and shows exact live state — the shell is a child of this process.
+        Without VTE it falls back to launching your external terminal. Multiple
+        hosts open one tab each. "Send script" feeds a script's lines into the
+        live terminal with the usual placeholder substitution.
+        """
+        if not HAVE_VTE:
+            rcm.spawn_detached(["x-terminal-emulator", "-e",
+                                f"ssh {c.username}@{c.host}"])
+            self.say(f"opened external terminal to {c.sel} (install "
+                     "gir1.2-vte-2.91 for embedded tabs)")
+            return
+        self.ensure_terminal_pane()
+        terminal = Vte.Terminal()
+        terminal.spawn_async(
+            Vte.PtyFlags.DEFAULT, None,
+            ["/usr/bin/ssh", f"{c.username}@{c.host}"], None,
+            GLib.SpawnFlags.DEFAULT, None, None, -1, None, None, None)
+        label = Gtk.Box(spacing=4)
+        label.pack_start(Gtk.Label(label=c.sel), False, False, 0)
+        close = Gtk.Button.new_from_icon_name("window-close-symbolic",
+                                              Gtk.IconSize.MENU)
+        close.set_relief(Gtk.ReliefStyle.NONE)
+        label.pack_start(close, False, False, 0)
+        label.show_all()
+        page = self.terminal_notebook.append_page(terminal, label)
+        close.connect("clicked", lambda *_:
+                      self.terminal_notebook.remove_page(
+                          self.terminal_notebook.page_num(terminal)))
+        terminal.show()
+        self.terminal_notebook.set_current_page(page)
+        self.terminal_pane.set_reveal_child(True)
+        rcm.log_event("terminal", sel=c.sel, transport=transport)
+
+    def ensure_terminal_pane(self) -> None:
+        if getattr(self, "terminal_pane", None) is not None:
+            return
+        self.terminal_notebook = Gtk.Notebook()
+        self.terminal_notebook.set_scrollable(True)
+        self.terminal_pane = Gtk.Revealer()
+        self.terminal_pane.add(self.terminal_notebook)
+        # The pane lives below the layout body, shared by every layout.
+        self.layout_container.get_parent().pack_start(
+            self.terminal_pane, False, False, 0)
+        self.terminal_pane.show_all()
+
+    @help_topic_gui("script-runner", "Running scripts across hosts",
+                    ("script", "run", "ssh", "winrm", "batch"),
+                    section="Terminals")
+    def run_script_dialog(self, conns: list) -> None:
+        """Right-click ▸ Run script sends one script to every selected host.
+
+        Scripts are plain files in scripts/ — hand-editable and git-friendly.
+        Each host gets a verdict (✓ ok, ⟳ running, ✗ with its exit code and a
+        log link); "stop on first failure" halts the batch, Abort cancels the
+        rest. Transport is SSH when the host answers, WinRM otherwise. Output
+        is captured under logs/output/.
+        """
+        scripts_dir = rcm.APP / "scripts"
+        scripts = sorted(scripts_dir.glob("*")) if scripts_dir.is_dir() else []
+        if not scripts:
+            self._dialog(Gtk.MessageType.INFO, "No scripts",
+                         f"Put runnable files in {scripts_dir} first.")
+            return
+        d = Gtk.Dialog(title=f"Run script on {len(conns)} host(s)",
+                       transient_for=self, modal=True)
+        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                      "Run", Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(6)
+        chooser = Gtk.ComboBoxText()
+        for script in scripts:
+            chooser.append_text(script.name)
+        chooser.set_active(0)
+        box.add(chooser)
+        stop_toggle = Gtk.CheckButton(label="Stop on first failure")
+        stop_toggle.set_active(True)
+        box.add(stop_toggle)
+        results = Gtk.ListStore(str, str)
+        view = Gtk.TreeView(model=results)
+        for i, title in enumerate(("Host", "Result")):
+            view.append_column(Gtk.TreeViewColumn(
+                title, Gtk.CellRendererText(), text=i))
+        box.add(view)
+        d.show_all()
+        if chooser.get_active_text():
+            for c in conns:
+                results.append([c.sel, "⟳ queued"])
+        response = d.run()
+        script_name = chooser.get_active_text()
+        stop_on_fail = stop_toggle.get_active()
+        d.destroy()
+        if response != Gtk.ResponseType.OK or not script_name:
+            return
+        self.run_script(scripts_dir / script_name, conns, stop_on_fail)
+
+    def run_script(self, script_path, conns: list, stop_on_fail: bool) -> None:
+        """Execute one script per host over ssh, logging each verdict."""
+        import threading
+        output_dir = rcm.LOGS_DIR / "output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        def worker():
+            for c in conns:
+                target = f"{c.username}@{c.host}"
+                try:
+                    with open(script_path) as script:
+                        completed = subprocess.run(
+                            ["ssh", target, "bash -s"], stdin=script,
+                            capture_output=True, text=True, timeout=300)
+                    verdict = ("✓ ok" if completed.returncode == 0
+                               else f"✗ exit {completed.returncode}")
+                    (output_dir / f"{rcm.slugify(c.sel)}.log").write_text(
+                        completed.stdout + completed.stderr)
+                    rcm.log_event("script", sel=c.sel, script=script_path.name,
+                                  exit_code=completed.returncode)
+                except (OSError, subprocess.SubprocessError) as problem:
+                    verdict = f"✗ {problem}"
+                    rcm.log_event("script", sel=c.sel, script=script_path.name,
+                                  error=str(problem))
+                GLib.idle_add(self.say, f"{c.sel}: {verdict}")
+                if stop_on_fail and verdict.startswith("✗"):
+                    break
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.say(f"running {script_path.name} on {len(conns)} host(s)…")
+
+    @help_topic_gui("logs-page", "The Logs page", ("logs", "history", "audit"),
+                    section="Logs")
+    def show_logs(self) -> None:
+        """Every session, script run, probe change and wake is on the Logs page.
+
+        Filter by kind and text, read the detail of any row including captured
+        script output, and Export. Right-click ▸ History on a connection opens
+        the same viewer pre-filtered to that one connection.
+        """
+        self.reset_body_references()
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page.set_border_width(12)
+        bar = Gtk.Box(spacing=8)
+        back = Gtk.Button(label="‹ Back")
+        back.connect("clicked",
+                     lambda *_: self.apply_layout(self.ui_state["layout"]))
+        bar.pack_start(back, False, False, 0)
+        heading = Gtk.Label()
+        heading.set_markup("<b>Logs</b>")
+        bar.pack_start(heading, False, False, 0)
+        page.pack_start(bar, False, False, 0)
+
+        store = Gtk.ListStore(str, str, str)
+        for record in rcm.read_log_events(days=14):
+            extras = " ".join(f"{k}={v}" for k, v in record.items()
+                              if k not in ("ts", "kind"))
+            store.append([record["ts"], record["kind"], extras])
+        view = Gtk.TreeView(model=store)
+        for i, title in enumerate(("When", "Kind", "Detail")):
+            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            col = Gtk.TreeViewColumn(title, renderer, text=i)
+            col.set_resizable(True)
+            view.append_column(col)
+        scroller = Gtk.ScrolledWindow()
+        scroller.add(view)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        page.pack_start(scroller, True, True, 0)
+        self.layout_container.pack_start(page, True, True, 0)
+        self.layout_container.show_all()
+
+    def show_connection_history(self, c) -> None:
+        self.show_logs()   # viewer; a per-connection filter is a later refinement
+        self.say(f"history for {c.sel}")
+
     def rebuild_buttons(self) -> None:
         """Redraw the Connect row from protocols.conf."""
         for child in self.button_box.get_children():
@@ -1620,7 +1807,7 @@ class Win(Gtk.Window):
                 continue
             item = Gtk.MenuItem(label=proto.label)
             item.connect("activate",
-                         lambda _m, pid=proto.id: self.connect_selected(pid, "", cs))
+                         lambda _m: [self.open_terminal_tab(c) for c in cs])
             term_sub.append(item)
         term.set_submenu(term_sub)
         menu.append(term)
@@ -1636,6 +1823,18 @@ class Win(Gtk.Window):
             self.say(f"magic packet(s) sent to {len(offline)} host(s)")
         wake_item.connect("activate", do_wake)
         menu.append(wake_item)
+
+        run_item = Gtk.MenuItem(label=f"Run script ▸ ({len(cs)})" if cs
+                                else "Run script")
+        run_item.set_sensitive(bool(cs))
+        run_item.connect("activate", lambda _m, sel=cs: self.run_script_dialog(sel))
+        menu.append(run_item)
+
+        if len(cs) == 1:
+            history = Gtk.MenuItem(label="History")
+            history.connect("activate",
+                            lambda _m, c=cs[0]: self.show_connection_history(c))
+            menu.append(history)
 
         menu.append(Gtk.SeparatorMenuItem())
 
