@@ -217,27 +217,6 @@ class Win(Gtk.Window):
         self.layout_button.set_popover(self.build_layout_popover())
         hb.pack_end(self.layout_button)
 
-        menu_btn = Gtk.MenuButton()
-        menu_btn.add(Gtk.Image.new_from_icon_name("open-menu-symbolic", Gtk.IconSize.BUTTON))
-        menu = Gtk.Menu()
-        for label, cb in (("Credentials…", self.on_credentials),
-                          ("Protocols…", self.on_protocols),
-                          ("Keyboard shortcuts…", self.on_shortcuts),
-                          (None, None),
-                          ("Import from CSV…", self.on_import),
-                          ("Export to CSV…", self.on_export),
-                          ("Export Radmin phonebook…", self.on_phonebook),
-                          (None, None),
-                          ("Rebuild jump list", self.on_genlauncher)):
-            if label is None:
-                menu.append(Gtk.SeparatorMenuItem())
-                continue
-            mi = Gtk.MenuItem(label=label)
-            mi.connect("activate", cb)
-            menu.append(mi)
-        menu.show_all()
-        menu_btn.set_popup(menu)
-        hb.pack_end(menu_btn)
 
         # Tab strip (design 7a): pinned filter queries shared by every layout.
         # "All" is permanent; Ctrl+T (or ＋) pins the current filter; ✕ closes.
@@ -301,6 +280,10 @@ class Win(Gtk.Window):
             row.set_sensitive(layout_id in self.IMPLEMENTED_LAYOUTS)
             row.connect("toggled", self.on_layout_chosen, layout_id)
             box.pack_start(row, False, False, 2)
+        setup_row = Gtk.ModelButton(label="Setup…")
+        setup_row.connect("clicked", lambda *_: (popover.popdown(), self.on_setup()))
+        box.pack_start(Gtk.Separator(), False, False, 4)
+        box.pack_start(setup_row, False, False, 0)
         foot = Gtk.Label(xalign=0)
         foot.set_markup("<small>saved as <tt>layout =</tt> in ui.conf</small>")
         foot.get_style_context().add_class("dim-label")
@@ -417,14 +400,25 @@ class Win(Gtk.Window):
     # ------------------------------------------------------------------ #
     # layout engine: five window arrangements over the same shell
     # ------------------------------------------------------------------ #
+    def reset_body_references(self) -> None:
+        """Destroy the body and forget every widget reference into it.
+
+        The 4s live timer keeps firing while Setup or the first-run checklist
+        is showing; anything still pointing at a destroyed widget is a crash
+        waiting for the next tick.
+        """
+        for child in self.layout_container.get_children():
+            child.destroy()
+        for name in ("tree", "store", "slist", "sstore", "button_box", "sidebar",
+                     "setup_badge", "filter_entry", "inspector_store",
+                     "cockpit_cards"):
+            setattr(self, name, None)
+
     def apply_layout(self, layout_id: str) -> None:
         """Tear down the body and rebuild it as the chosen layout."""
         if layout_id not in rcm.LAYOUTS:
             layout_id = "classic"
-        for child in self.layout_container.get_children():
-            child.destroy()
-        # Widgets the layouts may or may not create; reload()/refresh_live()
-        # only touch what exists.
+        self.reset_body_references()
         self.tree = None
         self.store = None
         self.slist = None
@@ -438,6 +432,11 @@ class Win(Gtk.Window):
         self.flat_list = layout_id in ("rail", "spotlight", "cockpit")
         self.highlight_matches = layout_id == "spotlight"
         self.current_layout = layout_id
+        if not rcm.conns_cached(refresh=True) and \
+                not getattr(self, "first_run_skipped", False):
+            self.layout_container.pack_start(self.build_first_run(), True, True, 0)
+            self.layout_container.show_all()
+            return
         builder = getattr(self, f"build_{layout_id}_layout")
         self.layout_container.pack_start(builder(), True, True, 0)
         self.layout_container.show_all()
@@ -725,12 +724,212 @@ class Win(Gtk.Window):
         self.setup_badge.set_label(
             f"⚙ Setup{f'  ({problems}⚠)' if problems else ''}")
 
+    @help_topic_gui("setup-page", "The Setup page",
+                    ("setup", "settings", "warnings", "import", "export"),
+                    section="Setup")
     def on_setup(self) -> None:
-        # Interim destination until the Setup page (Phase 5): show the health
-        # list; the real page replaces this method's body.
+        """Everything that used to hide in the menu lives on the Setup page.
+
+        Four cards — Protocols, Credentials, Keyboard shortcuts, Import/Export
+        — each fronting the same plain files you can edit by hand. Warnings
+        from the health check appear as a banner with a one-click action, and
+        the badge on the Setup entry counts them.
+        """
+        self.reset_body_references()
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(14)
+
+        bar = Gtk.Box(spacing=8)
+        back = Gtk.Button(label="‹ Back")
+        back.connect("clicked", lambda *_: self.apply_layout(self.ui_state["layout"]))
+        bar.pack_start(back, False, False, 0)
+        heading = Gtk.Label(xalign=0)
+        heading.set_markup("<b>Setup</b>")
+        bar.pack_start(heading, False, False, 0)
+        page.pack_start(bar, False, False, 0)
+
         problems = rcm.config_health()
-        body = "\n".join(f"• {w.message}" for w in problems) or "No warnings."
-        self._dialog(Gtk.MessageType.INFO, "Configuration health", body)
+        if problems:
+            banner = Gtk.Frame()
+            inner = Gtk.Box(spacing=8)
+            inner.set_border_width(8)
+            text = Gtk.Label(xalign=0)
+            text.set_markup(f'<span foreground="#b5890a">⚠ '
+                            f'{GLib.markup_escape_text(problems[0].message)}</span>')
+            text.set_line_wrap(True)
+            inner.pack_start(text, True, True, 0)
+            if problems[0].setup_section == "credentials":
+                act = Gtk.Button(label="Set default credentials")
+                act.get_style_context().add_class("suggested-action")
+                act.connect("clicked", lambda *_: self.set_default_credentials())
+                inner.pack_end(act, False, False, 0)
+            banner.add(inner)
+            page.pack_start(banner, False, False, 0)
+
+        cards = Gtk.Grid(row_spacing=10, column_spacing=10,
+                         row_homogeneous=True, column_homogeneous=True)
+        page.pack_start(cards, True, True, 0)
+
+        def card(title, subtitle, extra_widget, buttons):
+            frame = Gtk.Frame()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.set_border_width(10)
+            head = Gtk.Label(xalign=0)
+            head.set_markup(f"<b>{title}</b>")
+            box.pack_start(head, False, False, 0)
+            sub = Gtk.Label(xalign=0, label=subtitle)
+            sub.set_line_wrap(True)
+            sub.get_style_context().add_class("dim-label")
+            box.pack_start(sub, False, False, 0)
+            if extra_widget is not None:
+                box.pack_start(extra_widget, False, False, 0)
+            row = Gtk.Box(spacing=6)
+            for label, handler, suggested in buttons:
+                b = Gtk.Button(label=label)
+                if suggested:
+                    b.get_style_context().add_class("suggested-action")
+                b.connect("clicked", lambda _w, h=handler: h())
+                row.pack_start(b, False, False, 0)
+            box.pack_start(row, False, False, 0)
+            frame.add(box)
+            return frame
+
+        chips = Gtk.Label(xalign=0)
+        chips.set_markup(protocol_badges(list(protocols_safe()),
+                                         protocols_safe()))
+        cards.attach(card("Protocols",
+                          "buttons, commands, session detection, credential typing",
+                          chips,
+                          [("Edit…", self.on_protocols, False),
+                           ("Add protocol", self.on_protocols, False)]), 0, 0, 1, 1)
+
+        scopes = ", ".join(k for k in rcm.creds_scopes() if k != "DEFAULT") or "—"
+        missing_default = any(w.warning_id == "no-default-credential"
+                              for w in problems)
+        cards.attach(card("Credentials" + ("  ⚠ no DEFAULT" if missing_default else ""),
+                          "usernames in creds.conf, passwords in the OS keyring "
+                          "— never on disk",
+                          Gtk.Label(xalign=0, label=f"scopes: {scopes}"),
+                          [("Set default…", self.set_default_credentials,
+                            missing_default),
+                           ("Manage…", self.on_credentials, False)]), 1, 0, 1, 1)
+
+        globals_, per_session = rcm.load_shortcuts()
+        summary = " · ".join(f"{pretty_key(v)} {k}" for k, v in globals_.items()
+                             if v) or "none configured"
+        cards.attach(card("Keyboard shortcuts",
+                          f"{summary} · {len(per_session)} connection key(s)",
+                          None,
+                          [("Edit…", self.on_shortcuts, False),
+                           ("Reinstall", lambda: (rcm.shortcuts_install(),
+                                                  self.say("shortcuts reinstalled"))[1],
+                            False)]), 0, 1, 1, 1)
+
+        cards.attach(card("Import / Export",
+                          "CSV round-trips everything; .rdp files and Radmin "
+                          "phonebook export",
+                          None,
+                          [("Import CSV…", self.on_import, False),
+                           ("Export…", self.on_export, False),
+                           ("Phonebook…", self.on_phonebook, False)]), 1, 1, 1, 1)
+
+        foot = Gtk.Label(xalign=0)
+        foot.set_markup("<small>everything here is a plain file — protocols.conf, "
+                        "creds.conf, shortcuts.conf — this page is a convenience "
+                        "over the same files</small>")
+        foot.get_style_context().add_class("dim-label")
+        page.pack_start(foot, False, False, 0)
+        self.layout_container.pack_start(page, True, True, 0)
+        self.layout_container.show_all()
+
+    def set_default_credentials(self) -> None:
+        """The DEFAULT credential backs every connection with no closer match."""
+        d = Gtk.Dialog(title="Set default credentials", transient_for=self,
+                       modal=True)
+        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                      Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_spacing(6)
+        box.set_border_width(12)
+        box.add(Gtk.Label(xalign=0, label="Username (blank = from each .rdp):"))
+        user_entry = Gtk.Entry(activates_default=True)
+        box.add(user_entry)
+        box.add(Gtk.Label(xalign=0, label="Password (stored in the OS keyring):"))
+        pw_entry = Gtk.Entry(visibility=False, activates_default=True)
+        box.add(pw_entry)
+        d.set_default_response(Gtk.ResponseType.OK)
+        d.show_all()
+        response = d.run()
+        username, password = user_entry.get_text().strip(), pw_entry.get_text()
+        d.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        rcm.creds_set_user("DEFAULT", username)
+        if password:
+            rcm.secret_set("DEFAULT", password)
+        self.say("DEFAULT credentials saved")
+        self.on_setup()
+
+    @help_topic_gui("first-run", "First-run checklist",
+                    ("empty", "getting started", "checklist"), section="Setup")
+    def build_first_run(self):
+        """With no connections yet, the window opens as a setup checklist.
+
+        Each row is a step with its done-state checked live: detect installed
+        clients, install the keyboard shortcuts, set default credentials,
+        create the first connection, or import a CSV. Skipping shows the
+        normal (empty) window.
+        """
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        page.set_border_width(30)
+        title = Gtk.Label()
+        title.set_markup("<span size='x-large'><b>Set up your hub</b></span>")
+        page.pack_start(title, False, False, 4)
+
+        registry = protocols_safe()
+        any_launcher = any(
+            rcm.launcher_exe(proto, tmpl) and
+            (shutil.which(rcm.launcher_exe(proto, tmpl)) or
+             Path(rcm.launcher_exe(proto, tmpl)).is_file())
+            for proto in registry.values() for tmpl in proto.launchers.values())
+        shortcuts_installed = bool(rcm.parse_gsettings_list(
+            rcm.run_gsettings("get", rcm.GS_LIST, "custom-list")))
+        have_default = bool(rcm.secret_get("DEFAULT"))
+        steps = [
+            ("Detect installed clients", any_launcher, self.on_protocols, False),
+            ("Install keyboard shortcuts", shortcuts_installed,
+             lambda: (rcm.shortcuts_install(), self.reload()), False),
+            ("Set default credentials", have_default,
+             self.set_default_credentials, False),
+            ("Create first connection", False,
+             lambda: self.edit_dialog(None), True),
+            ("Import CSV", False, self.on_import, False),
+        ]
+        done = sum(1 for _t, state, _h, _s in steps if state)
+        progress = Gtk.Label()
+        progress.set_markup(f"<small>{done} of {len(steps)} done</small>")
+        progress.get_style_context().add_class("dim-label")
+        page.pack_start(progress, False, False, 0)
+
+        for text, done_state, handler, suggested in steps:
+            row = Gtk.Box(spacing=10)
+            mark = Gtk.Label(label="✓" if done_state else "○")
+            row.pack_start(mark, False, False, 0)
+            row.pack_start(Gtk.Label(xalign=0, label=text), True, True, 0)
+            button = Gtk.Button(label="Done" if done_state else "Go")
+            button.set_sensitive(not done_state)
+            if suggested and not done_state:
+                button.get_style_context().add_class("suggested-action")
+            button.connect("clicked", lambda _w, h=handler: h())
+            row.pack_end(button, False, False, 0)
+            page.pack_start(row, False, False, 2)
+
+        skip = Gtk.Button(label="Skip — show me the empty list")
+        skip.set_relief(Gtk.ReliefStyle.NONE)
+        skip.connect("clicked", lambda *_: (setattr(self, "first_run_skipped", True),
+                                            self.apply_layout(self.ui_state["layout"])))
+        page.pack_start(skip, False, False, 8)
+        return page
 
     # ---- Spotlight ------------------------------------------------------ #
     def build_spotlight_layout(self):
@@ -1020,7 +1219,7 @@ class Win(Gtk.Window):
         if self.current_layout == "inspector":
             return
         self.refresh_cockpit_cards()
-        if self.store is None:
+        if self.store is None or self.tree is None:
             return
         live = rcm.active_sels()
 
