@@ -115,8 +115,8 @@ def install_css(protos=None, widget=None) -> None:
 # TreeStore columns. Checkboxes and selection are deliberately independent:
 # the Connect buttons act on what is ticked, the context menu on what is
 # highlighted, so you can queue up a set and still right-click something else.
-(C_CHECK, C_MARK, C_LABEL, C_HOST, C_USER, C_PROTOS, C_KEY, C_SEL,
- C_WEIGHT, C_STYLE) = range(10)
+(C_CHECK, C_MARK, C_NET, C_LABEL, C_HOST, C_USER, C_PROTOS, C_KEY, C_SEL,
+ C_WEIGHT, C_STYLE) = range(11)
 
 def protocols_safe() -> dict:
     """The protocol registry, or {} if the config is broken.
@@ -249,6 +249,7 @@ class Win(Gtk.Window):
         self.connect("key-press-event", self.on_window_key)
 
         self.apply_layout(self.ui_state["layout"])
+        self.start_prober()
         GLib.timeout_add_seconds(REFRESH_SECONDS, self._tick)
 
     LAYOUT_DESCRIPTIONS = {
@@ -461,7 +462,7 @@ class Win(Gtk.Window):
         head.pack_start(self.count_lbl, False, False, 0)
         left.pack_start(head, False, False, 0)
 
-        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str,
+        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, str,
                                    int, int)
         self.tree = Gtk.TreeView(model=self.store)
         # Ctrl and Shift range-select come free with MULTIPLE.
@@ -477,6 +478,10 @@ class Win(Gtk.Window):
 
         r = Gtk.CellRendererText()
         col = Gtk.TreeViewColumn("Live", r, text=C_MARK)
+        col.set_min_width(36)
+        self.tree.append_column(col)
+        r = Gtk.CellRendererText()
+        col = Gtk.TreeViewColumn("Net", r, markup=C_NET)
         col.set_min_width(36)
         self.tree.append_column(col)
 
@@ -562,7 +567,8 @@ class Win(Gtk.Window):
         """The connection list used by Rail/Spotlight/Cockpit: same columns as
         Classic, but flat — group changes render as italic heading rows rather
         than expander nesting, and Spotlight highlights filter matches."""
-        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, int, int)
+        self.store = Gtk.TreeStore(bool, str, str, str, str, str, str, str, str,
+                                   int, int)
         self.tree = Gtk.TreeView(model=self.store)
         self.tree.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
         self.tree.set_rubber_banding(True)
@@ -574,6 +580,10 @@ class Win(Gtk.Window):
         self.tree.append_column(col)
         live_renderer = Gtk.CellRendererText()
         col = Gtk.TreeViewColumn("Live", live_renderer, text=C_MARK)
+        col.set_min_width(36)
+        self.tree.append_column(col)
+        net_renderer = Gtk.CellRendererText()
+        col = Gtk.TreeViewColumn("Net", net_renderer, markup=C_NET)
         col.set_min_width(36)
         self.tree.append_column(col)
         for idx, title, minw in ((C_LABEL, "Connection", 150),
@@ -607,6 +617,10 @@ class Win(Gtk.Window):
         self.filter_entry.set_text(self.query_text)
         self.filter_entry.connect("search-changed", self.on_filter_changed)
         row.pack_start(self.filter_entry, True, True, 0)
+        recheck = Gtk.Button(label="Recheck")
+        recheck.set_tooltip_text("Re-probe the visible rows now")
+        recheck.connect("clicked", lambda *_: self.recheck_visible())
+        row.pack_start(recheck, False, False, 0)
         new_button = Gtk.Button(label="New")
         new_button.connect("clicked", lambda *_: self.edit_dialog(None))
         row.pack_start(new_button, False, False, 0)
@@ -1099,6 +1113,83 @@ class Win(Gtk.Window):
                 GLib.markup_escape_text(pretty_key(keys.get(c.sel, ""))) or "—",
                 health])
 
+    @help_topic_gui("net-probe", "Online probing and Wake-on-LAN",
+                    ("net", "online", "offline", "probe", "wake"),
+                    section="Connections")
+    def start_prober(self) -> None:
+        """The Net column shows whether a machine answers at all.
+
+        ● reachable, ○ offline, ◌ not probed yet. The probe is one TCP connect
+        to the connection's default-protocol port with a ~1s timeout, and only
+        ONE probe socket exists at any moment — visible rows are probed first,
+        a full sweep of everything else trickles along behind, and probing
+        pauses entirely while the window is hidden. That is what keeps 500
+        hosts cheap. "Recheck" re-probes the visible rows on demand; offline
+        rows offer ⚡ Wake when a MAC has been learned.
+        """
+        import threading
+        self.net_state: dict = {}
+        self.prober_generation = 0
+
+        def worker():
+            while True:
+                if not self.get_visible():
+                    time.sleep(3)
+                    continue
+                generation = self.prober_generation
+                order = [c for c in rcm.conns_cached()
+                         if self.connection_matches_query(c)]
+                order += [c for c in rcm.conns_cached() if c not in order]
+                for c in order:
+                    if generation != self.prober_generation:
+                        break
+                    if not self.get_visible():
+                        break
+                    reachable = rcm.probe_host(c.host, c.port_for(c.default_protocol))
+                    previous = self.net_state.get(c.sel)
+                    self.net_state[c.sel] = reachable
+                    if previous is not None and previous != reachable:
+                        rcm.log_event("probe", sel=c.sel,
+                                      state="up" if reachable else "down")
+                    GLib.idle_add(self.paint_net_cells)
+                    time.sleep(0.4)
+                time.sleep(60)   # rest between sweeps
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def recheck_visible(self) -> None:
+        """Toolbar Recheck: forget visible results and let the prober redo them."""
+        for c in rcm.conns_cached():
+            if self.connection_matches_query(c):
+                self.net_state.pop(c.sel, None)
+        self.prober_generation += 1
+        self.say("re-probing visible rows")
+
+    def net_cell(self, c) -> str:
+        state = getattr(self, "net_state", {}).get(c.sel)
+        if state is True:
+            return '<span foreground="#26a269">●</span>'
+        if state is False:
+            return '<span foreground="#c04040">○</span>'
+        return '<span foreground="#8f9192">◌</span>'
+
+    def paint_net_cells(self) -> bool:
+        if self.store is None:
+            return False
+        def walk(it):
+            while it:
+                sel = self.store[it][C_SEL]
+                if sel:
+                    c = rcm.find(sel)
+                    if c:
+                        self.store[it][C_NET] = self.net_cell(c)
+                child = self.store.iter_children(it)
+                if child:
+                    walk(child)
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
+        return False
+
     def rebuild_buttons(self) -> None:
         """Redraw the Connect row from protocols.conf."""
         for child in self.button_box.get_children():
@@ -1157,9 +1248,9 @@ class Win(Gtk.Window):
                 name_markup += ('\n<small><span foreground="#c04040">'
                                 'no password — will prompt</span></small>')
             self.store.append(parent, [
-                c.sel in ticked, "", name_markup, highlight(c.host),
-                c.username, protocol_badges(c.protocols, registry,
-                                            c.default_protocol),
+                c.sel in ticked, "", self.net_cell(c), name_markup,
+                highlight(c.host), c.username,
+                protocol_badges(c.protocols, registry, c.default_protocol),
                 pretty_key(keys.get(c.sel, "")), c.sel, 400, Pango.Style.NORMAL])
 
         visible = 0
@@ -1176,8 +1267,8 @@ class Win(Gtk.Window):
                     continue
                 if c.group != last_group and c.group:
                     heading = GLib.markup_escape_text(c.group.replace("/", " / "))
-                    self.store.append(None, [False, "", heading, "", "", "", "",
-                                             "", 400, Pango.Style.ITALIC])
+                    self.store.append(None, [False, "", "", heading, "", "", "",
+                                             "", "", 400, Pango.Style.ITALIC])
                     last_group = c.group
                 connection_row(c, None)
                 visible += 1
@@ -1190,7 +1281,7 @@ class Win(Gtk.Window):
                 if path not in nodes:
                     parent = group_iter(path.rsplit("/", 1)[0] if "/" in path else "")
                     nodes[path] = self.store.append(
-                        parent, [False, "", GLib.markup_escape_text(
+                        parent, [False, "", "", GLib.markup_escape_text(
                             path.rsplit("/", 1)[-1]), "", "", "", "", "",
                             700, Pango.Style.ITALIC])
                 return nodes[path]
@@ -1516,6 +1607,35 @@ class Win(Gtk.Window):
                     sub.append(mi)
                 top.set_submenu(sub)
             menu.append(top)
+
+        menu.append(Gtk.SeparatorMenuItem())
+
+        # Terminals (11a): a transport per ssh-ish protocol; one tab per host,
+        # offered on ANY connection -- worst case the server refuses.
+        term = Gtk.MenuItem(label=f"Open terminal ({len(cs)})" if cs else "Open terminal")
+        term.set_sensitive(bool(cs))
+        term_sub = Gtk.Menu()
+        for proto in protocols_safe().values():
+            if proto.id not in ("ssh",) and "ssh" not in proto.detect_process:
+                continue
+            item = Gtk.MenuItem(label=proto.label)
+            item.connect("activate",
+                         lambda _m, pid=proto.id: self.connect_selected(pid, "", cs))
+            term_sub.append(item)
+        term.set_submenu(term_sub)
+        menu.append(term)
+
+        offline = [c for c in cs
+                   if getattr(self, "net_state", {}).get(c.sel) is False
+                   and c.extra.get("rcm-mac")]
+        wake_item = Gtk.MenuItem(label=f"⚡ Wake ({len(offline)})")
+        wake_item.set_sensitive(bool(offline))
+        def do_wake(_m):
+            for c in offline:
+                rcm.wake(c.extra["rcm-mac"], host=c.host)
+            self.say(f"magic packet(s) sent to {len(offline)} host(s)")
+        wake_item.connect("activate", do_wake)
+        menu.append(wake_item)
 
         menu.append(Gtk.SeparatorMenuItem())
 
