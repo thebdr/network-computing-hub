@@ -110,8 +110,8 @@ def build_protocol_css(protos) -> bytes:
                "button.rcm-tabclose:hover { "
                "background-color: alpha(currentColor, 0.22); }\n"
                # The Connect row: 20% shorter than a stock button.
-               "button.rcm-connect { padding-top: 2px; padding-bottom: 2px; "
-               "min-height: 22px; }\n")
+               "button.rcm-connect { padding-top: 1px; padding-bottom: 1px; "
+               "min-height: 20px; }\n")
     # Group headings in the icon view read as bands, like the list's rows.
     out.append(".rcm-group-heading { background-color: alpha("
                "@theme_selected_bg_color, 0.16); padding: 2px 6px; }\n")
@@ -531,9 +531,27 @@ class Win(Gtk.Window):
                 return True
         if key_name == "Delete" and not isinstance(self.get_focus(),
                                                    (Gtk.Entry, Gtk.TextView)):
+            # The window sees the key before the focused widget does, so the
+            # sidebar's own handler never ran: ask who has focus first.
+            if self.get_focus() is getattr(self, "sidebar", None):
+                return self.delete_selected_group()
             self.on_delete()
             return True
         return False
+
+    def delete_selected_group(self) -> bool:
+        """Delete whichever group the sidebar has highlighted, if any."""
+        if getattr(self, "sidebar", None) is None:
+            return False
+        model, it = self.sidebar.get_selection().get_selected()
+        if not it:
+            return False
+        key = model[it][1]
+        if not key or key.startswith(("tag:", "workspace:",
+                                      self.SIDEBAR_HEADER)):
+            return False
+        self.delete_group(key)
+        return True
 
     def duplicate_selection(self) -> None:
         """Ctrl+D: a copy beside each selected connection or group."""
@@ -977,8 +995,8 @@ class Win(Gtk.Window):
         self.tree.append_column(col)
 
         for idx, title, minw in ((C_LABEL, "Connection", 130),
-                                 (C_HOST, "Host", 118), (C_USER, "User", 78),
                                  (C_PROTOS, "Protocols", 168),
+                                 (C_HOST, "Host", 118), (C_USER, "User", 78),
                                  (C_KEY, "Key", 86)):
             r = Gtk.CellRendererText(
                 ellipsize=Pango.EllipsizeMode.NONE if idx == C_PROTOS
@@ -1082,8 +1100,9 @@ class Win(Gtk.Window):
         col.set_min_width(36)
         self.tree.append_column(col)
         for idx, title, minw in ((C_LABEL, "Connection", 150),
+                                 (C_PROTOS, "Protocols", 168),
                                  (C_HOST, "Host", 118), (C_USER, "User", 78),
-                                 (C_PROTOS, "Protocols", 168), (C_KEY, "Key", 86)):
+                                 (C_KEY, "Key", 86)):
             # Protocols never ellipsises: a half-drawn chip row reads as a
             # missing protocol, so that column sizes to its content and the
             # list scrolls sideways instead of lying.
@@ -1208,15 +1227,18 @@ class Win(Gtk.Window):
 
         # Live sessions: present only when there is something to show.
         self.cards_revealer = Gtk.Revealer()
-        # A row, not a grid: FlowBox stretched every card to an equal share of
-        # the window, so two sessions each took half the width. In a Box they
-        # take what they need and the strip scrolls when there are many.
-        self.cockpit_cards = Gtk.Box(spacing=4)
-        cards_scroller = Gtk.ScrolledWindow()
-        cards_scroller.set_policy(Gtk.PolicyType.AUTOMATIC,
-                                  Gtk.PolicyType.NEVER)
-        cards_scroller.add(self.cockpit_cards)
-        self.cards_revealer.add(cards_scroller)
+        # Wrapping, not scrolling: the strip changes how much each card says
+        # so the whole set stays visible (see refresh_cockpit_cards).
+        self.cockpit_cards = Gtk.FlowBox()
+        self.cockpit_cards.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.cockpit_cards.set_homogeneous(False)
+        self.cockpit_cards.set_max_children_per_line(30)
+        self.cockpit_cards.set_min_children_per_line(1)
+        self.cockpit_cards.set_row_spacing(3)
+        self.cockpit_cards.set_column_spacing(4)
+        self.cards_revealer.add(self.cockpit_cards)
+        self.cards_revealer.connect(
+            "size-allocate", lambda *_: self.reflow_cards_if_needed())
         outer.pack_start(self.cards_revealer, False, False, 0)
 
         row = Gtk.Box(spacing=6)
@@ -1295,8 +1317,13 @@ class Win(Gtk.Window):
         self.setup_badge.connect("clicked", lambda *_: self.on_setup())
         side.pack_start(self.setup_badge, False, False, 0)
         paned.pack1(side, False, False)
-        paned.pack2(self.build_icon_view() if icons_on
-                    else self.build_connection_list(), True, False)
+        # The Connect row rides with the list inside the pane, so it sits
+        # under the table it acts on instead of spanning the sidebar too.
+        list_side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        list_side.pack_start(self.build_icon_view() if icons_on
+                             else self.build_connection_list(), True, True, 0)
+        list_side.pack_start(self.build_connect_button_box(), False, False, 0)
+        paned.pack2(list_side, True, False)
         paned.set_position(190 if sidebar_toggle.get_active() else 0)
         outer.pack_start(paned, True, True, 0)
 
@@ -1312,7 +1339,6 @@ class Win(Gtk.Window):
         sidebar_toggle.connect("toggled", on_sidebar_toggled)
         self._browse_side_box = side
 
-        outer.pack_start(self.build_connect_button_box(), False, False, 0)
         return outer
 
     # \x01 survives GTK's C strings (\x00 truncated to "", which reads as
@@ -1388,10 +1414,24 @@ class Win(Gtk.Window):
                     and self.chip_filters_allow(c)):
                 continue
             by_group.setdefault(c.group, []).append(c)
+        # A parent with only sub-groups still needs its heading, or its
+        # children would sit at the top level with nothing to fold them.
+        for group in list(by_group):
+            parent = group
+            while "/" in parent:
+                parent = parent.rsplit("/", 1)[0]
+                by_group.setdefault(parent, [])
         shown = sum(len(v) for v in by_group.values())
 
+        # Sections nest like the list's rows: a sub-group is indented under
+        # its parent, and folding the parent takes its children with it.
         for group in sorted(by_group):
+            depth = group.count("/") if group else 0
+            hidden_by_parent = any(
+                group.startswith(parent + "/")
+                for parent in self.collapsed_groups if parent)
             heading = Gtk.Box(spacing=6)
+            heading.set_margin_start(depth * 18)
             folded = group in self.collapsed_groups
             fold = Gtk.Button.new_from_icon_name(
                 "pan-end-symbolic" if folded else "pan-down-symbolic",
@@ -1410,14 +1450,18 @@ class Win(Gtk.Window):
             group_check.connect("toggled", self.on_icon_group_toggled, members)
             heading.pack_start(group_check, False, False, 0)
             title = Gtk.Label(xalign=0)
-            title.set_markup(
-                f"<b>{GLib.markup_escape_text(group or '(top level)')}</b>"
-                f"  <small>({len(members)})</small>")
+            leaf = group.rsplit("/", 1)[-1] if group else "(top level)"
+            title.set_markup(f"<b>{GLib.markup_escape_text(leaf)}</b>"
+                             f"  <small>({len(members)})</small>")
             heading.pack_start(title, False, False, 0)
             heading.get_style_context().add_class("rcm-group-heading")
             self.icon_box.pack_start(heading, False, False, 0)
+            if hidden_by_parent:
+                heading.set_no_show_all(True)
+                heading.hide()
 
             flow = Gtk.FlowBox()
+            flow.set_margin_start(depth * 18)
             flow.set_valign(Gtk.Align.START)
             flow.set_max_children_per_line(12)
             flow.set_min_children_per_line(1)
@@ -1435,7 +1479,7 @@ class Win(Gtk.Window):
 
             for c in by_group[group]:
                 flow.add(self.build_tile(c, registry, live))
-            if folded:
+            if folded or hidden_by_parent:
                 flow.set_no_show_all(True)
                 flow.hide()
         self.icon_box.show_all()
@@ -1803,15 +1847,7 @@ class Win(Gtk.Window):
         """Delete on a highlighted sidebar group removes that group."""
         if Gdk.keyval_name(event.keyval) != "Delete":
             return False
-        model, it = self.sidebar.get_selection().get_selected()
-        if not it:
-            return False
-        key = model[it][1]
-        if key and not key.startswith(("tag:", "workspace:",
-                                       self.SIDEBAR_HEADER)):
-            self.delete_group(key)
-            return True
-        return False
+        return self.delete_selected_group()
 
     def on_sidebar_activated(self, _tv, path, _col) -> None:
         """Double-click / Enter on a workspace row connects the whole set."""
@@ -1912,6 +1948,58 @@ class Win(Gtk.Window):
                 getattr(self, "_browse_side_box", None) is not None:
             self._browse_side_box.hide()
 
+    # Card widths per density, and how many rows each is allowed to fill
+    # before the strip gives up detail rather than height.
+    CARD_WIDTHS = (232, 150, 108)
+
+    def card_density(self, count: int) -> int:
+        """How much each live card may say, given the room and the crowd.
+
+        Three steps: the full card (chip, path, host and shortcut, action
+        buttons), then name-only when that would spill past two rows, then a
+        chip-and-name tile with its actions on the right-click menu. The
+        strip never scrolls and never eats the list's height.
+        """
+        width = self.cards_revealer.get_allocated_width() if getattr(
+            self, "cards_revealer", None) else 0
+        if width < 50:
+            return 0
+        for level, card_width in enumerate(self.CARD_WIDTHS):
+            per_row = max(1, width // card_width)
+            if count <= per_row * (2 + level):
+                return level
+        return len(self.CARD_WIDTHS) - 1
+
+    def on_card_click(self, _widget, event, session):
+        """Right-click a live card: Focus / Disconnect, at any density."""
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            rcm.focus_session(session)
+            return True
+        if event.button != 3:
+            return False
+        menu = Gtk.Menu()
+        focus_item = Gtk.MenuItem(label=f"Focus {session.label}")
+        focus_item.connect("activate",
+                           lambda *_: rcm.focus_session(session))
+        menu.append(focus_item)
+        end_item = Gtk.MenuItem(label=f"Disconnect {session.label}")
+        end_item.connect("activate", lambda *_: (rcm.kill_session(session),
+                                                 self.refresh_live()))
+        menu.append(end_item)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def reflow_cards_if_needed(self) -> None:
+        """Re-densify when the window resizes, but only on a real change."""
+        if getattr(self, "cockpit_cards", None) is None:
+            return
+        count = len(getattr(self, "_card_sessions", []))
+        if not count:
+            return
+        if self.card_density(count) != getattr(self, "_card_density", None):
+            GLib.idle_add(self.refresh_cockpit_cards)
+
     def refresh_cockpit_cards(self) -> None:
         """Paint the live-session card strip; hidden entirely when idle."""
         if getattr(self, "cockpit_cards", None) is None:
@@ -1921,51 +2009,81 @@ class Win(Gtk.Window):
         registry = protocols_safe()
         keys = rcm.session_bindings()
         sessions = rcm.sessions()
+        self._card_sessions = sessions
+        density = self.card_density(len(sessions))
+        self._card_density = density
+        # Pack exactly as many per row as the density was calculated for, or
+        # the FlowBox spreads them wider and spills into an extra row.
+        width = self.cards_revealer.get_allocated_width() if getattr(
+            self, "cards_revealer", None) else 0
+        if width > 50:
+            self.cockpit_cards.set_max_children_per_line(
+                max(1, width // self.CARD_WIDTHS[density]))
         if getattr(self, "cards_revealer", None) is not None:
             self.cards_revealer.set_reveal_child(bool(sessions))
         for session in sessions:
             card = Gtk.Frame()
-            # One row, not a stack: the strip sits above the list all day, so
-            # it buys its height back in rows of connections.
-            inner = Gtk.Box(spacing=6)
-            inner.set_border_width(4)
-            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-            head = Gtk.Label(xalign=0)
+            inner = Gtk.Box(spacing=4)
+            inner.set_border_width(2 if density else 4)
             proto = next((q for q in registry.values()
                           if q.label == session.proto), None)
             chip = (f'<span background="{resolve_colour(proto.color)}" '
-                    f'foreground="#ffffff"> {GLib.markup_escape_text(session.proto)} '
-                    f'</span>  ') if proto else ""
-            head.set_markup(chip + f"<b>{GLib.markup_escape_text(session.label)}</b>")
+                    f'foreground="#ffffff"> '
+                    f'{GLib.markup_escape_text(session.proto)} </span>  '
+                    ) if proto else ""
+            # Level 0 shows the full path; tighter levels show the leaf name,
+            # which is what tells two live sessions apart at a glance.
+            shown = session.label if density == 0 \
+                else session.label.rsplit("/", 1)[-1]
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            head = Gtk.Label(xalign=0)
+            head.set_markup(chip + f"<b>{GLib.markup_escape_text(shown)}</b>")
+            head.set_ellipsize(Pango.EllipsizeMode.END)
             text.pack_start(head, False, False, 0)
-            sub = Gtk.Label(xalign=0)
-            key = pretty_key(keys.get(session.label, ""))
-            sub.set_markup(f"<small>{GLib.markup_escape_text(session.host)}"
-                           + (f" · {key}" if key else "") + "</small>")
-            sub.get_style_context().add_class("dim-label")
-            text.pack_start(sub, False, False, 0)
+            if density < 2:
+                sub = Gtk.Label(xalign=0)
+                key = pretty_key(keys.get(session.label, ""))
+                detail = GLib.markup_escape_text(session.host)
+                if key and density == 0:
+                    detail += f" · {GLib.markup_escape_text(key)}"
+                sub.set_markup(f"<small>{detail}</small>")
+                sub.get_style_context().add_class("dim-label")
+                sub.set_ellipsize(Pango.EllipsizeMode.END)
+                text.pack_start(sub, False, False, 0)
             inner.pack_start(text, True, True, 0)
 
-            focus = Gtk.Button.new_from_icon_name("view-reveal-symbolic",
-                                                  Gtk.IconSize.MENU)
-            focus.set_relief(Gtk.ReliefStyle.NONE)
-            focus.set_tooltip_text(f"Focus {session.label}")
-            focus.get_style_context().add_class("rcm-tab")
-            focus.connect("clicked",
-                          lambda _b, sess=session: rcm.focus_session(sess))
-            inner.pack_start(focus, False, False, 0)
-            end = Gtk.Button.new_from_icon_name(
-                "network-wired-disconnected-symbolic", Gtk.IconSize.MENU)
-            end.set_relief(Gtk.ReliefStyle.NONE)
-            end.set_tooltip_text(f"Disconnect {session.label}")
-            end.get_style_context().add_class("rcm-tab")
-            end.connect("clicked",
-                        lambda _b, sess=session: (rcm.kill_session(sess),
-                                                  self.refresh_live()))
-            inner.pack_start(end, False, False, 0)
-            card.add(inner)
+            if density < 2:
+                focus = Gtk.Button.new_from_icon_name("view-reveal-symbolic",
+                                                      Gtk.IconSize.MENU)
+                focus.set_relief(Gtk.ReliefStyle.NONE)
+                focus.set_tooltip_text(f"Focus {session.label}")
+                focus.get_style_context().add_class("rcm-tab")
+                focus.connect("clicked",
+                              lambda _b, sess=session: rcm.focus_session(sess))
+                inner.pack_start(focus, False, False, 0)
+                end = Gtk.Button.new_from_icon_name(
+                    "network-wired-disconnected-symbolic", Gtk.IconSize.MENU)
+                end.set_relief(Gtk.ReliefStyle.NONE)
+                end.set_tooltip_text(f"Disconnect {session.label}")
+                end.get_style_context().add_class("rcm-tab")
+                end.connect("clicked",
+                            lambda _b, sess=session: (rcm.kill_session(sess),
+                                                      self.refresh_live()))
+                inner.pack_start(end, False, False, 0)
+            # At the tightest density the buttons would crowd out the name,
+            # so Focus and Disconnect move to the right-click menu.
+            card_event = Gtk.EventBox()
+            card_event.add(inner)
+            card_event.connect("button-press-event", self.on_card_click,
+                               session)
+            card_event.set_tooltip_text(
+                f"{session.label} — {session.host}"
+                + ("  ·  right-click for Focus and Disconnect"
+                   if density == 2 else ""))
+            card.add(card_event)
             card.set_halign(Gtk.Align.START)
-            self.cockpit_cards.pack_start(card, False, False, 0)
+            card.set_size_request(self.CARD_WIDTHS[density] - 8, -1)
+            self.cockpit_cards.add(card)
         self.cockpit_cards.show_all()
 
     def chip_filters_allow(self, c) -> bool:
@@ -2102,6 +2220,8 @@ class Win(Gtk.Window):
         return '<span foreground="#8f9192">◌</span>'
 
     def paint_net_cells(self) -> bool:
+        if getattr(self, "_editing_cell", False):
+            return True          # never redraw a row being typed into
         if self.store is None:
             return False
         def walk(it):
@@ -3251,6 +3371,10 @@ class Win(Gtk.Window):
         self.status.set_text(msg)
 
     def _tick(self) -> bool:
+        # The 4s repaint used to land in the middle of a cell edit and cancel
+        # it -- which is why renaming only worked if you typed fast enough.
+        if getattr(self, "_editing_cell", False):
+            return True
         self.refresh_live()
         return True
 
@@ -3468,8 +3592,15 @@ class Win(Gtk.Window):
             return
         renderer.set_property("editable", True)
         renderer.connect("edited", self.on_cell_edited, column_index)
+        renderer.connect("editing-started", self.on_cell_editing, True)
+        renderer.connect("editing-canceled", self.on_cell_editing, False)
+
+    def on_cell_editing(self, _renderer, *args) -> None:
+        """Editing holds the repaints off until you are done."""
+        self._editing_cell = bool(args[-1])
 
     def on_cell_edited(self, _renderer, path, text, column_index: int) -> None:
+        self._editing_cell = False
         text = text.strip()
         if not text:
             self.say("a name cannot be empty")
