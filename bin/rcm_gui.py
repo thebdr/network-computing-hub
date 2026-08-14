@@ -263,6 +263,9 @@ class Win(Gtk.Window):
         # each with a one-line description. The choice persists as `layout =`
         # in ui.conf. Layouts not yet built in this branch are insensitive.
         self.ui_state = rcm.load_ui_state()
+        # Copy/paste holds real objects, not text: it survives a reload and
+        # knows the difference between a group and its members.
+        self.clipboard = {"conns": [], "groups": []}
         self.layout_button = Gtk.MenuButton()
         self.layout_button.set_tooltip_text("Window layout — saved in ui.conf")
         self.layout_label = Gtk.Label(label=f"Layout: {self.ui_state['layout'].title()} ▾")
@@ -497,7 +500,163 @@ class Win(Gtk.Window):
                 key_name in ("t", "T"):
             self.pin_current_query()
             return True
+        if event.state & Gdk.ModifierType.CONTROL_MASK:
+            if key_name in ("c", "C"):
+                self.copy_selection()
+                return True
+            if key_name in ("v", "V"):
+                self.paste_clipboard_here()
+                return True
         return False
+
+    @help_topic_gui("copy-paste-keys", "Copy and paste in the list",
+                    ("ctrl+c", "ctrl+v", "copy", "paste", "duplicate"),
+                    section="Connections")
+    def copy_selection(self) -> None:
+        """Ctrl+C copies the highlighted rows; Ctrl+V pastes into where you are.
+
+        Whole groups copy with everything under them. The paste target is the
+        group you have selected in the sidebar (or the group of the
+        highlighted row, or the top level) — so pasting into the same place
+        duplicates, with "(copy)" appended rather than a name clash. Copying
+        a group and pasting it straight back puts the duplicate beside the
+        original rather than inside it. Nothing is ever overwritten. The
+        selection also lands on the system clipboard as plain text, which is
+        handy for pasting a host list into a ticket.
+        """
+        rows = self.selected_rows_for_copy()
+        if not rows["conns"] and not rows["groups"]:
+            self.say("nothing selected to copy")
+            return
+        self.clipboard = rows
+        text = "\n".join([g for g in rows["groups"]]
+                         + [c.sel for c in rows["conns"]])
+        Gtk.Clipboard.get_default(Gdk.Display.get_default()).set_text(text, -1)
+        parts = []
+        if rows["conns"]:
+            parts.append(f"{len(rows['conns'])} connection(s)")
+        if rows["groups"]:
+            parts.append(f"{len(rows['groups'])} group(s)")
+        self.say("copied " + " and ".join(parts) + " — Ctrl+V pastes into "
+                 "the selected group")
+
+    def selected_rows_for_copy(self) -> dict:
+        """Highlighted rows split into whole groups and loose connections.
+
+        A group row copies as a group (its subtree comes along), so its
+        members are not also listed individually.
+        """
+        out = {"conns": [], "groups": []}
+        if self.tree is None:
+            return out
+        model, paths = self.tree.get_selection().get_selected_rows()
+        picked_groups: list[str] = []
+        for path in paths:
+            it = model.get_iter(path)
+            if not model[it][C_SEL]:
+                group = self.group_of_row(model, it)
+                if group:
+                    picked_groups.append(group)
+        for path in paths:
+            it = model.get_iter(path)
+            sel = model[it][C_SEL]
+            if not sel:
+                continue
+            c = rcm.find(sel)
+            if c and not any(c.group == g or c.group.startswith(g + "/")
+                             for g in picked_groups):
+                out["conns"].append(c)
+        out["groups"] = picked_groups
+        return out
+
+    def group_of_row(self, model, it) -> str:
+        """Full group path of a heading row, rebuilt from its ancestors."""
+        parts = []
+        node = it
+        while node is not None:
+            if not model[node][C_SEL]:
+                label = model[node][C_LABEL]
+                parts.append(re.sub(r"<[^>]+>", "", label).strip())
+            node = model.iter_parent(node)
+        return "/".join(reversed([p for p in parts if p]))
+
+    def paste_target_group(self) -> str:
+        """Where a paste lands: sidebar group, else the highlighted row's."""
+        query = getattr(self, "query_group", "")
+        if query and not query.startswith(("tag:", "workspace:",
+                                           self.SIDEBAR_HEADER)):
+            return query
+        if self.tree is not None:
+            model, paths = self.tree.get_selection().get_selected_rows()
+            if paths:
+                it = model.get_iter(paths[0])
+                sel = model[it][C_SEL]
+                if sel:
+                    c = rcm.find(sel)
+                    return c.group if c else ""
+                return self.group_of_row(model, it)
+        return ""
+
+    def paste_clipboard_here(self) -> None:
+        board = getattr(self, "clipboard", None)
+        if not board or (not board["conns"] and not board["groups"]):
+            self.say("clipboard is empty — Ctrl+C copies the selection first")
+            return
+        target = self.paste_target_group()
+        # Copying a group and pasting with it still selected means "duplicate
+        # this", not the impossible "put it inside itself": such a group lands
+        # beside the original instead.
+        plans: dict[str, dict] = {target: {"conns": board["conns"],
+                                           "groups": []}}
+        for group in board["groups"]:
+            where = target
+            if where == group or where.startswith(group + "/"):
+                where = group.rsplit("/", 1)[0] if "/" in group else ""
+            plans.setdefault(where, {"conns": [], "groups": []})
+            plans[where]["groups"].append(group)
+        made: list[str] = []
+        try:
+            for where, work in plans.items():
+                if work["conns"] or work["groups"]:
+                    made += rcm.paste_into(where, work["conns"],
+                                           work["groups"])
+        except (OSError, ValueError) as problem:
+            self._dialog(Gtk.MessageType.ERROR, "Cannot paste", str(problem))
+            return
+        rcm.gen_launcher()
+        self.reload()
+        # Land the selection on what was just created: it shows the result,
+        # and it keeps the paste target put for a second Ctrl+V (reload
+        # clears the selection, which would silently retarget the top level).
+        self.select_after_paste(made)
+        where = target or "the top level"
+        self.say(f"pasted {len(made)} item(s) into {where}"
+                 + (f" — {made[0].rsplit('/', 1)[-1]}" if len(made) == 1
+                    else ""))
+
+    def select_after_paste(self, made: list[str]) -> None:
+        wanted = set(made)
+        if getattr(self, "icon_box", None) is not None:
+            self.icon_box.unselect_all()
+            for child in self.icon_box.get_children():
+                if getattr(child, "rcm_sel", "") in wanted:
+                    self.icon_box.select_child(child)
+            return
+        if self.tree is None:
+            return
+        selection = self.tree.get_selection()
+        selection.unselect_all()
+        self.tree.expand_all()
+
+        def walk(it):
+            while it is not None:
+                sel = self.store[it][C_SEL]
+                if sel in wanted or (not sel and
+                                     self.group_of_row(self.store, it) in wanted):
+                    selection.select_iter(it)
+                walk(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        walk(self.store.get_iter_first())
 
     def connection_matches_query(self, c) -> bool:
         query = self.query_group
@@ -545,7 +704,9 @@ class Win(Gtk.Window):
             child.destroy()
         for name in ("tree", "store", "slist", "sstore", "button_box", "sidebar",
                      "setup_badge", "filter_entry", "inspector_store",
-                     "cockpit_cards", "cards_revealer", "select_all_check"):
+                     "cockpit_cards", "cards_revealer", "select_all_check",
+                     "icon_box", "details_grid", "details_title",
+                     "details_edit"):
             setattr(self, name, None)
 
     def apply_layout(self, layout_id: str) -> None:
@@ -955,10 +1116,11 @@ class Win(Gtk.Window):
         The filter is always front and centre, and matches highlight while you
         type. The group sidebar collapses with the ⊞ button (remembered in
         ui.conf), turning the same layout from sidebar-navigation into a pure
-        filter view. Live sessions appear as a strip of cards — protocol chip,
-        name, Focus/Disconnect — only while any exist, so an idle window gives
-        every pixel to the list. The Live and per-protocol chips beside the
-        filter narrow the list to matching rows.
+        filter view. Live sessions appear as a strip of one-line cards —
+        protocol chip and name, with 👁 to focus and the unplugged-cable icon
+        to disconnect — only while any exist, so an idle window gives every
+        pixel to the list. The Live and per-protocol chips beside the filter
+        narrow the list to matching rows.
         """
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         outer.set_border_width(8)
@@ -969,6 +1131,8 @@ class Win(Gtk.Window):
         self.cockpit_cards.set_selection_mode(Gtk.SelectionMode.NONE)
         self.cockpit_cards.set_max_children_per_line(6)
         self.cockpit_cards.set_min_children_per_line(2)
+        self.cockpit_cards.set_row_spacing(2)
+        self.cockpit_cards.set_column_spacing(4)
         self.cards_revealer.add(self.cockpit_cards)
         outer.pack_start(self.cards_revealer, False, False, 0)
 
@@ -977,6 +1141,22 @@ class Win(Gtk.Window):
         sidebar_toggle.set_tooltip_text("Show or hide the group sidebar")
         sidebar_toggle.set_active(self.ui_state.get("sidebar", True))
         row.pack_start(sidebar_toggle, False, False, 0)
+        icons_on = self.ui_state.get("browse_view", "list") == "icons"
+        view_toggle = Gtk.ToggleButton()
+        view_toggle.add(Gtk.Image.new_from_icon_name(
+            "view-list-symbolic" if icons_on else "view-grid-symbolic",
+            Gtk.IconSize.MENU))
+        view_toggle.set_active(icons_on)
+        view_toggle.set_tooltip_text("Switch between the row list and the "
+                                     "machine icons")
+
+        def on_view_toggled(button):
+            self.ui_state["browse_view"] = ("icons" if button.get_active()
+                                            else "list")
+            rcm.save_ui_state(self.ui_state)
+            self.apply_layout("browse")
+        view_toggle.connect("toggled", on_view_toggled)
+        row.pack_start(view_toggle, False, False, 0)
         self.filter_entry = Gtk.SearchEntry()
         self.filter_entry.set_placeholder_text(
             "matches name · host · group · user   (Ctrl+T pins as tab)")
@@ -1031,7 +1211,8 @@ class Win(Gtk.Window):
         self.setup_badge.connect("clicked", lambda *_: self.on_setup())
         side.pack_start(self.setup_badge, False, False, 0)
         paned.pack1(side, False, False)
-        paned.pack2(self.build_connection_list(), True, False)
+        paned.pack2(self.build_icon_view() if icons_on
+                    else self.build_connection_list(), True, False)
         paned.set_position(190 if sidebar_toggle.get_active() else 0)
         outer.pack_start(paned, True, True, 0)
 
@@ -1053,6 +1234,211 @@ class Win(Gtk.Window):
     # \x01 survives GTK's C strings (\x00 truncated to "", which reads as
     # the All row) and no real directory will ever be named this.
     SIDEBAR_HEADER = "\x01header"
+
+    @help_topic_gui("icon-view", "The icon view", ("icons", "grid", "tiles",
+                    "details pane", "machines"), section="The window")
+    def build_icon_view(self):
+        """Browse can show machines instead of rows — the ⊞/▦ button switches.
+
+        Each connection is one machine: a computer with its protocol chips on
+        it, its name and host underneath. Double-click a chip to connect over
+        that protocol; double-click anywhere else on the tile for its default
+        one. Single-click fills the details pane on the right, which is the
+        whole record — host, user, protocols, shortcut, tags, gateway, hooks,
+        where its password comes from — so the grid stays uncluttered without
+        hiding anything. The choice is saved as `browse_view` in ui.conf.
+        """
+        split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        self.icon_box = Gtk.FlowBox()
+        self.icon_box.set_valign(Gtk.Align.START)
+        self.icon_box.set_max_children_per_line(12)
+        self.icon_box.set_min_children_per_line(2)
+        self.icon_box.set_row_spacing(6)
+        self.icon_box.set_column_spacing(6)
+        self.icon_box.set_border_width(6)
+        self.icon_box.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+        self.icon_box.connect("selected-children-changed",
+                              lambda *_: self.refresh_details_pane())
+        self.icon_box.connect("child-activated", self.on_tile_activated)
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.add(self.icon_box)
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        split.pack1(scroller, True, False)
+
+        details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        details.set_border_width(10)
+        self.details_title = Gtk.Label(xalign=0)
+        self.details_title.set_line_wrap(True)
+        details.pack_start(self.details_title, False, False, 0)
+        self.details_grid = Gtk.Grid(column_spacing=10, row_spacing=4)
+        details.pack_start(self.details_grid, False, False, 0)
+        self.details_edit = Gtk.Button(label="Edit…")
+        self.details_edit.connect("clicked", lambda *_: self.on_edit())
+        self.details_edit.set_halign(Gtk.Align.START)
+        details.pack_end(self.details_edit, False, False, 0)
+        details_scroller = Gtk.ScrolledWindow()
+        details_scroller.set_policy(Gtk.PolicyType.NEVER,
+                                    Gtk.PolicyType.AUTOMATIC)
+        details_scroller.set_min_content_width(280)
+        details_scroller.add(details)
+        split.pack2(details_scroller, False, True)
+        split.set_position(640)
+        self.refresh_details_pane()
+        return split
+
+    def refresh_icon_view(self) -> None:
+        """Rebuild the tiles from the current filter."""
+        if getattr(self, "icon_box", None) is None:
+            return
+        for child in self.icon_box.get_children():
+            child.destroy()
+        registry = protocols_safe()
+        live = rcm.active_sels()
+        shown = 0
+        for c in rcm.conns_cached():
+            if not (self.connection_matches_query(c)
+                    and self.chip_filters_allow(c)):
+                continue
+            shown += 1
+            tile = Gtk.FlowBoxChild()
+            tile.rcm_sel = c.sel
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            box.set_border_width(6)
+
+            # The machine, with its protocols sitting on it.
+            overlay = Gtk.Overlay()
+            machine = Gtk.Image.new_from_icon_name("computer",
+                                                   Gtk.IconSize.DIALOG)
+            machine.set_pixel_size(56)
+            overlay.add(machine)
+            chip_row = Gtk.Box(spacing=2)
+            chip_row.set_halign(Gtk.Align.CENTER)
+            chip_row.set_valign(Gtk.Align.END)
+            for pid in c.protocols:
+                proto = registry.get(pid)
+                if not proto:
+                    continue
+                chip = Gtk.EventBox()
+                chip.rcm_pid = pid
+                label = Gtk.Label()
+                label.set_markup(
+                    f'<span background="{resolve_colour(proto.color)}" '
+                    f'foreground="#ffffff" size="x-small"> '
+                    f'{GLib.markup_escape_text(proto.label)} </span>')
+                chip.add(label)
+                chip.set_tooltip_text(
+                    f"double-click: connect {c.sel} over {proto.label}")
+                chip.connect("button-press-event", self.on_tile_chip_press,
+                             c.sel, pid)
+                chip_row.pack_start(chip, False, False, 0)
+            overlay.add_overlay(chip_row)
+            box.pack_start(overlay, False, False, 0)
+
+            name = Gtk.Label()
+            marker = "● " if c.sel in live else ""
+            name.set_markup(f"<b>{marker}{GLib.markup_escape_text(c.name)}</b>")
+            name.set_ellipsize(Pango.EllipsizeMode.END)
+            name.set_max_width_chars(18)
+            box.pack_start(name, False, False, 0)
+            host = Gtk.Label()
+            host.set_markup(f"<small>{GLib.markup_escape_text(c.host)}</small>")
+            host.get_style_context().add_class("dim-label")
+            host.set_ellipsize(Pango.EllipsizeMode.END)
+            host.set_max_width_chars(18)
+            box.pack_start(host, False, False, 0)
+            tile.add(box)
+            tile.set_tooltip_text(f"{c.sel} — double-click connects "
+                                  f"{proto_label(c.default_protocol)}")
+            self.icon_box.add(tile)
+        self.icon_box.show_all()
+        if getattr(self, "count_lbl", None):
+            total = len(rcm.conns_cached())
+            self.count_lbl.set_text(f"({shown})" if shown == total
+                                    else f"({shown} of {total})")
+
+    def on_tile_chip_press(self, _widget, event, sel: str, pid: str):
+        """Double-click a chip: that protocol. Single click still selects."""
+        if event.type == Gdk.EventType._2BUTTON_PRESS:
+            c = rcm.find(sel)
+            if c:
+                # The tile's own activation fires for the same double-click;
+                # this stamp tells it to stand down.
+                self._chip_activated = Gtk.get_current_event_time()
+                self.connect_selected(pid, "", [c])
+            return True
+        return False
+
+    def on_tile_activated(self, _box, child) -> None:
+        if Gtk.get_current_event_time() == getattr(self, "_chip_activated",
+                                                   None):
+            return          # a chip already handled this double-click
+        c = rcm.find(getattr(child, "rcm_sel", ""))
+        if c:
+            self.connect_selected(c.default_protocol, "", [c])
+
+    def selected_tiles(self) -> list:
+        if getattr(self, "icon_box", None) is None:
+            return []
+        out = []
+        for child in self.icon_box.get_selected_children():
+            c = rcm.find(getattr(child, "rcm_sel", ""))
+            if c:
+                out.append(c)
+        return out
+
+    def refresh_details_pane(self) -> None:
+        """The whole record of the selected tile, or a hint when none is."""
+        if getattr(self, "details_grid", None) is None:
+            return
+        for child in self.details_grid.get_children():
+            child.destroy()
+        picked = self.selected_tiles()
+        self.details_edit.set_sensitive(len(picked) == 1)
+        if len(picked) != 1:
+            self.details_title.set_markup(
+                "<b>{}</b>".format("select a machine for its details"
+                                   if not picked
+                                   else f"{len(picked)} machines selected"))
+            self.details_grid.show_all()
+            return
+        c = picked[0]
+        state, scope = rcm.connection_password_state(c)
+        password = {"own": "its own (keyring)",
+                    "inherited": f"inherits {scope}",
+                    "none": "none — will prompt"}.get(state, state)
+        binding = rcm.session_bindings().get(c.sel, "")
+        net = getattr(self, "net_state", {}).get(c.sel)
+        rows = [("Group", c.group or "(top level)"),
+                ("Host", c.host),
+                ("User", c.username or "(none)"),
+                ("Protocols", ", ".join(proto_label(p) for p in c.protocols)),
+                ("Default", proto_label(c.default_protocol)),
+                ("Password", password),
+                ("Shortcut", pretty_key(binding) or "—"),
+                ("Tags", ", ".join(c.tags) or "—"),
+                ("Gateway", c.extra.get("rcm-via", "") or "direct"),
+                ("Pre hook", c.extra.get("rcm-pre", "") or "—"),
+                ("Post hook", c.extra.get("rcm-post", "") or "—"),
+                ("MAC", c.extra.get("rcm-mac", "") or "not learned yet"),
+                ("Net", {True: "reachable", False: "offline"}.get(
+                    net, "not probed yet")),
+                ("Live", "yes" if c.sel in rcm.active_sels() else "no"),
+                ("File", str(c.path))]
+        self.details_title.set_markup(
+            f"<b>{GLib.markup_escape_text(c.name)}</b>")
+        for row, (label, value) in enumerate(rows):
+            key_label = Gtk.Label(xalign=0)
+            key_label.set_markup(f"<small>{label}</small>")
+            key_label.get_style_context().add_class("dim-label")
+            key_label.set_valign(Gtk.Align.START)
+            self.details_grid.attach(key_label, 0, row, 1, 1)
+            value_label = Gtk.Label(xalign=0, label=str(value))
+            value_label.set_line_wrap(True)
+            value_label.set_max_width_chars(28)
+            value_label.set_selectable(True)
+            self.details_grid.attach(value_label, 1, row, 1, 1)
+        self.details_grid.show_all()
 
     def on_sidebar_selected(self, selection) -> None:
         if getattr(self, "_sidebar_rebuilding", False):
@@ -1190,8 +1576,11 @@ class Win(Gtk.Window):
             self.cards_revealer.set_reveal_child(bool(sessions))
         for session in sessions:
             card = Gtk.Frame()
-            inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            inner.set_border_width(8)
+            # One row, not a stack: the strip sits above the list all day, so
+            # it buys its height back in rows of connections.
+            inner = Gtk.Box(spacing=6)
+            inner.set_border_width(4)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
             head = Gtk.Label(xalign=0)
             proto = next((q for q in registry.values()
                           if q.label == session.proto), None)
@@ -1199,27 +1588,32 @@ class Win(Gtk.Window):
                     f'foreground="#ffffff"> {GLib.markup_escape_text(session.proto)} '
                     f'</span>  ') if proto else ""
             head.set_markup(chip + f"<b>{GLib.markup_escape_text(session.label)}</b>")
-            inner.pack_start(head, False, False, 0)
+            text.pack_start(head, False, False, 0)
             sub = Gtk.Label(xalign=0)
             key = pretty_key(keys.get(session.label, ""))
             sub.set_markup(f"<small>{GLib.markup_escape_text(session.host)}"
                            + (f" · {key}" if key else "") + "</small>")
             sub.get_style_context().add_class("dim-label")
-            inner.pack_start(sub, False, False, 0)
-            actions = Gtk.Box(spacing=8)
-            focus = Gtk.Button(label="Focus")
+            text.pack_start(sub, False, False, 0)
+            inner.pack_start(text, True, True, 0)
+
+            focus = Gtk.Button.new_from_icon_name("view-reveal-symbolic",
+                                                  Gtk.IconSize.MENU)
             focus.set_relief(Gtk.ReliefStyle.NONE)
+            focus.set_tooltip_text(f"Focus {session.label}")
+            focus.get_style_context().add_class("rcm-tab")
             focus.connect("clicked",
                           lambda _b, sess=session: rcm.focus_session(sess))
-            actions.pack_start(focus, False, False, 0)
-            end = Gtk.Button(label="Disconnect")
+            inner.pack_start(focus, False, False, 0)
+            end = Gtk.Button.new_from_icon_name(
+                "network-wired-disconnected-symbolic", Gtk.IconSize.MENU)
             end.set_relief(Gtk.ReliefStyle.NONE)
-            end.get_style_context().add_class("destructive-action")
+            end.set_tooltip_text(f"Disconnect {session.label}")
+            end.get_style_context().add_class("rcm-tab")
             end.connect("clicked",
                         lambda _b, sess=session: (rcm.kill_session(sess),
                                                   self.refresh_live()))
-            actions.pack_start(end, False, False, 0)
-            inner.pack_start(actions, False, False, 0)
+            inner.pack_start(end, False, False, 0)
             card.add(inner)
             self.cockpit_cards.add(card)
         self.cockpit_cards.show_all()
@@ -2460,6 +2854,13 @@ class Win(Gtk.Window):
             self.reload_inspector()
             self.refresh_health()
             return
+        if getattr(self, "icon_box", None) is not None:
+            self.refresh_icon_view()
+            self.refresh_details_pane()
+            self.refresh_sidebar()
+            self.refresh_live()
+            self.refresh_health()
+            return
         if self.store is None:
             return
         keys = rcm.session_bindings()
@@ -2701,6 +3102,8 @@ class Win(Gtk.Window):
 
     def checked_sels(self) -> set[str]:
         out: set[str] = set()
+        if self.store is None:
+            return out            # icon view has no tickboxes
 
         def walk(it):
             while it:
@@ -2728,6 +3131,9 @@ class Win(Gtk.Window):
 
     def _selected_conns(self) -> list[rcm.Conn]:
         """Selected connections; a selected group row stands for all its members."""
+        if self.tree is None:
+            # Icon view: the tiles are the selection.
+            return self.selected_tiles()
         model, paths = self.tree.get_selection().get_selected_rows()
         out: list[rcm.Conn] = []
         for p in paths:
@@ -3004,6 +3410,22 @@ class Win(Gtk.Window):
             esub.append(mi)
         exp.set_submenu(esub)
         menu.append(exp)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        rows = self.selected_rows_for_copy()
+        copy_item = Gtk.MenuItem(label="Copy  (Ctrl+C)")
+        copy_item.set_sensitive(bool(rows["conns"] or rows["groups"]))
+        copy_item.connect("activate", lambda _m: self.copy_selection())
+        menu.append(copy_item)
+        board = getattr(self, "clipboard", None)
+        held = len((board or {}).get("conns", [])) + \
+            len((board or {}).get("groups", []))
+        paste_item = Gtk.MenuItem(
+            label=f"Paste {held} item(s) here  (Ctrl+V)" if held
+            else "Paste  (Ctrl+V)")
+        paste_item.set_sensitive(bool(held))
+        paste_item.connect("activate", lambda _m: self.paste_clipboard_here())
+        menu.append(paste_item)
 
         menu.append(Gtk.SeparatorMenuItem())
         for label, cb, need_one in (("Edit", self.on_edit, True),
