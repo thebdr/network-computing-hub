@@ -1774,9 +1774,13 @@ def load_workspaces() -> dict[str, list[dict]]:
 
     workspaces.conf holds one [workspace:<name>] section per set; each member
     line is `member.<n> = <sel>|<protocol>|<monitor>` (protocol and monitor
-    optional). Connecting a workspace walks its members with the usual launch
-    stagger; members that are already live are focused, never relaunched. A
-    workspace can carry its own keyboard shortcut like any connection.
+    optional; monitor is 1-based in xrandr order and the member's window is
+    moved there once it appears). Connecting a workspace walks its members
+    with the usual launch stagger; members that are already live are focused,
+    never relaunched. A workspace can carry its own keyboard shortcut —
+    `workspace:<name> = <combo>` under [sessions] in shortcuts.conf — and
+    sits in the Browse sidebar: click to see its members, double-click to
+    connect them all.
     """
     if not WORKSPACES_CONF.is_file():
         return {}
@@ -1802,12 +1806,19 @@ def load_workspaces() -> dict[str, list[dict]]:
 
 
 def connect_workspace(name: str) -> list[str]:
-    """Open every member; focus the ones already live. Returns status lines."""
+    """Open every member; focus the ones already live. Returns status lines.
+
+    A member with a monitor number gets its window moved to that monitor
+    (1-based, xrandr order) once it appears — a move, not a resize, and only
+    for members launched by this call: already-live windows stay where the
+    operator put them.
+    """
     members = load_workspaces().get(name)
     if members is None:
         raise ConfigError(f"{WORKSPACES_CONF}: no [workspace:{name}] section")
     live = active_sels()
     lines = []
+    pending_placement: list[tuple[str, str]] = []
     for position, member in enumerate(members):
         c = find(member["sel"])
         if not c:
@@ -1826,8 +1837,62 @@ def connect_workspace(name: str) -> list[str]:
             lines.append(launch(c, member["protocol"] or c.default_protocol))
         except (RuntimeError, ConfigError) as problem:
             lines.append(f"{member['sel']}: {problem}")
+            continue
+        if member["monitor"]:
+            pending_placement.append((member["sel"], member["monitor"]))
+    place_workspace_members(pending_placement, lines)
     log_event("workspace", name=name, members=len(members))
     return lines
+
+
+def monitor_geometry() -> dict[int, tuple[int, int, int, int]]:
+    """1-based monitor index -> (x, y, width, height), in xrandr order."""
+    listing = subprocess.run(["xrandr", "--listactivemonitors"],
+                             capture_output=True, text=True).stdout
+    out: dict[int, tuple[int, int, int, int]] = {}
+    for line in listing.splitlines():
+        m = re.match(r"\s*(\d+):\s+\S+\s+(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)", line)
+        if m:
+            idx, width, height, x, y = map(int, m.groups())
+            out[idx + 1] = (x, y, width, height)
+    return out
+
+
+def place_workspace_members(pending: list[tuple[str, str]], lines: list[str],
+                            wait_seconds: float = 20.0) -> None:
+    """Move freshly launched members' windows to their configured monitors.
+
+    One shared deadline for the lot: windows appear on their own schedule,
+    so keep sweeping the session list and place whatever has shown up.
+    """
+    todo: dict[str, int] = {}
+    for sel, monitor_raw in pending:
+        try:
+            todo[sel] = int(monitor_raw)
+        except ValueError:
+            lines.append(f"{sel}: monitor {monitor_raw!r} is not a number")
+    if not todo:
+        return
+    monitors = monitor_geometry()
+    deadline = time.time() + wait_seconds
+    while todo and time.time() < deadline:
+        for session in sessions():
+            wanted = todo.get(session.label)
+            if wanted is None or not session.window:
+                continue
+            geometry = monitors.get(wanted)
+            if geometry is None:
+                lines.append(f"{session.label}: monitor {wanted} not present "
+                             f"({len(monitors)} active)")
+            else:
+                xdotool("windowmove", session.window,
+                        str(geometry[0]), str(geometry[1]))
+                lines.append(f"{session.label}: placed on monitor {wanted}")
+            del todo[session.label]
+        if todo:
+            time.sleep(0.5)
+    for sel in todo:
+        lines.append(f"{sel}: window never appeared for monitor placement")
 
 
 # --------------------------------------------------------------------------- #
@@ -2199,7 +2264,9 @@ def save_shortcuts(globals_: dict[str, str], per_session: dict[str, str]) -> Non
 
 def load_shortcuts() -> tuple[dict[str, str], dict[str, str]]:
     """(global_bindings, per_session_bindings) from shortcuts.conf."""
-    cp = configparser.ConfigParser()
+    # "=" only: the default parser also splits on ":", which would eat the
+    # documented `workspace:<name> = <combo>` keys.
+    cp = configparser.ConfigParser(delimiters=("=",))
     cp.optionxform = str  # connection names are case-sensitive
     if SHORTCUTS.is_file():
         cp.read(SHORTCUTS)
@@ -2235,6 +2302,14 @@ def shortcut_specs() -> list[tuple[str, str, str, str]]:
                           f"{me} {action}", g[action]))
     for sel, binding in s.items():
         if not binding:
+            continue
+        # `workspace:<name> = <combo>` opens a whole named set, as the
+        # workspaces.conf comment has always promised.
+        if sel.startswith("workspace:"):
+            name = sel.split(":", 1)[1].strip()
+            specs.append((f"rcm-workspace-{slugify(name)}",
+                          f"rcm: workspace {name}",
+                          f"{me} workspace {shlex.quote(name)}", binding))
             continue
         specs.append((f"rcm-goto-{slugify(sel)}", f"rcm: {sel}",
                       f"{me} goto {shlex.quote(sel)}", binding))
