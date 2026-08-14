@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import shlex
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -1067,22 +1068,30 @@ class Win(Gtk.Window):
     def run_script_dialog(self, conns: list) -> None:
         """Right-click ▸ Run script sends one script to every selected host.
 
-        Scripts are plain files in scripts/ — hand-editable and git-friendly.
-        Each host gets a verdict (✓ ok, ⟳ running, ✗ with its exit code and a
-        log link); "stop on first failure" halts the batch, Abort cancels the
-        rest. Transport is SSH when the host answers, WinRM otherwise. Output
-        is captured under logs/output/.
+        Scripts are plain files in scripts/ — hand-editable and git-friendly,
+        sent verbatim (no placeholder substitution; that is Send script's
+        job). Transport per host: SSH when port 22 answers (key auth — there
+        is no terminal to type a password into), else PowerShell over WinRM
+        (5985/5986, credentials from the chain; pywinrm installs itself on
+        first use). Each host's verdict stays in the dialog — ✓ ok,
+        ⟳ running, ✗ with its exit code — and double-clicking a finished row
+        opens its captured output under logs/output/. "Stop on first
+        failure" skips the rest after a ✗; Abort stops between hosts.
         """
         scripts_dir = rcm.APP / "scripts"
-        scripts = sorted(scripts_dir.glob("*")) if scripts_dir.is_dir() else []
+        scripts = sorted(f for f in scripts_dir.glob("*") if f.is_file()) \
+            if scripts_dir.is_dir() else []
         if not scripts:
             self._dialog(Gtk.MessageType.INFO, "No scripts",
                          f"Put runnable files in {scripts_dir} first.")
             return
         d = Gtk.Dialog(title=f"Run script on {len(conns)} host(s)",
-                       transient_for=self, modal=True)
-        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                      "Run", Gtk.ResponseType.OK)
+                       transient_for=self, modal=False)
+        close_btn = d.add_button(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
+        abort_btn = d.add_button("Abort", 1)
+        run_btn = d.add_button("Run", Gtk.ResponseType.OK)
+        abort_btn.set_sensitive(False)
+        d.set_default_response(Gtk.ResponseType.OK)
         box = d.get_content_area()
         box.set_border_width(10)
         box.set_spacing(6)
@@ -1091,57 +1100,172 @@ class Win(Gtk.Window):
             chooser.append_text(script.name)
         chooser.set_active(0)
         box.add(chooser)
+        transport_note = Gtk.Label(xalign=0)
+        transport_note.set_markup(
+            "<small>transport: SSH if 22 answers, else PowerShell (WinRM) · "
+            "sent, run, exit code collected</small>")
+        transport_note.get_style_context().add_class("dim-label")
+        box.add(transport_note)
         stop_toggle = Gtk.CheckButton(label="Stop on first failure")
         stop_toggle.set_active(True)
         box.add(stop_toggle)
-        results = Gtk.ListStore(str, str)
+        results = Gtk.ListStore(str, str, str)   # sel, verdict, output path
         view = Gtk.TreeView(model=results)
         for i, title in enumerate(("Host", "Result")):
             view.append_column(Gtk.TreeViewColumn(
                 title, Gtk.CellRendererText(), text=i))
-        box.add(view)
-        d.show_all()
-        if chooser.get_active_text():
-            for c in conns:
-                results.append([c.sel, "⟳ queued"])
-        response = d.run()
-        script_name = chooser.get_active_text()
-        stop_on_fail = stop_toggle.get_active()
-        d.destroy()
-        if response != Gtk.ResponseType.OK or not script_name:
-            return
-        self.run_script(scripts_dir / script_name, conns, stop_on_fail)
+        view.set_tooltip_text("double-click a finished row to open its output")
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(160)
+        scroller.add(view)
+        box.pack_start(scroller, True, True, 0)
+        for c in conns:
+            results.append([c.sel, "queued", ""])
+        view.connect("row-activated",
+                     lambda _tv, path, _col:
+                     results[path][2] and rcm.spawn_detached(
+                         ["xdg-open", results[path][2]]))
 
-    def run_script(self, script_path, conns: list, stop_on_fail: bool) -> None:
-        """Execute one script per host over ssh, logging each verdict."""
-        import threading
+        abort = threading.Event()
+
+        def on_response(_d, response):
+            if response == Gtk.ResponseType.OK:
+                script_name = chooser.get_active_text()
+                if not script_name:
+                    return
+                run_btn.set_sensitive(False)
+                chooser.set_sensitive(False)
+                stop_toggle.set_sensitive(False)
+                abort_btn.set_sensitive(True)
+                self._script_batch(scripts_dir / script_name, conns,
+                                   stop_toggle.get_active(), abort, results,
+                                   done=lambda: (abort_btn.set_sensitive(False),
+                                                 close_btn.grab_focus()))
+                return
+            if response == 1:            # Abort: between hosts, not mid-host
+                abort.set()
+                abort_btn.set_sensitive(False)
+                return
+            abort.set()
+            d.destroy()
+
+        d.connect("response", on_response)
+        d.show_all()
+
+    def _script_batch(self, script_path, conns: list, stop_on_fail: bool,
+                      abort: threading.Event, results, done) -> None:
+        """Worker thread: one host after another, verdicts into `results`."""
         output_dir = rcm.LOGS_DIR / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+
+        def set_row(i, verdict, out_path=""):
+            def apply():
+                results[i][1] = verdict
+                if out_path:
+                    results[i][2] = out_path
+            GLib.idle_add(apply)
 
         def worker():
-            for c in conns:
-                target = f"{c.username}@{c.host}"
+            counts = {"ok": 0, "fail": 0}
+            for i, c in enumerate(conns):
+                if abort.is_set():
+                    set_row(i, "— aborted")
+                    continue
+                if counts["fail"] and stop_on_fail:
+                    set_row(i, "— skipped")
+                    continue
+                set_row(i, "⟳ running…")
+                out_file = output_dir / f"{rcm.slugify(c.sel)}-{stamp}.log"
                 try:
-                    with open(script_path) as script:
-                        completed = subprocess.run(
-                            ["ssh", target, "bash -s"], stdin=script,
-                            capture_output=True, text=True, timeout=300)
-                    verdict = ("✓ ok" if completed.returncode == 0
-                               else f"✗ exit {completed.returncode}")
-                    (output_dir / f"{rcm.slugify(c.sel)}.log").write_text(
-                        completed.stdout + completed.stderr)
+                    code, output, transport = self._script_one_host(
+                        c, script_path)
+                    out_file.write_text(output)
                     rcm.log_event("script", sel=c.sel, script=script_path.name,
-                                  exit_code=completed.returncode)
-                except (OSError, subprocess.SubprocessError) as problem:
-                    verdict = f"✗ {problem}"
+                                  transport=transport, exit_code=code,
+                                  output=str(out_file))
+                    if code == 0:
+                        counts["ok"] += 1
+                        set_row(i, f"✓ ok ({transport})", str(out_file))
+                    else:
+                        counts["fail"] += 1
+                        set_row(i, f"✗ exit {code} — double-click for log",
+                                str(out_file))
+                except Exception as problem:   # noqa: BLE001 -- verdict, not crash
+                    counts["fail"] += 1
                     rcm.log_event("script", sel=c.sel, script=script_path.name,
                                   error=str(problem))
-                GLib.idle_add(self.say, f"{c.sel}: {verdict}")
-                if stop_on_fail and verdict.startswith("✗"):
-                    break
+                    set_row(i, f"✗ {problem}")
+            GLib.idle_add(done)
+            GLib.idle_add(self.say,
+                          f"{script_path.name}: {counts['ok']} ✓, "
+                          f"{counts['fail']} ✗ on {len(conns)} host(s)")
 
         threading.Thread(target=worker, daemon=True).start()
-        self.say(f"running {script_path.name} on {len(conns)} host(s)…")
+
+    def _script_one_host(self, c, script_path) -> tuple[int, str, str]:
+        """(exit code, output, transport) for one host: SSH else WinRM."""
+        if rcm.probe_host(c.host, 22, timeout=2.0):
+            target = f"{c.username}@{c.host}" if c.username else c.host
+            with open(script_path) as script:
+                completed = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                     target, "bash -s"], stdin=script,
+                    capture_output=True, text=True, timeout=300)
+            return (completed.returncode,
+                    completed.stdout + completed.stderr, "ssh")
+        winrm_port = next((p for p in (5985, 5986)
+                           if rcm.probe_host(c.host, p, timeout=2.0)), 0)
+        if not winrm_port:
+            raise RuntimeError("no transport — nothing on 22 (ssh) "
+                               "or 5985/5986 (winrm)")
+        winrm = self._ensure_pywinrm()
+        user, pw = rcm.creds_lookup(c.sel, c.username)
+        if not pw or pw == "CHANGEME":
+            raise RuntimeError("winrm needs a password on the credential chain")
+        scheme = "https" if winrm_port == 5986 else "http"
+        session = winrm.Session(
+            f"{scheme}://{c.host}:{winrm_port}/wsman", auth=(user, pw),
+            transport="ntlm", server_cert_validation="ignore")
+        if script_path.suffix.lower() == ".ps1":
+            reply = session.run_ps(script_path.read_text(errors="replace"))
+        else:
+            # Send-then-run, same shape as the sftp path: the bytes land in
+            # %TEMP% and cmd runs them, so .bat files behave exactly as if
+            # double-clicked on the machine.
+            import base64
+            b64 = base64.b64encode(script_path.read_bytes()).decode()
+            reply = session.run_ps(
+                f"$p = Join-Path $env:TEMP 'rcm-{script_path.name}'; "
+                f"[IO.File]::WriteAllBytes($p, "
+                f"[Convert]::FromBase64String('{b64}')); "
+                "& cmd.exe /c $p; exit $LASTEXITCODE")
+        output = (reply.std_out + reply.std_err).decode(errors="replace")
+        return reply.status_code, output, f"winrm:{winrm_port}"
+
+    def _ensure_pywinrm(self):
+        """Import pywinrm, pip-installing --user on first WinRM use."""
+        try:
+            import winrm
+            return winrm
+        except ImportError:
+            pass
+        GLib.idle_add(self.say, "installing pywinrm (first WinRM use)…")
+        import sys
+        done = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--user", "pywinrm"],
+            capture_output=True, text=True, timeout=300)
+        if done.returncode != 0:
+            tail = (done.stderr.strip() or "?").splitlines()[-1]
+            raise RuntimeError(f"pip install --user pywinrm failed: {tail}")
+        import importlib
+        import site
+        importlib.invalidate_caches()
+        if site.getusersitepackages() not in sys.path:
+            sys.path.append(site.getusersitepackages())
+        import winrm
+        return winrm
 
     @help_topic_gui("logs-page", "The Logs page", ("logs", "history", "audit"),
                     section="Logs")
