@@ -1859,7 +1859,10 @@ class Win(Gtk.Window):
         kept, shown as e.g. "port 5901 kept", and return on re-tick.
 
         The password override and the shortcut live in their own expanders;
-        a blank password always means "leave as is".
+        a blank password always means "leave as is". Hooks & gateway holds
+        the pre/post commands (pre must exit 0 or the launch stops) and the
+        via-gateway picker for hosts that are only reachable through a
+        bastion's SSH tunnel.
         """
         new = c is None
         registry = protocols_safe()
@@ -2035,6 +2038,61 @@ class Win(Gtk.Window):
         sc_box.pack_start(sc_row, False, False, 0)
         body.pack_start(shortcut_expander, False, False, 0)
 
+        # ---- hooks + via-gateway (10b/10c) -------------------------------- #
+        old_pre = c.extra.get("rcm-pre", "") if c else ""
+        old_post = c.extra.get("rcm-post", "") if c else ""
+        old_via = c.extra.get("rcm-via", "") if c else ""
+        try:
+            via_names = sorted(rcm.load_vias())
+        except rcm.ConfigError:
+            via_names = []
+        hooks_expander = Gtk.Expander(
+            label="Hooks & gateway",
+            expanded=bool(old_pre or old_post or old_via))
+        hk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        hk_box.set_border_width(6)
+        hooks_expander.add(hk_box)
+
+        def hook_row(label_text, value, placeholder):
+            row = Gtk.Box(spacing=6)
+            lab = Gtk.Label(label=label_text, xalign=0)
+            lab.set_width_chars(4)
+            row.pack_start(lab, False, False, 0)
+            entry = Gtk.Entry(text=value, activates_default=True)
+            entry.set_placeholder_text(placeholder)
+            row.pack_start(entry, True, True, 0)
+            hk_box.pack_start(row, False, False, 0)
+            return entry
+
+        pre_entry = hook_row("pre", old_pre,
+                             "must exit 0 or the launch stops")
+        post_entry = hook_row("post", old_post,
+                              "optional — runs after the launch")
+        via_row = Gtk.Box(spacing=6)
+        via_lab = Gtk.Label(label="via", xalign=0)
+        via_lab.set_width_chars(4)
+        via_row.pack_start(via_lab, False, False, 0)
+        via_combo = Gtk.ComboBoxText()
+        via_combo.append_text("(direct)")
+        for nm in via_names:
+            via_combo.append_text(nm)
+        if old_via and old_via not in via_names:
+            via_combo.append_text(f"{old_via} (missing!)")
+            via_combo.set_active(len(via_names) + 1)
+        else:
+            via_combo.set_active(via_names.index(old_via) + 1 if old_via else 0)
+        via_row.pack_start(via_combo, False, False, 0)
+        hk_box.pack_start(via_row, False, False, 0)
+        hook_hint = Gtk.Label(xalign=0)
+        hook_hint.set_markup(
+            "<small>placeholders: {host} {port} {user} {name} {file} {via}\n"
+            "via = SSH tunnel through a [via:*] gateway from protocols.conf "
+            "(key auth)</small>")
+        hook_hint.get_style_context().add_class("dim-label")
+        hook_hint.set_line_wrap(True)
+        hk_box.pack_start(hook_hint, False, False, 0)
+        body.pack_start(hooks_expander, False, False, 0)
+
         d.show_all()
         refresh_row_states()
         if d.run() != Gtk.ResponseType.OK:
@@ -2063,6 +2121,11 @@ class Win(Gtk.Window):
         new_pw = epw.get_text()
         drop_pw = clear_pw.get_active()
         new_binding = sc_btn.binding
+        new_pre = pre_entry.get_text().strip()
+        new_post = post_entry.get_text().strip()
+        via_choice = via_combo.get_active_text() or "(direct)"
+        new_via = ("" if via_choice == "(direct)"
+                   else via_choice.removesuffix(" (missing!)"))
         d.destroy()
 
         if not n or not h:
@@ -2091,6 +2154,12 @@ class Win(Gtk.Window):
             rcm.set_fields(target, host=h, username=u, port=rdp_port,
                            ports=ports, protocols=protos,
                            default_proto=default_pid)
+
+        for key, old, new_val in (("rcm-pre", old_pre, new_pre),
+                                  ("rcm-post", old_post, new_post),
+                                  ("rcm-via", old_via, new_via)):
+            if new_val != old:
+                rcm.set_connection_extra(target, key, new_val)
 
         sel = target.sel
         if drop_pw:

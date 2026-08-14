@@ -111,3 +111,16 @@ default = Browser
 launcher.Browser = xdg-open https://{host}:{port}/
 # Deliberately unmatchable: a browser tab is not ours to track as a session.
 detect.process = ^$
+
+# --------------------------------------------------------------------------- #
+# Via-gateways: hosts only reachable through a bastion.
+# Point a connection at one (Edit > Hooks & gateway, stored as rcm-via) and
+# connecting opens `ssh -f -L <free port>:<host>:<port> <gateway> sleep <hold>`
+# first, then hands the launcher 127.0.0.1:<free port> in {host}/{port}.
+# Needs key auth to the gateway -- BatchMode never sits on a hidden prompt.
+#
+# [via:plant-gw]
+# host = gw.example.local
+# user = maint
+# ; port = 22        ; the gateway's SSH port
+# ; hold = 30        ; seconds the tunnel waits for the client to attach
