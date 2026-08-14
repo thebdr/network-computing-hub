@@ -624,8 +624,16 @@ class Win(Gtk.Window):
             GLib.idle_add(apply)
         threading.Thread(target=worker, daemon=True).start()
 
+    def install_shortcuts(self) -> tuple[int, list[str]]:
+        """shortcuts_install with the platform's answer surfaced, not raised."""
+        try:
+            return rcm.shortcuts_install()
+        except rcm.PlatformError as sorry:
+            self.say(str(sorry))
+            return 0, [str(sorry)]
+
     def on_first_run_shortcuts(self) -> None:
-        count, warnings = rcm.shortcuts_install()
+        count, warnings = self.install_shortcuts()
         self.say(f"{count} shortcut(s) installed"
                  + (f" — {warnings[0]}" if warnings else ""))
         self.apply_layout(self.ui_state["layout"])
@@ -1415,8 +1423,7 @@ class Win(Gtk.Window):
             results.append([c.sel, "queued", ""])
         view.connect("row-activated",
                      lambda _tv, path, _col:
-                     results[path][2] and rcm.spawn_detached(
-                         ["xdg-open", results[path][2]]))
+                     results[path][2] and rcm.open_path(results[path][2]))
 
         abort = threading.Event()
 
@@ -1882,8 +1889,7 @@ class Win(Gtk.Window):
                 f"line {topic.source_line}.")
             advice.add_buttons("Open with text editor", 1, Gtk.STOCK_CLOSE, 0)
             if advice.run() == 1:
-                rcm.spawn_detached(["xdg-open",
-                                    str(rcm.APP / topic.source_file)])
+                rcm.open_path(rcm.APP / topic.source_file)
             advice.destroy()
         source_button.connect("clicked", open_source)
 
@@ -2790,7 +2796,7 @@ class Win(Gtk.Window):
             else:
                 per_session.pop(sel, None)
             rcm.save_shortcuts(gkeys, per_session)
-            rcm.shortcuts_install()
+            self.install_shortcuts()
         rcm.gen_launcher()
         self.reload()
 
@@ -3254,7 +3260,7 @@ class Win(Gtk.Window):
             gg, ss = rcm.load_shortcuts()
             ss.pop(sel, None)
             rcm.save_shortcuts(gg, ss)
-            rcm.shortcuts_install()
+            self.install_shortcuts()
             self.say(f"shortcut removed for {sel}")
             self.reload()
             d.response(Gtk.ResponseType.APPLY)   # reopen so the list redraws
@@ -3288,7 +3294,7 @@ class Win(Gtk.Window):
                 warn.set_markup("<small>" + "; ".join(clashes) + "</small>")
                 return
             rcm.save_shortcuts(gg, ss)
-            n, warnings = rcm.shortcuts_install()
+            n, warnings = self.install_shortcuts()
             warn.set_markup("<small>" + ("; ".join(warnings) if warnings else "") +
                             "</small>")
             self.say(f"{n} shortcut(s) saved and registered with Cinnamon")

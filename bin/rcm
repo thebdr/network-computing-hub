@@ -40,6 +40,7 @@ from pathlib import Path
 # path; rcm_gui/rcm_switch are imported the same way further down.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rcm_help import HELP_TOPICS, help_topic, register_topic  # noqa: E402
+from rcm_platform import PLATFORM, PlatformError  # noqa: E402
 
 APP = Path(__file__).resolve().parent.parent
 RDP_DIR = APP / "RDP"
@@ -215,56 +216,24 @@ def creds_path() -> Path | None:
 # Passwords live in the login keyring (libsecret), encrypted at rest and unlocked
 # with the session. creds.conf keeps only "key|username" -- no secret material.
 # A third field there is still honoured so pre-keyring files keep working.
-_KEYRING_BACKEND = None
-
-
-def keyring_backend():
-    global _KEYRING_BACKEND
-    if _KEYRING_BACKEND is None:
-        try:
-            import gi
-            gi.require_version("Secret", "1")
-            from gi.repository import Secret
-            _KEYRING_BACKEND = (Secret, Secret.Schema.new(
-                "org.hyper.rcm", Secret.SchemaFlags.NONE,
-                {"app": Secret.SchemaAttributeType.STRING,
-                 "key": Secret.SchemaAttributeType.STRING}))
-        except Exception:
-            _KEYRING_BACKEND = (None, None)
-    return _KEYRING_BACKEND
+# Storage itself is the platform's: libsecret here, Credential Locker on
+# Windows -- rcm_platform owns the difference.
 
 
 def keyring_available() -> bool:
-    return keyring_backend()[0] is not None
+    return PLATFORM.secret_available()
 
 
 def secret_get(key: str) -> str:
-    Secret, schema = keyring_backend()
-    if not Secret:
-        return ""
-    try:
-        return Secret.password_lookup_sync(schema, {"app": "rcm", "key": key}, None) or ""
-    except Exception:
-        return ""
+    return PLATFORM.secret_get(key)
 
 
 def secret_set(key: str, password: str) -> bool:
-    Secret, schema = keyring_backend()
-    if not Secret:
-        return False
-    return bool(Secret.password_store_sync(
-        schema, {"app": "rcm", "key": key}, Secret.COLLECTION_DEFAULT,
-        f"rcm credential for {key}", password, None))
+    return PLATFORM.secret_set(key, password)
 
 
 def secret_clear(key: str) -> bool:
-    Secret, schema = keyring_backend()
-    if not Secret:
-        return False
-    try:
-        return bool(Secret.password_clear_sync(schema, {"app": "rcm", "key": key}, None))
-    except Exception:
-        return False
+    return PLATFORM.secret_clear(key)
 
 
 def creds_conf_table() -> dict[str, tuple[str, str]]:
@@ -577,11 +546,12 @@ def set_fields(c: Conn, host: str | None = None, username: str | None = None,
 # launching
 # --------------------------------------------------------------------------- #
 def spawn_detached(argv: list[str], env: dict | None = None) -> None:
-    e = dict(os.environ)
-    if env:
-        e.update(env)
-    subprocess.Popen(argv, env=e, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    PLATFORM.spawn_detached(argv, env)
+
+
+def open_path(target) -> None:
+    """Open a file or URL with the desktop's opener (xdg-open here)."""
+    PLATFORM.open_path(str(target))
 
 
 class ConfigError(RuntimeError):
@@ -1248,11 +1218,9 @@ def inject_credentials(c: Conn, p: Protocol, argv: list[str]) -> str:
     /password: switch by design, and others are the same) is handled by a step
     list in protocols.conf rather than bespoke code.
     """
-    # xdotool cannot inject under Wayland; without this it fails silently.
-    if os.environ.get("XDG_SESSION_TYPE", "x11") != "x11":
-        raise RuntimeError(
-            f"session is {os.environ.get('XDG_SESSION_TYPE')}, not X11 -- "
-            "credential typing will not work (ydotool is the fallback)")
+    problem = PLATFORM.credential_typing_problem()
+    if problem:
+        raise RuntimeError(problem)
 
     user, pw = creds_lookup(c.sel, c.username, proto=p.id)
     win, _ = open_credential_prompt(p, c.host, argv)
@@ -1315,11 +1283,7 @@ def launch_rdp(c: Conn) -> None:
 
 
 def xdotool(*args: str) -> str:
-    try:
-        return subprocess.run(["xdotool", *args], capture_output=True,
-                              text=True, timeout=10).stdout.strip()
-    except Exception:
-        return ""
+    return PLATFORM.xdotool(*args)
 
 
 def capture_window(win: str, dest: Path) -> Path | None:
@@ -1328,8 +1292,6 @@ def capture_window(win: str, dest: Path) -> Path | None:
     Wine draws dialog controls inside a single X window, so no X query can say
     which field holds the caret. A picture can.
     """
-    if not shutil.which("gnome-screenshot"):
-        return None
     try:
         from PIL import Image
     except ImportError:
@@ -1346,8 +1308,7 @@ def capture_window(win: str, dest: Path) -> Path | None:
         return None
     full = Path(tempfile.mkstemp(suffix=".png")[1])
     try:
-        subprocess.run(["gnome-screenshot", "--file", str(full)], capture_output=True)
-        if not full.stat().st_size:
+        if not PLATFORM.screenshot_to(full):
             return None
         im = Image.open(full)
         pad = 10
@@ -1362,19 +1323,7 @@ def capture_window(win: str, dest: Path) -> Path | None:
 
 
 def process_command_lines() -> list[tuple[int, str]]:
-    out = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
-                         text=True).stdout
-    rows = []
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        pid, _, args = line.partition(" ")
-        try:
-            rows.append((int(pid), args.strip()))
-        except ValueError:
-            pass
-    return rows
+    return PLATFORM.process_command_lines()
 
 
 def launcher_exe(p: Protocol, tmpl: str) -> str:
@@ -1851,15 +1800,7 @@ def connect_workspace(name: str) -> list[str]:
 
 def monitor_geometry() -> dict[int, tuple[int, int, int, int]]:
     """1-based monitor index -> (x, y, width, height), in xrandr order."""
-    listing = subprocess.run(["xrandr", "--listactivemonitors"],
-                             capture_output=True, text=True).stdout
-    out: dict[int, tuple[int, int, int, int]] = {}
-    for line in listing.splitlines():
-        m = re.match(r"\s*(\d+):\s+\S+\s+(\d+)/\d+x(\d+)/\d+\+(\d+)\+(\d+)", line)
-        if m:
-            idx, width, height, x, y = map(int, m.groups())
-            out[idx + 1] = (x, y, width, height)
-    return out
+    return PLATFORM.monitor_geometry()
 
 
 def place_workspace_members(pending: list[tuple[str, str]], lines: list[str],
@@ -1964,10 +1905,7 @@ def probe_host(host: str, port: int, timeout: float = 1.0) -> bool:
 
 def learn_mac(host: str) -> str:
     """The MAC from the ARP table after a successful connect, else ''."""
-    neigh = subprocess.run(["ip", "neigh", "show", host],
-                           capture_output=True, text=True).stdout
-    match = re.search(r"lladdr\s+([0-9a-f:]{17})", neigh)
-    return match.group(1) if match else ""
+    return PLATFORM.mac_for_host(host)
 
 
 @help_topic("wake-on-lan", "Wake-on-LAN", ("wol", "wake", "magic packet", "mac"),
@@ -2153,8 +2091,7 @@ GS_ITEM = "org.cinnamon.desktop.keybindings.custom-keybinding"
 
 def notify(msg: str) -> None:
     """Desktop notification -- shortcuts run detached, so stdout goes nowhere."""
-    subprocess.run(["notify-send", "-a", "Remote Connections", "-t", "2500",
-                    "Remote Connections", msg], capture_output=True)
+    PLATFORM.notify(msg)
 
 
 def gui_window() -> str:
@@ -2322,6 +2259,10 @@ def shortcut_specs() -> list[tuple[str, str, str, str]]:
 
 
 def shortcuts_install() -> tuple[int, list[str]]:
+    if not PLATFORM.system_shortcuts:
+        raise PlatformError("system shortcuts are not available on "
+                            f"{PLATFORM.name} yet -- the tray agent phase of "
+                            "the port plan owns hotkeys there")
     specs = shortcut_specs()
     warnings = []
     for _id, _name, _cmd, binding in specs:
@@ -2345,6 +2286,8 @@ def shortcuts_install() -> tuple[int, list[str]]:
 
 
 def shortcuts_remove() -> int:
+    if not PLATFORM.system_shortcuts:
+        return 0
     current = parse_gsettings_list(run_gsettings("get", GS_LIST, "custom-list"))
     mine = [i for i in current if i.startswith("rcm-")]
     for _id in mine:
@@ -2381,6 +2324,10 @@ def icon_installed() -> bool:
 
 def install_icon() -> list[str]:
     """Install the app icon into the user's hicolor theme."""
+    if not PLATFORM.desktop_files:
+        raise PlatformError(f"hicolor icon themes do not exist on "
+                            f"{PLATFORM.name}; the installer phase of the "
+                            "port plan covers Windows shortcuts")
     if not ICON_SVG.is_file():
         raise RuntimeError(f"missing {ICON_SVG}")
     written = []
@@ -2432,6 +2379,8 @@ def quote_exec_argument(s: str) -> str:
 
 
 def gen_launcher() -> int:
+    if not PLATFORM.desktop_files:
+        return 0    # .desktop files are a freedesktop concept; nothing to do
     me = Path(__file__).resolve()
     # The .desktop is about to reference the icon by name, so make sure it exists.
     if not icon_installed():
@@ -2905,7 +2854,11 @@ def main(argv: list[str]) -> int:
                     print(f"      conflict: also bound to {conflict}")
             return 0
         if sub == "install":
-            n, warnings = shortcuts_install()
+            try:
+                n, warnings = shortcuts_install()
+            except PlatformError as e:
+                print(f"rcm: {e}", file=sys.stderr)
+                return 1
             for w in warnings:
                 print(f"  warning: {w}")
             print(f"{n} shortcut(s) registered with Cinnamon")
