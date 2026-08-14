@@ -1019,8 +1019,12 @@ class Win(Gtk.Window):
         With the VTE library present the terminal opens in a tab in the bottom
         pane and shows exact live state — the shell is a child of this process.
         Without VTE it falls back to launching your external terminal. Multiple
-        hosts open one tab each. "Send script" feeds a script's lines into the
-        live terminal with the usual placeholder substitution.
+        hosts open one tab each. Right-click the terminal for Send script — it
+        types a file from scripts/ into the live session, substituting the
+        known {placeholders} ({host} {port} {user} {name} {file} {via}) and
+        leaving every other brace alone, since shell scripts have plenty of
+        their own. {password} is deliberately not substituted: a terminal is
+        scrollback, and scrollback is where passwords go to be found.
         """
         if not HAVE_VTE:
             rcm.spawn_detached(["x-terminal-emulator", "-e",
@@ -1030,6 +1034,8 @@ class Win(Gtk.Window):
             return
         self.ensure_terminal_pane()
         terminal = Vte.Terminal()
+        terminal.rcm_conn = c
+        terminal.connect("button-press-event", self.on_terminal_click)
         terminal.spawn_async(
             Vte.PtyFlags.DEFAULT, None,
             ["/usr/bin/ssh", f"{c.username}@{c.host}"], None,
@@ -1049,6 +1055,66 @@ class Win(Gtk.Window):
         self.terminal_notebook.set_current_page(page)
         self.terminal_pane.set_reveal_child(True)
         rcm.log_event("terminal", sel=c.sel, transport=transport)
+
+    def on_terminal_click(self, terminal, event):
+        if event.button != 3:
+            return False
+        menu = Gtk.Menu()
+        send = Gtk.MenuItem(label="Send script")
+        scripts_dir = rcm.APP / "scripts"
+        scripts = sorted(f for f in scripts_dir.glob("*") if f.is_file()) \
+            if scripts_dir.is_dir() else []
+        if scripts:
+            sub = Gtk.Menu()
+            for script in scripts:
+                mi = Gtk.MenuItem(label=script.name)
+                mi.connect("activate",
+                           lambda _m, path=script:
+                           self.send_script_to_terminal(terminal, path))
+                sub.append(mi)
+            send.set_submenu(sub)
+        else:
+            send.set_sensitive(False)
+        menu.append(send)
+        menu.append(Gtk.SeparatorMenuItem())
+        copy_item = Gtk.MenuItem(label="Copy")
+        copy_item.connect(
+            "activate",
+            lambda *_: terminal.copy_clipboard_format(Vte.Format.TEXT)
+            if hasattr(Vte, "Format") else terminal.copy_clipboard())
+        menu.append(copy_item)
+        paste_item = Gtk.MenuItem(label="Paste")
+        paste_item.connect("activate", lambda *_: terminal.paste_clipboard())
+        menu.append(paste_item)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def send_script_to_terminal(self, terminal, script_path) -> None:
+        c = terminal.rcm_conn
+        try:
+            p = rcm.protocol("ssh")
+        except rcm.ConfigError:
+            p = rcm.protocol(c.default_protocol)
+        vals = rcm.launch_placeholder_values(
+            c, p, via=(c.extra.get("rcm-via") or "").strip())
+        del vals["password"]     # never into scrollback; {password} stays put
+        text = script_path.read_text(errors="replace")
+        rendered = re.sub(r"\{(%s)\}" % "|".join(vals),
+                          lambda mo: str(vals[mo.group(1)]), text)
+        if not rendered.endswith("\n"):
+            rendered += "\n"
+        self.feed_terminal(terminal, rendered)
+        rcm.log_event("send-script", sel=c.sel, script=script_path.name)
+        self.say(f"sent {script_path.name} into the {c.sel} terminal")
+
+    @staticmethod
+    def feed_terminal(terminal, text: str) -> None:
+        data = text.encode()
+        try:
+            terminal.feed_child(data)
+        except TypeError:    # older VTE introspection wants (text, length)
+            terminal.feed_child(text, len(data))
 
     def ensure_terminal_pane(self) -> None:
         if getattr(self, "terminal_pane", None) is not None:
