@@ -329,9 +329,15 @@ named with its full path (`Plant/Line2`). Names, hosts and usernames are correct
 
 ## Roadmap
 
-- Windows support: a platform seam replacing `xdotool`/`ps`/`gsettings`, `keyring` in
-  place of libsecret, a tray agent owning `RegisterHotKey` (Windows has no per-command
-  keybinding registry, and Win+W/Win+Q are shell-reserved), PyInstaller bundling GTK
+- Windows support, in phases. **Done: the platform seam** — every OS call lives in
+  `bin/rcm_platform.py` (`LinuxX11` is the reference behaviour; `WindowsNative`
+  really implements detached spawn, process listing, ARP lookup, opening files and
+  credentials via the `keyring` package, and raises a clear `PlatformError` for
+  window control, monitor placement, credential typing and system shortcuts).
+  Still to come: the tray agent owning `RegisterHotKey` and window management
+  (Windows has no per-command keybinding registry, and Win+W/Win+Q are
+  shell-reserved), then PyInstaller bundling GTK. Nothing of the Windows class has
+  met a real Windows machine yet — its parsers are tested against fixtures.
 - VNC is implemented but has not been exercised against a real server
 - The WinRM script transport is exercised against a stub in tests, not yet against
   a real Windows host; same for via-gateways and a real bastion
