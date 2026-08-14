@@ -95,6 +95,12 @@ def build_protocol_css(protos) -> bytes:
         out.append(CSS_TEMPLATE.format(cls=protocol_css_class(pr.id), bg=colour,
                                        edge=_shift(colour, 0.8),
                                        hover=_shift(colour, 1.18)))
+    # Pinned filter tabs sit flat: the theme's button padding would make a
+    # second toolbar out of them. The slightly smaller font buys the last
+    # few pixels -- the label is the floor of a button's height.
+    out.append("button.rcm-tab { padding: 0px 8px; min-height: 0; "
+               "font-size: 85%; }\n"
+               "button.rcm-tab image { padding: 0; min-height: 0; }\n")
     return "".join(out).encode()
 
 
@@ -267,7 +273,7 @@ class Win(Gtk.Window):
         self.query_group = ""
         self.query_text = ""
         self.tab_strip = Gtk.Box(spacing=2)
-        self.tab_strip.set_border_width(4)
+        self.tab_strip.set_border_width(2)
         outer.pack_start(self.tab_strip, False, False, 0)
         self.rebuild_tab_strip()
 
@@ -354,40 +360,101 @@ class Win(Gtk.Window):
 
         def add_tab(label: str, group: str, text: str, closable: bool):
             active = (group, text) == (self.query_group, self.query_text)
-            button = Gtk.ToggleButton()
-            inner = Gtk.Box(spacing=4)
-            inner.add(Gtk.Label(label=label))
-            button.add(inner)
+            shown = label if len(label) <= 16 else label[:16] + ".."
+            button = Gtk.ToggleButton(label=shown)
+            button.rcm_tab_key = (group, text)
+            button.get_style_context().add_class("rcm-tab")
+            if closable:
+                button.set_tooltip_text(f"{label}\ndouble-click renames · "
+                                        "middle-click closes")
             button.set_active(active)
             button.connect("toggled", self.on_tab_toggled, group, text)
-            self.tab_strip.pack_start(button, False, False, 0)
-            if closable:
-                close = Gtk.Button.new_from_icon_name("window-close-symbolic",
-                                                      Gtk.IconSize.MENU)
-                close.set_relief(Gtk.ReliefStyle.NONE)
-                close.set_tooltip_text(f"Close tab {label!r}")
-                close.connect("clicked", self.on_tab_closed, label)
-                inner.add(close)
+            button.connect("button-press-event", self.on_tab_pressed,
+                           label, closable)
+            if not closable:
+                self.tab_strip.pack_start(button, False, False, 0)
+                return
+            # The ✕ is a SIBLING: a button nested inside a button never
+            # receives the click — the outer toggle eats it (seen in the
+            # wild as "tabs can't be closed").
+            close = Gtk.Button.new_from_icon_name("window-close-symbolic",
+                                                  Gtk.IconSize.MENU)
+            close.set_relief(Gtk.ReliefStyle.NONE)
+            close.get_style_context().add_class("rcm-tab")
+            close.set_tooltip_text(f"Close tab {label!r}")
+            close.connect("clicked", self.on_tab_closed, label)
+            pair = Gtk.Box()
+            pair.get_style_context().add_class("linked")
+            pair.pack_start(button, False, False, 0)
+            pair.pack_start(close, False, False, 0)
+            self.tab_strip.pack_start(pair, False, False, 0)
 
         add_tab("All", "", "", closable=False)
         for label, group, text in self.ui_state.get("tabs", []):
             add_tab(label, group, text, closable=True)
         pin = Gtk.Button.new_from_icon_name("list-add-symbolic", Gtk.IconSize.MENU)
         pin.set_relief(Gtk.ReliefStyle.NONE)
+        pin.get_style_context().add_class("rcm-tab")
         pin.set_tooltip_text("Pin the current filter as a tab (Ctrl+T)")
         pin.connect("clicked", lambda *_: self.pin_current_query())
         self.tab_strip.pack_start(pin, False, False, 0)
         self.tab_strip.show_all()
 
+    def on_tab_pressed(self, button, event, label: str, closable: bool):
+        if not closable:
+            return False
+        if event.button == 2:                          # middle-click closes
+            self.on_tab_closed(button, label)
+            return True
+        if event.button == 1 and event.type == Gdk.EventType._2BUTTON_PRESS:
+            new_label = self._ask_text("Rename tab", "Tab name", label)
+            if new_label and new_label != label:
+                if any(t[0] == new_label for t in self.ui_state["tabs"]):
+                    self.say(f"tab {new_label!r} already exists")
+                    return True
+                self.ui_state["tabs"] = [
+                    (new_label if l == label else l, g, x)
+                    for l, g, x in self.ui_state["tabs"]]
+                rcm.save_ui_state(self.ui_state)
+                self.rebuild_tab_strip()
+            return True
+        return False
+
     def on_tab_toggled(self, button, group: str, text: str) -> None:
+        if getattr(self, "_tab_syncing", False):
+            return
         if not button.get_active():
             # Re-activate: the strip behaves like radio tabs, one always active.
             if (group, text) == (self.query_group, self.query_text):
+                self._tab_syncing = True
                 button.set_active(True)
+                self._tab_syncing = False
             return
         self.query_group, self.query_text = group, text
-        self.rebuild_tab_strip()
+        self.sync_tab_states()
         self.reload()
+
+    def sync_tab_states(self) -> None:
+        """Reflect the filter in the toggles without recreating them.
+
+        Rebuilding the strip on activation destroyed the button between the
+        two presses of a double-click, so the rename gesture could never
+        pair up. Structure changes (pin, close, rename) still rebuild.
+        """
+        if getattr(self, "tab_strip", None) is None:
+            return
+        self._tab_syncing = True
+        try:
+            todo = list(self.tab_strip.get_children())
+            while todo:
+                wdg = todo.pop()
+                if isinstance(wdg, Gtk.ToggleButton):
+                    wdg.set_active(getattr(wdg, "rcm_tab_key", None)
+                                   == (self.query_group, self.query_text))
+                elif isinstance(wdg, Gtk.Box):
+                    todo += wdg.get_children()
+        finally:
+            self._tab_syncing = False
 
     def on_tab_closed(self, _button, label: str) -> None:
         self.ui_state["tabs"] = [t for t in self.ui_state["tabs"] if t[0] != label]
@@ -399,7 +466,11 @@ class Win(Gtk.Window):
         self.reload()
 
     def pin_current_query(self) -> None:
-        """Ctrl+T: the current group/text filter becomes a persistent tab."""
+        """Ctrl+T: the current group/text filter becomes a persistent tab.
+
+        Tabs rename on double-click, close on their ✕ or a middle-click, and
+        show at most 16 characters — the tooltip carries the full name.
+        """
         if not (self.query_group or self.query_text):
             self.say("nothing to pin — the All tab is already permanent")
             return
@@ -1825,6 +1896,101 @@ class Win(Gtk.Window):
         """Right-click ▸ History: the Logs page pre-filtered to one host."""
         self.show_logs(sel=c.sel)
 
+    @help_topic_gui("setup-page", "The Setup page",
+                    ("setup", "cards", "config files", "warnings"),
+                    section="The window")
+    def on_setup(self) -> None:
+        """Everything that used to hide in the menu lives on the Setup page.
+
+        Four cards — Protocols, Credentials, Keyboard shortcuts,
+        Import/Export — each fronting the same plain files you can edit by
+        hand. Warnings from the health check appear as a banner with a
+        one-click action, and the badge on the Setup entry counts them.
+        """
+        self.reset_body_references()
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        page.set_border_width(12)
+        bar = Gtk.Box(spacing=8)
+        back = Gtk.Button(label="‹ Back")
+        back.connect("clicked",
+                     lambda *_: self.apply_layout(self.ui_state["layout"]))
+        bar.pack_start(back, False, False, 0)
+        heading = Gtk.Label()
+        heading.set_markup("<b>Setup</b>")
+        bar.pack_start(heading, False, False, 0)
+        page.pack_start(bar, False, False, 0)
+
+        openers = {"protocols": self.on_protocols,
+                   "credentials": self.on_credentials,
+                   "shortcuts": self.on_shortcuts}
+        for warning in rcm.config_health():
+            banner = Gtk.Box(spacing=8)
+            mark = Gtk.Label()
+            colour = "#c04040" if warning.severity == "error" else "#b5890a"
+            mark.set_markup(f'<span foreground="{colour}">⚠ '
+                            f'{GLib.markup_escape_text(warning.message)}</span>')
+            mark.set_line_wrap(True)
+            mark.set_xalign(0)
+            banner.pack_start(mark, True, True, 0)
+            action = openers.get(warning.setup_section)
+            if action:
+                fix = Gtk.Button(label="Open…")
+                fix.connect("clicked", lambda _b, a=action: a())
+                banner.pack_end(fix, False, False, 0)
+            page.pack_start(banner, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=12,
+                        column_homogeneous=True)
+        page.pack_start(grid, False, False, 0)
+
+        def card(col, row, title, blurb, buttons):
+            frame = Gtk.Frame()
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            box.set_border_width(12)
+            frame.add(box)
+            head = Gtk.Label(xalign=0)
+            head.set_markup(f"<b>{title}</b>")
+            box.pack_start(head, False, False, 0)
+            sub = Gtk.Label(xalign=0)
+            sub.set_markup(f"<small>{GLib.markup_escape_text(blurb)}</small>")
+            sub.get_style_context().add_class("dim-label")
+            sub.set_line_wrap(True)
+            box.pack_start(sub, False, False, 0)
+            row_box = Gtk.Box(spacing=6)
+            for label, handler in buttons:
+                b = Gtk.Button(label=label)
+                b.connect("clicked", lambda _b, h=handler: h())
+                row_box.pack_start(b, False, False, 0)
+            box.pack_start(row_box, False, False, 2)
+            grid.attach(frame, col, row, 1, 1)
+
+        card(0, 0, "Protocols",
+             "protocols.conf — launchers, colours, detection, credential "
+             "typing, via-gateways",
+             [("Open…", self.on_protocols)])
+        card(1, 0, "Credentials",
+             "creds.conf maps scopes to usernames; passwords live in the "
+             "keyring only",
+             [("Open…", self.on_credentials)])
+        card(0, 1, "Keyboard shortcuts",
+             "shortcuts.conf — global keys, per-connection jumps, "
+             "workspace:<name> bindings",
+             [("Open…", self.on_shortcuts)])
+        card(1, 1, "Import / Export",
+             "CSV round-trip, .rdp files, Radmin phonebook (.rpb)",
+             [("Import…", self.on_import), ("Export…", self.on_export),
+              ("Phonebook…", self.on_phonebook)])
+
+        foot = Gtk.Label(xalign=0)
+        foot.set_markup(f"<small>all of it plain files in "
+                        f"{GLib.markup_escape_text(str(rcm.APP))} — edit by "
+                        "hand whenever you prefer; the window notices on the "
+                        "next refresh</small>")
+        foot.get_style_context().add_class("dim-label")
+        page.pack_start(foot, False, False, 0)
+        self.layout_container.pack_start(page, True, True, 0)
+        self.layout_container.show_all()
+
     @help_topic_gui("help-window", "The Help window (F1)",
                     ("help", "f1", "guide", "open code"), section="Help")
     def show_help(self, topic_id: str = "") -> None:
@@ -1960,6 +2126,7 @@ class Win(Gtk.Window):
 
     def reload(self) -> None:
         rcm.conns_cached(refresh=True)
+        self.sync_tab_states()   # sidebar/filter changes reflect in the strip
         if self.current_layout == "inspector":
             self.reload_inspector()
             self.refresh_health()
