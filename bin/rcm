@@ -512,6 +512,73 @@ def copy_conn(c: Conn, new_name: str) -> Path:
     return dest
 
 
+def unique_name(group: str, wanted: str) -> str:
+    """`wanted` if free in `group`, else "wanted (copy)", "(copy 2)", …
+
+    Asks the filesystem, not the cache: pasting several copies in one go
+    creates files the cache has not been refreshed for yet.
+    """
+    folder = (RDP_DIR / group) if group else RDP_DIR
+    if not (folder / f"{wanted}.rdp").exists():
+        return wanted
+    candidate = f"{wanted} (copy)"
+    attempt = 2
+    while (folder / f"{candidate}.rdp").exists():
+        candidate = f"{wanted} (copy {attempt})"
+        attempt += 1
+    return candidate
+
+
+def unique_group(parent: str, wanted: str) -> str:
+    """Same rule for a group folder: the free name under `parent`."""
+    base = (RDP_DIR / parent) if parent else RDP_DIR
+    if not (base / wanted).exists():
+        return wanted
+    candidate = f"{wanted} (copy)"
+    attempt = 2
+    while (base / candidate).exists():
+        candidate = f"{wanted} (copy {attempt})"
+        attempt += 1
+    return candidate
+
+
+@help_topic("copy-paste", "Copying connections and groups",
+            ("copy", "paste", "duplicate", "ctrl+c", "ctrl+v", "clipboard"),
+            section="Connections")
+def paste_into(group: str, connections: list[Conn] | None = None,
+               groups: list[str] | None = None) -> list[str]:
+    """Ctrl+C on any selection, Ctrl+V into whichever group you are in.
+
+    Copying is by file: a pasted connection is a byte copy of the .rdp,
+    keeping every rcm-* setting (tags, hooks, via, MAC, per-protocol ports).
+    A copied group brings its whole subtree. Names never collide — an
+    existing name becomes "<name> (copy)", then "(copy 2)" — so pasting into
+    the same group is how you duplicate. Passwords are NOT copied: the
+    keyring entry belongs to the original connection's name, and the copy
+    inherits from its group chain until you give it one of its own.
+    """
+    made: list[str] = []
+    for c in connections or []:
+        name = unique_name(group, c.name)
+        folder = (RDP_DIR / group) if group else RDP_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(c.path, folder / f"{name}.rdp")
+        made.append(f"{group}/{name}" if group else name)
+    for source in groups or []:
+        leaf = source.rsplit("/", 1)[-1]
+        # Pasting a group into itself or into its own subtree would recurse
+        # forever; the caller is told rather than silently skipped.
+        if group == source or group.startswith(source + "/"):
+            raise ValueError(f"cannot paste group {source!r} into itself")
+        name = unique_group(group, leaf)
+        destination = ((RDP_DIR / group) if group else RDP_DIR) / name
+        shutil.copytree(RDP_DIR / source, destination)
+        made.append(f"{group}/{name}" if group else name)
+    conns_cached(refresh=True)
+    log_event("paste", into=group or "(top level)", created=len(made))
+    return made
+
+
 def set_fields(c: Conn, host: str | None = None, username: str | None = None,
                port: int | None = None, ports: dict | None = None,
                protocols: str | None = None,
@@ -858,6 +925,9 @@ DEFAULT||
 layout = browse
 # Browse only: show the group sidebar. The ⊞ button toggles this.
 sidebar = on
+# Browse only: list | icons. Icons draws each connection as a machine with its
+# protocols on it, and a details pane beside the grid.
+browse_view = list
 
 [tabs]
 # Pinned filter tabs, shared by every layout. One per line:
@@ -1975,7 +2045,8 @@ def load_ui_state() -> dict:
     the pinned filter tabs and the sidebar toggle, shared by every layout.
     Older files naming rail, spotlight or cockpit are read as Browse.
     """
-    state = {"layout": "browse", "tabs": [], "editor": "", "sidebar": True}
+    state = {"layout": "browse", "tabs": [], "editor": "", "sidebar": True,
+             "browse_view": "list"}
     if not UI_CONF.is_file():
         return state
     parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
@@ -1985,6 +2056,8 @@ def load_ui_state() -> dict:
     layout = LEGACY_LAYOUT_NAMES.get(layout, layout)
     state["layout"] = layout if layout in LAYOUTS else "browse"
     state["sidebar"] = parser.getboolean("ui", "sidebar", fallback=True)
+    view = parser.get("ui", "browse_view", fallback="list").strip().lower()
+    state["browse_view"] = view if view in ("list", "icons") else "list"
     if parser.has_section("tabs"):
         for _key, raw in sorted(parser.items("tabs")):
             parts = (raw.split("|") + ["", "", ""])[:3]
@@ -2000,6 +2073,7 @@ def save_ui_state(state: dict) -> None:
     lines = [header.rstrip("\n"), "", "[ui]",
              f"layout = {state.get('layout', 'browse')}",
              f"sidebar = {'on' if state.get('sidebar', True) else 'off'}",
+             f"browse_view = {state.get('browse_view', 'list')}",
              "", "[tabs]"]
     for index, (label, group, text) in enumerate(state.get("tabs", []), start=1):
         lines.append(f"tab.{index} = {label}|{group}|{text}")

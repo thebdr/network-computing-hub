@@ -215,12 +215,27 @@ Two independent mechanisms, on purpose:
   specific program, edit, delete, or **Export ▸** the selection as `.rdp` files, a
   re-importable CSV, or a Radmin phonebook. A selected group means all of it.
 
+**Ctrl+C / Ctrl+V** copy connections and whole groups (subtree included) and paste
+them into whichever group you are in — the sidebar selection, else the highlighted
+row's group, else the top level. A pasted copy is a byte copy of the `.rdp`, so tags,
+hooks, gateway and per-protocol ports come along; names never collide, since an
+existing name becomes `<name> (copy)`, then `(copy 2)`. Pasting into the same place
+is therefore how you duplicate, and copying a group and pasting it straight back puts
+the duplicate beside the original rather than inside it. Passwords are deliberately
+not copied: the keyring entry belongs to the original's name, so the copy inherits
+from its group chain until you give it one of its own.
+
 ## The manager
 
 The window has three layouts (the Layout button, saved as `layout =` in `ui.conf`):
 **Browse** — the everyday view: a filter-first flat list with match highlighting, a
 collapsible group sidebar (the ⊞ button), Live and per-protocol filter chips, and
-live sessions appearing as a card strip only while any exist; **Inspector** — a
+live sessions appearing as a strip of one-line cards only while any exist — each with
+👁 to focus it and an unplugged-cable button to disconnect. Browse also has an **icon
+view** (the grid button, saved as `browse_view` in `ui.conf`): every connection as a
+machine with its protocol chips on it, double-click a chip to connect over that
+protocol, and a details pane beside the grid carrying the full record of whatever is
+selected; **Inspector** — a
 read-only audit showing where every connection's password comes from and whether its
 protocols are healthy; **Classic** — the original window. (Earlier builds shipped
 Browse's variants as separate Rail/Spotlight/Cockpit modes; they were one layout
