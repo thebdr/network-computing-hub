@@ -140,6 +140,40 @@ def protocols_safe() -> dict:
         return {}
 
 
+def event_summary(record: dict) -> str:
+    """One readable line for a log event; falls back to raw k=v pairs."""
+    kind = record.get("kind", "")
+    if kind == "script":
+        base = record.get("script", "?")
+        if "error" in record:
+            return f"{base} — {record['error']}"
+        code = record.get("exit_code")
+        extra = f" ({record['transport']})" if record.get("transport") else ""
+        return f"{base} — {'ok' if code == 0 else f'exit {code}'}{extra}"
+    if kind == "send-script":
+        return f"{record.get('script', '?')} typed into the terminal"
+    if kind == "launch":
+        text = f"{record.get('protocol', '?')} via {record.get('launcher', '?')}"
+        if record.get("via"):
+            text += f" (through {record['via']})"
+        return text
+    if kind == "terminal":
+        return f"terminal opened ({record.get('transport', 'ssh')})"
+    if kind == "probe":
+        return "came up" if record.get("state") == "up" else "went down"
+    if kind == "wake":
+        return f"magic packet → {record.get('mac', '?')}"
+    if kind == "via":
+        return (f"tunnel 127.0.0.1:{record.get('local_port')} → "
+                f"port {record.get('port')} (exit {record.get('exit_code')})")
+    if kind == "pre-hook":
+        return f"exit {record.get('exit_code')}: {record.get('command', '')}"
+    if kind == "workspace":
+        return f"{record.get('name')} — {record.get('members')} member(s)"
+    return " ".join(f"{k}={v}" for k, v in record.items()
+                    if k not in ("ts", "kind", "sel"))
+
+
 def proto_label(pid: str) -> str:
     pr = protocols_safe().get(pid)
     return pr.label if pr else pid
@@ -289,9 +323,12 @@ class Win(Gtk.Window):
             row.set_sensitive(layout_id in self.IMPLEMENTED_LAYOUTS)
             row.connect("toggled", self.on_layout_chosen, layout_id)
             box.pack_start(row, False, False, 2)
+        logs_row = Gtk.ModelButton(label="Logs…")
+        logs_row.connect("clicked", lambda *_: (popover.popdown(), self.show_logs()))
         setup_row = Gtk.ModelButton(label="Setup…")
         setup_row.connect("clicked", lambda *_: (popover.popdown(), self.on_setup()))
         box.pack_start(Gtk.Separator(), False, False, 4)
+        box.pack_start(logs_row, False, False, 0)
         box.pack_start(setup_row, False, False, 0)
         foot = Gtk.Label(xalign=0)
         foot.set_markup("<small>saved as <tt>layout =</tt> in ui.conf</small>")
@@ -760,6 +797,10 @@ class Win(Gtk.Window):
         side_scroller.add(self.sidebar)
         side.pack_start(side_scroller, True, True, 0)
         side.pack_start(Gtk.Separator(), False, False, 0)
+        logs_button = Gtk.Button(label="▤ Logs")
+        logs_button.set_relief(Gtk.ReliefStyle.NONE)
+        logs_button.connect("clicked", lambda *_: self.show_logs())
+        side.pack_start(logs_button, False, False, 0)
         self.setup_badge = Gtk.Button()
         self.setup_badge.set_relief(Gtk.ReliefStyle.NONE)
         self.setup_badge.connect("clicked", lambda *_: self.on_setup())
@@ -1335,16 +1376,22 @@ class Win(Gtk.Window):
 
     @help_topic_gui("logs-page", "The Logs page", ("logs", "history", "audit"),
                     section="Logs")
-    def show_logs(self) -> None:
+    def show_logs(self, sel: str = "") -> None:
         """Every session, script run, probe change and wake is on the Logs page.
 
-        Filter by kind and text, read the detail of any row including captured
-        script output, and Export. Right-click ▸ History on a connection opens
-        the same viewer pre-filtered to that one connection.
+        Reached from the Layout menu (Logs…), ▤ Logs under the Browse
+        sidebar, or right-click ▸ History — the same page pre-filtered to one
+        connection. The chips narrow to sessions / scripts / probes, the text
+        box matches any field, and the range reaches back up to 90 days.
+        Selecting a row shows every field the event carries, plus the
+        captured output for script runs (one file per host per run under
+        logs/output/). Export… writes exactly what the filters show, as CSV.
         """
         self.reset_body_references()
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         page.set_border_width(12)
+        holder = {"records": [], "filtered": [], "sel": sel}
+
         bar = Gtk.Box(spacing=8)
         back = Gtk.Button(label="‹ Back")
         back.connect("clicked",
@@ -1353,29 +1400,209 @@ class Win(Gtk.Window):
         heading = Gtk.Label()
         heading.set_markup("<b>Logs</b>")
         bar.pack_start(heading, False, False, 0)
+
+        chip_groups = (("All", None), ("Sessions", {"launch", "terminal"}),
+                       ("Scripts", {"script", "send-script"}),
+                       ("Probes", {"probe", "wake"}), ("Other", "other"))
+        named_union = {k for _t, kinds in chip_groups
+                       if isinstance(kinds, set) for k in kinds}
+        holder["kinds"] = None
+        chip_anchor = None
+        for title, kinds in chip_groups:
+            chip = Gtk.RadioButton.new_with_label_from_widget(chip_anchor, title)
+            chip.set_mode(False)     # draw as a toggle, not a dot
+            chip_anchor = chip_anchor or chip
+
+            def on_chip(button, kinds=kinds):
+                if button.get_active():
+                    holder["kinds"] = kinds
+                    refilter()
+            chip.connect("toggled", on_chip)
+            bar.pack_start(chip, False, False, 0)
+
+        entry = Gtk.SearchEntry()
+        entry.set_placeholder_text("filter connection, host, text…")
+        entry.connect("search-changed", lambda *_: refilter())
+        bar.pack_start(entry, True, True, 0)
+
+        days_combo = Gtk.ComboBoxText()
+        for label in ("Today", "7 days", "14 days", "30 days", "90 days"):
+            days_combo.append_text(label)
+        days_combo.set_active(2)
+
+        def on_days(_combo):
+            days = {0: 1, 1: 7, 2: 14, 3: 30, 4: 90}[days_combo.get_active()]
+            holder["records"] = rcm.read_log_events(days=days)
+            refilter()
+        days_combo.connect("changed", on_days)
+        bar.pack_start(days_combo, False, False, 0)
+
+        export_btn = Gtk.Button(label="Export…")
+        bar.pack_start(export_btn, False, False, 0)
         page.pack_start(bar, False, False, 0)
 
-        store = Gtk.ListStore(str, str, str)
-        for record in rcm.read_log_events(days=14):
-            extras = " ".join(f"{k}={v}" for k, v in record.items()
-                              if k not in ("ts", "kind"))
-            store.append([record["ts"], record["kind"], extras])
+        history_row = Gtk.Box(spacing=6)
+        history_chip = Gtk.Button()
+        history_chip.set_relief(Gtk.ReliefStyle.NONE)
+
+        def sync_history_chip():
+            if holder["sel"]:
+                history_chip.set_label(f"history: {holder['sel']}  ✕")
+                history_row.show_all()
+            else:
+                history_row.hide()
+
+        def clear_history(*_a):
+            holder["sel"] = ""
+            sync_history_chip()
+            refilter()
+        history_chip.connect("clicked", clear_history)
+        history_row.pack_start(history_chip, False, False, 0)
+        page.pack_start(history_row, False, False, 0)
+
+        store = Gtk.ListStore(str, str, str, str, int)
         view = Gtk.TreeView(model=store)
-        for i, title in enumerate(("When", "Kind", "Detail")):
-            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        for i, (title, expand) in enumerate((("Time", False), ("Kind", False),
+                                             ("Connection", False),
+                                             ("Event", True))):
+            # Only Event ellipsizes; the narrow columns show whole values.
+            renderer = Gtk.CellRendererText(
+                ellipsize=Pango.EllipsizeMode.END if expand
+                else Pango.EllipsizeMode.NONE)
             col = Gtk.TreeViewColumn(title, renderer, text=i)
             col.set_resizable(True)
+            col.set_expand(expand)
             view.append_column(col)
         scroller = Gtk.ScrolledWindow()
         scroller.add(view)
         scroller.set_shadow_type(Gtk.ShadowType.IN)
-        page.pack_start(scroller, True, True, 0)
+
+        detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        detail_head = Gtk.Box(spacing=8)
+        detail_title = Gtk.Label(xalign=0)
+        detail_title.set_markup("<small>select an event for its detail</small>")
+        detail_title.get_style_context().add_class("dim-label")
+        detail_head.pack_start(detail_title, True, True, 0)
+        copy_btn = Gtk.Button(label="Copy")
+        copy_btn.set_sensitive(False)
+        detail_head.pack_end(copy_btn, False, False, 0)
+        detail_box.pack_start(detail_head, False, False, 0)
+        detail_view = Gtk.TextView(editable=False, monospace=True)
+        detail_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        detail_scroller = Gtk.ScrolledWindow()
+        detail_scroller.add(detail_view)
+        detail_scroller.set_shadow_type(Gtk.ShadowType.IN)
+        detail_box.pack_start(detail_scroller, True, True, 0)
+
+        split = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        split.pack1(scroller, True, False)
+        split.pack2(detail_box, False, True)
+        split.set_position(320)
+        page.pack_start(split, True, True, 0)
+
+        foot = Gtk.Label(xalign=0)
+        foot.set_markup(f"<small>{GLib.markup_escape_text(str(rcm.LOGS_DIR))}"
+                        "/YYYY-MM-DD.jsonl · one line per event, plain files, "
+                        "rotated daily · script output under logs/output/"
+                        "</small>")
+        foot.get_style_context().add_class("dim-label")
+        page.pack_start(foot, False, False, 0)
+
+        def when(ts: str) -> str:
+            from datetime import datetime
+            try:
+                t = datetime.fromisoformat(ts).astimezone()
+            except ValueError:
+                return ts
+            now = datetime.now().astimezone()
+            return (t.strftime("%H:%M:%S") if t.date() == now.date()
+                    else t.strftime("%b %d %H:%M"))
+
+        def refilter(*_a):
+            text = entry.get_text().strip().lower()
+            store.clear()
+            holder["filtered"] = []
+            for record in holder["records"]:
+                if holder["sel"] and record.get("sel") != holder["sel"]:
+                    continue
+                kind = record.get("kind", "")
+                wanted = holder["kinds"]
+                if wanted == "other":
+                    if kind in named_union:
+                        continue
+                elif wanted and kind not in wanted:
+                    continue
+                if text and text not in " ".join(
+                        str(v).lower() for v in record.values()):
+                    continue
+                holder["filtered"].append(record)
+                store.append([when(record.get("ts", "")), kind,
+                              record.get("sel", ""), event_summary(record),
+                              len(holder["filtered"]) - 1])
+
+        def on_row_selected(selection):
+            model, it = selection.get_selected()
+            if not it:
+                return
+            record = holder["filtered"][model[it][4]]
+            detail_title.set_markup("<b>{}</b>  <small>{}</small>".format(
+                GLib.markup_escape_text(
+                    record.get("sel", "") or record.get("kind", "")),
+                GLib.markup_escape_text(record.get("ts", ""))))
+            lines = [f"{k} = {v}" for k, v in record.items()]
+            out_path = record.get("output", "")
+            if not out_path and record.get("kind") == "script" \
+                    and record.get("sel"):
+                legacy = (rcm.LOGS_DIR / "output"
+                          / f"{rcm.slugify(record['sel'])}.log")
+                if legacy.is_file():
+                    out_path = str(legacy)
+            if out_path and Path(out_path).is_file():
+                captured = Path(out_path).read_text(errors="replace")
+                lines += ["", f"--- captured output ({out_path}) ---",
+                          captured[-20000:]]
+            detail_view.get_buffer().set_text("\n".join(lines))
+            copy_btn.set_sensitive(True)
+        view.get_selection().connect("changed", on_row_selected)
+
+        def do_copy(*_a):
+            buffer = detail_view.get_buffer()
+            text = buffer.get_text(buffer.get_start_iter(),
+                                   buffer.get_end_iter(), False)
+            Gtk.Clipboard.get_default(Gdk.Display.get_default()).set_text(
+                text, -1)
+            self.say("event detail copied")
+        copy_btn.connect("clicked", do_copy)
+
+        def do_export(*_a):
+            dest = self._file_dialog("Export filtered log",
+                                     Gtk.FileChooserAction.SAVE,
+                                     name="rcm-log.csv")
+            if not dest:
+                return
+            import csv
+            import json
+            with open(dest, "w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["ts", "kind", "connection", "event", "raw"])
+                for record in holder["filtered"]:
+                    writer.writerow([record.get("ts", ""),
+                                     record.get("kind", ""),
+                                     record.get("sel", ""),
+                                     event_summary(record),
+                                     json.dumps(record, ensure_ascii=False)])
+            self.say(f"exported {len(holder['filtered'])} event(s) → {dest}")
+        export_btn.connect("clicked", do_export)
+
+        holder["records"] = rcm.read_log_events(days=14)
+        refilter()
         self.layout_container.pack_start(page, True, True, 0)
         self.layout_container.show_all()
+        sync_history_chip()
 
     def show_connection_history(self, c) -> None:
-        self.show_logs()   # viewer; a per-connection filter is a later refinement
-        self.say(f"history for {c.sel}")
+        """Right-click ▸ History: the Logs page pre-filtered to one host."""
+        self.show_logs(sel=c.sel)
 
     @help_topic_gui("help-window", "The Help window (F1)",
                     ("help", "f1", "guide", "open code"), section="Help")
