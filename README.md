@@ -230,11 +230,17 @@ name, so the copy inherits from its group chain until you give it one of its own
 | `Ctrl+C` / `Ctrl+V` | copy the selection · paste inside the current group |
 | `Ctrl+D` | duplicate the selection beside itself |
 | `Ctrl+E` | edit the highlighted connection |
-| `Delete` | delete the selection |
+| `Delete` | delete the selection (also on a sidebar group) |
 
-Right-clicking a group in the Browse sidebar copies, pastes into, or deletes that
-whole group; groups fold away with their expander in both the sidebar and the list,
-and stay folded until you open them again (a filter match opens what it matched).
+Right-clicking a group in the Browse sidebar copies, pastes into, **renames** or
+deletes that whole group; groups fold away with their expander in the sidebar, the
+list and the icon view, and stay folded until you open them again (a filter match
+opens what it matched).
+
+**Renaming without a dialog**: click a selected row's Connection, Host or User cell a
+second time and type — the slow double-click every file manager uses. On a group
+heading row the Connection cell renames the group, which moves the folder with
+everything in it.
 
 ## The manager
 
@@ -260,6 +266,9 @@ The hamburger menu is gone — **Setup** (sidebar footer, or the Layout menu) ca
 Protocols, Credentials, Keyboard shortcuts and Import/Export as cards over the same
 plain files. With zero connections the window opens as a first-run checklist.
 
+Pinned filter tabs belong to the connection list, so they appear with it and step
+aside on Setup, Logs and the first-run checklist.
+
 **F1 opens the Help window** anywhere: the guide is generated from the source
 docstrings that implement each behaviour, and every topic ends with an Open-code
 link to that file and line.
@@ -267,8 +276,9 @@ link to that file and line.
 The **Net** column probes reachability (one TCP connect at a time, visible rows
 first, paused while hidden — cheap even at hundreds of hosts); offline rows with a
 learned MAC offer **⚡ Wake** (`rcm wake <sel>`). Right-click also gives **Open
-terminal** (embedded VTE tabs when the library is present; right-click a tab to
-**Send script** — it types a file from `scripts/` into the live session with the
+terminal** (embedded VTE tabs when the library is present, each in its own scroller
+so the prompt never scrolls out of reach — right-click the *tab* to pop that terminal
+into its own window, or right-click inside it for **Send script** — it types a file from `scripts/` into the live session with the
 placeholders substituted, `{password}` deliberately never), **Run script** across
 the selection — SSH when port 22 answers, PowerShell over WinRM otherwise, live
 per-host verdicts in the dialog, output captured per run — and **History**.

@@ -504,6 +504,39 @@ def delete_conn(c: Conn) -> list[str]:
     return prune_empty_parents(c.path.parent)
 
 
+@help_topic("rename-group", "Renaming a group", ("rename", "group", "folder"),
+            section="Connections")
+def rename_group(group: str, new_leaf: str) -> str:
+    """A group is a folder, so renaming one is a move — everything follows.
+
+    Only the last part of the path changes: "Plant/Line2" renamed to "Line 2"
+    becomes "Plant/Line 2", with every connection and sub-group inside it
+    coming along. Their keyring entries are keyed by connection name, which
+    includes the group, so `rcm creds migrate` re-points them if you rename a
+    group whose connections carry their own passwords.
+    """
+    new_leaf = new_leaf.strip().strip("/")
+    if not group:
+        raise ValueError("the whole collection has no name to change")
+    if not new_leaf:
+        raise ValueError("a group needs a name")
+    parent = group.rsplit("/", 1)[0] if "/" in group else ""
+    if new_leaf == group.rsplit("/", 1)[-1]:
+        return group
+    source = RDP_DIR / group
+    if not source.is_dir():
+        raise ValueError(f"no such group: {group}")
+    destination = ((RDP_DIR / parent) if parent else RDP_DIR) / new_leaf
+    if destination.exists():
+        raise FileExistsError(f"{parent + '/' if parent else ''}{new_leaf} "
+                              "already exists")
+    source.rename(destination)
+    conns_cached(refresh=True)
+    renamed = f"{parent}/{new_leaf}" if parent else new_leaf
+    log_event("rename-group", old=group, new=renamed)
+    return renamed
+
+
 def delete_group(group: str) -> int:
     """Delete a group folder and everything under it; returns connections lost.
 

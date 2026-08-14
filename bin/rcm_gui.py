@@ -98,9 +98,20 @@ def build_protocol_css(protos) -> bytes:
     # Pinned filter tabs sit flat: the theme's button padding would make a
     # second toolbar out of them. The slightly smaller font buys the last
     # few pixels -- the label is the floor of a button's height.
-    out.append("button.rcm-tab { padding: 0px 8px; min-height: 0; "
-               "font-size: 85%; }\n"
-               "button.rcm-tab image { padding: 0; min-height: 0; }\n")
+    # Tabs: flat and compact, but a readable size, and the ✕ has to look like
+    # part of the tab rather than a stray icon floating beside it.
+    out.append("button.rcm-tab { padding: 1px 8px; min-height: 0; "
+               "font-size: 95%; }\n"
+               "button.rcm-tab image { padding: 0; min-height: 0; }\n"
+               "button.rcm-tabclose { padding: 1px 4px 1px 0px; min-height: 0; "
+               "background-image: none; "
+               "background-color: alpha(currentColor, 0.10); "
+               "border-left-width: 0; }\n"
+               "button.rcm-tabclose:hover { "
+               "background-color: alpha(currentColor, 0.22); }\n"
+               # The Connect row: 20% shorter than a stock button.
+               "button.rcm-connect { padding-top: 2px; padding-bottom: 2px; "
+               "min-height: 22px; }\n")
     # Group headings in the icon view read as bands, like the list's rows.
     out.append(".rcm-group-heading { background-color: alpha("
                "@theme_selected_bg_color, 0.16); padding: 2px 6px; }\n")
@@ -390,8 +401,8 @@ class Win(Gtk.Window):
             # wild as "tabs can't be closed").
             close = Gtk.Button.new_from_icon_name("window-close-symbolic",
                                                   Gtk.IconSize.MENU)
-            close.set_relief(Gtk.ReliefStyle.NONE)
             close.get_style_context().add_class("rcm-tab")
+            close.get_style_context().add_class("rcm-tabclose")
             close.set_tooltip_text(f"Close tab {label!r}")
             close.connect("clicked", self.on_tab_closed, label)
             pair = Gtk.Box()
@@ -764,13 +775,27 @@ class Win(Gtk.Window):
         self.current_layout = layout_id
         if not rcm.conns_cached(refresh=True) and \
                 not getattr(self, "first_run_skipped", False):
+            self.show_tab_strip(False)
             self.layout_container.pack_start(self.build_first_run(), True, True, 0)
             self.layout_container.show_all()
             return
         builder = getattr(self, f"build_{layout_id}_layout")
+        self.show_tab_strip(True)
         self.layout_container.pack_start(builder(), True, True, 0)
         self.layout_container.show_all()
         self.reload()
+
+    def show_tab_strip(self, visible: bool) -> None:
+        """Pinned filters belong to the connection list, so they go with it.
+
+        Setup, Logs and the first-run checklist are not filtered views; a tab
+        row floating above them looked like window furniture rather than part
+        of the list it filters.
+        """
+        if getattr(self, "tab_strip", None) is None:
+            return
+        self.tab_strip.set_no_show_all(not visible)
+        self.tab_strip.set_visible(visible)
 
     @help_topic_gui("first-run", "The first-run checklist",
                     ("first run", "setup", "empty", "checklist"),
@@ -955,7 +980,9 @@ class Win(Gtk.Window):
                                  (C_HOST, "Host", 118), (C_USER, "User", 78),
                                  (C_PROTOS, "Protocols", 168),
                                  (C_KEY, "Key", 86)):
-            r = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            r = Gtk.CellRendererText(
+                ellipsize=Pango.EllipsizeMode.NONE if idx == C_PROTOS
+                else Pango.EllipsizeMode.END)
             if idx in (C_PROTOS, C_LABEL, C_HOST):
                 col = Gtk.TreeViewColumn(title, r, markup=idx)
             else:
@@ -965,10 +992,17 @@ class Win(Gtk.Window):
             col.set_resizable(True)
             col.set_min_width(minw)
             col.set_expand(idx == C_LABEL)
+            if idx == C_PROTOS:
+                col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
+            self.attach_cell_editing(r, idx)
             self.tree.append_column(col)
             if idx == C_PROTOS:
                 self.protocols_column = col
 
+        self.paint_group_headings()
+        self.tree.connect("row-expanded", self.on_group_expansion_changed, True)
+        self.tree.connect("row-collapsed", self.on_group_expansion_changed,
+                          False)
         self.tree.connect("row-activated", self.on_row_activated)
         self.tree.connect("button-press-event", self.on_tree_click)
         sw = Gtk.ScrolledWindow()
@@ -979,15 +1013,9 @@ class Win(Gtk.Window):
 
         # Edit / Duplicate / Delete live in the right-click menu, not here.
         # One button per configured protocol; a FlowBox so ten of them wrap
-        # instead of squeezing into an unreadable row.
-        self.button_box = Gtk.FlowBox()
-        self.button_box.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.button_box.set_max_children_per_line(4)
-        self.button_box.set_row_spacing(6)
-        self.button_box.set_column_spacing(6)
-        self.button_box.set_homogeneous(True)
-        left.pack_start(self.button_box, False, False, 0)
-        self.rebuild_buttons()
+        # instead of squeezing into an unreadable row, framed against the
+        # list they act on.
+        left.pack_start(self.build_connect_button_box(), False, False, 0)
 
         # ---- right: active sessions ----------------------------------------- #
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -1073,6 +1101,7 @@ class Win(Gtk.Window):
             col.set_expand(idx == C_LABEL)
             if idx == C_PROTOS:
                 col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
+            self.attach_cell_editing(renderer, idx)
             self.tree.append_column(col)
             if idx == C_PROTOS:
                 self.protocols_column = col
@@ -1143,14 +1172,20 @@ class Win(Gtk.Window):
         return pane
 
     def build_connect_button_box(self):
+        """The Connect row, framed against the list it acts on."""
         self.button_box = Gtk.FlowBox()
         self.button_box.set_selection_mode(Gtk.SelectionMode.NONE)
         self.button_box.set_max_children_per_line(4)
-        self.button_box.set_row_spacing(6)
-        self.button_box.set_column_spacing(6)
+        self.button_box.set_row_spacing(4)
+        self.button_box.set_column_spacing(4)
         self.button_box.set_homogeneous(True)
+        self.button_box.set_border_width(4)
         self.rebuild_buttons()
-        return self.button_box
+        # A frame tied to the list above it: these buttons act on that list,
+        # not on the window at large.
+        frame = Gtk.Frame()
+        frame.add(self.button_box)
+        return frame
 
     # ---- Browse --------------------------------------------------------- #
     @help_topic_gui("browse-layout", "The Browse layout",
@@ -1173,13 +1208,15 @@ class Win(Gtk.Window):
 
         # Live sessions: present only when there is something to show.
         self.cards_revealer = Gtk.Revealer()
-        self.cockpit_cards = Gtk.FlowBox()
-        self.cockpit_cards.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.cockpit_cards.set_max_children_per_line(6)
-        self.cockpit_cards.set_min_children_per_line(2)
-        self.cockpit_cards.set_row_spacing(2)
-        self.cockpit_cards.set_column_spacing(4)
-        self.cards_revealer.add(self.cockpit_cards)
+        # A row, not a grid: FlowBox stretched every card to an equal share of
+        # the window, so two sessions each took half the width. In a Box they
+        # take what they need and the strip scrolls when there are many.
+        self.cockpit_cards = Gtk.Box(spacing=4)
+        cards_scroller = Gtk.ScrolledWindow()
+        cards_scroller.set_policy(Gtk.PolicyType.AUTOMATIC,
+                                  Gtk.PolicyType.NEVER)
+        cards_scroller.add(self.cockpit_cards)
+        self.cards_revealer.add(cards_scroller)
         outer.pack_start(self.cards_revealer, False, False, 0)
 
         row = Gtk.Box(spacing=6)
@@ -1243,6 +1280,7 @@ class Win(Gtk.Window):
             lambda _sel, model, path, _cur: model[path][1] != self.SIDEBAR_HEADER)
         self.sidebar.connect("row-activated", self.on_sidebar_activated)
         self.sidebar.connect("button-press-event", self.on_sidebar_click)
+        self.sidebar.connect("key-press-event", self.on_sidebar_key)
         side_scroller = Gtk.ScrolledWindow()
         side_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         side_scroller.add(self.sidebar)
@@ -1354,6 +1392,15 @@ class Win(Gtk.Window):
 
         for group in sorted(by_group):
             heading = Gtk.Box(spacing=6)
+            folded = group in self.collapsed_groups
+            fold = Gtk.Button.new_from_icon_name(
+                "pan-end-symbolic" if folded else "pan-down-symbolic",
+                Gtk.IconSize.MENU)
+            fold.set_relief(Gtk.ReliefStyle.NONE)
+            fold.get_style_context().add_class("rcm-tab")
+            fold.set_tooltip_text("Fold this group away")
+            fold.connect("clicked", self.on_icon_group_folded, group)
+            heading.pack_start(fold, False, False, 0)
             group_check = Gtk.CheckButton()
             group_check.set_tooltip_text("tick every machine in this group")
             members = [c.sel for c in by_group[group]]
@@ -1388,6 +1435,9 @@ class Win(Gtk.Window):
 
             for c in by_group[group]:
                 flow.add(self.build_tile(c, registry, live))
+            if folded:
+                flow.set_no_show_all(True)
+                flow.hide()
         self.icon_box.show_all()
         if getattr(self, "count_lbl", None):
             total = len(rcm.conns_cached())
@@ -1471,6 +1521,14 @@ class Win(Gtk.Window):
                               f"{proto_label(c.default_protocol)}")
         return tile
 
+    def on_icon_group_folded(self, _button, group: str) -> None:
+        """Fold a group's tiles away; the list's memory of it is shared."""
+        if group in self.collapsed_groups:
+            self.collapsed_groups.discard(group)
+        else:
+            self.collapsed_groups.add(group)
+        self.refresh_icon_view()
+
     def on_icon_tile_toggled(self, check, sel: str) -> None:
         if check.get_active():
             self.icon_checked.add(sel)
@@ -1509,7 +1567,12 @@ class Win(Gtk.Window):
                 self.connect_selected(pid, "", [c])
             return True
         if event.type == Gdk.EventType.BUTTON_PRESS:
-            tile = widget.get_ancestor(Gtk.FlowBoxChild)
+            # Not get_ancestor(FlowBoxChild): the chips sit in a FlowBox of
+            # their own, so each is wrapped in one too. The tile is the
+            # ancestor that carries the connection.
+            tile = widget
+            while tile is not None and not hasattr(tile, "rcm_sel"):
+                tile = tile.get_parent()
             if tile is not None:
                 for flow in getattr(self, "icon_flows", []) or []:
                     flow.unselect_all()
@@ -1659,6 +1722,11 @@ class Win(Gtk.Window):
                            lambda *_: self.paste_into_group(group))
         menu.append(paste_item)
 
+        rename_item = Gtk.MenuItem(label=f"Rename group {label!r}…")
+        rename_item.set_sensitive(bool(group))
+        rename_item.connect("activate", lambda *_: self.rename_group(group))
+        menu.append(rename_item)
+
         menu.append(Gtk.SeparatorMenuItem())
         delete_item = Gtk.MenuItem(label=f"Delete group {label!r}…")
         delete_item.set_sensitive(bool(group))
@@ -1691,6 +1759,24 @@ class Win(Gtk.Window):
         self.select_after_paste(made)
         self.say(f"pasted {len(made)} item(s) into {group or 'the top level'}")
 
+    def rename_group(self, group: str) -> None:
+        if not group:
+            return
+        leaf = group.rsplit("/", 1)[-1]
+        wanted = self._ask_text("Rename group", "Group name", leaf)
+        if not wanted or wanted == leaf:
+            return
+        try:
+            renamed = rcm.rename_group(group, wanted)
+        except (OSError, ValueError) as problem:
+            self._dialog(Gtk.MessageType.ERROR, "Cannot rename", str(problem))
+            return
+        if self.query_group == group or self.query_group.startswith(group + "/"):
+            self.query_group = renamed + self.query_group[len(group):]
+        rcm.gen_launcher()
+        self.reload()
+        self.say(f"renamed group {group!r} → {renamed!r}")
+
     def delete_group(self, group: str) -> None:
         if not group:
             return
@@ -1712,6 +1798,20 @@ class Win(Gtk.Window):
             else self.query_group
         self.reload()
         self.say(f"deleted group {group!r} — {removed} connection(s) removed")
+
+    def on_sidebar_key(self, _widget, event):
+        """Delete on a highlighted sidebar group removes that group."""
+        if Gdk.keyval_name(event.keyval) != "Delete":
+            return False
+        model, it = self.sidebar.get_selection().get_selected()
+        if not it:
+            return False
+        key = model[it][1]
+        if key and not key.startswith(("tag:", "workspace:",
+                                       self.SIDEBAR_HEADER)):
+            self.delete_group(key)
+            return True
+        return False
 
     def on_sidebar_activated(self, _tv, path, _col) -> None:
         """Double-click / Enter on a workspace row connects the whole set."""
@@ -1864,7 +1964,8 @@ class Win(Gtk.Window):
                                                   self.refresh_live()))
             inner.pack_start(end, False, False, 0)
             card.add(inner)
-            self.cockpit_cards.add(card)
+            card.set_halign(Gtk.Align.START)
+            self.cockpit_cards.pack_start(card, False, False, 0)
         self.cockpit_cards.show_all()
 
     def chip_filters_allow(self, c) -> bool:
@@ -2047,21 +2148,75 @@ class Win(Gtk.Window):
             Vte.PtyFlags.DEFAULT, None,
             ["/usr/bin/ssh", f"{c.username}@{c.host}"], None,
             GLib.SpawnFlags.DEFAULT, None, None, -1, None, None, None)
+        # VTE inside a scroller: unscrolled it is allocated whatever height is
+        # left over and the top of the buffer — the prompt and cursor — is cut
+        # off the moment output arrives.
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(220)
+        scroller.add(terminal)
+        scroller.rcm_terminal = terminal
+        scroller.rcm_sel = c.sel
+
         label = Gtk.Box(spacing=4)
-        label.pack_start(Gtk.Label(label=c.sel), False, False, 0)
+        label_event = Gtk.EventBox()
+        label_event.add(Gtk.Label(label=c.sel))
+        label_event.connect("button-press-event", self.on_terminal_tab_click,
+                            scroller)
+        label.pack_start(label_event, False, False, 0)
         close = Gtk.Button.new_from_icon_name("window-close-symbolic",
                                               Gtk.IconSize.MENU)
         close.set_relief(Gtk.ReliefStyle.NONE)
         label.pack_start(close, False, False, 0)
         label.show_all()
-        page = self.terminal_notebook.append_page(terminal, label)
+        page = self.terminal_notebook.append_page(scroller, label)
         close.connect("clicked", lambda *_:
                       self.terminal_notebook.remove_page(
-                          self.terminal_notebook.page_num(terminal)))
-        terminal.show()
+                          self.terminal_notebook.page_num(scroller)))
+        scroller.show_all()
         self.terminal_notebook.set_current_page(page)
         self.terminal_pane.set_reveal_child(True)
         rcm.log_event("terminal", sel=c.sel, transport=transport)
+
+    def on_terminal_tab_click(self, _widget, event, scroller):
+        """Right-click a terminal tab: pop it out into its own window."""
+        if event.button != 3:
+            return False
+        menu = Gtk.Menu()
+        pop = Gtk.MenuItem(label="Pop out into its own window")
+        pop.connect("activate", lambda *_: self.pop_out_terminal(scroller))
+        menu.append(pop)
+        close = Gtk.MenuItem(label="Close this terminal")
+        close.connect("activate", lambda *_:
+                      self.terminal_notebook.remove_page(
+                          self.terminal_notebook.page_num(scroller)))
+        menu.append(close)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    @help_topic_gui("terminal-popout", "Popping a terminal out",
+                    ("terminal", "pop out", "window", "detach"),
+                    section="Terminals")
+    def pop_out_terminal(self, scroller) -> None:
+        """A terminal tab can become its own window, and stays connected.
+
+        Right-click the tab and pop it out when a session deserves a whole
+        screen — the shell keeps running, because the widget moves rather
+        than being rebuilt. Closing that window ends the session, as closing
+        the tab would. The bottom pane hides itself once its last tab leaves.
+        """
+        sel = getattr(scroller, "rcm_sel", "terminal")
+        page = self.terminal_notebook.page_num(scroller)
+        if page >= 0:
+            self.terminal_notebook.remove_page(page)
+        window = Gtk.Window(title=f"{sel} — terminal")
+        window.set_default_size(900, 520)
+        window.add(scroller)
+        window.show_all()
+        if self.terminal_notebook.get_n_pages() == 0:
+            self.terminal_pane.set_reveal_child(False)
+        self.say(f"{sel}: terminal popped out — closing that window ends it")
 
     def on_terminal_click(self, terminal, event):
         if event.button != 3:
@@ -2353,6 +2508,7 @@ class Win(Gtk.Window):
         logs/output/). Export… writes exactly what the filters show, as CSV.
         """
         self.reset_body_references()
+        self.show_tab_strip(False)
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         page.set_border_width(12)
         holder = {"records": [], "filtered": [], "sel": sel}
@@ -2582,6 +2738,7 @@ class Win(Gtk.Window):
         them.
         """
         self.reset_body_references()
+        self.show_tab_strip(False)
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         page.set_border_width(12)
         bar = Gtk.Box(spacing=8)
@@ -3084,6 +3241,7 @@ class Win(Gtk.Window):
             css = "suggested-action" if pr.color in ("", "accent") \
                 else protocol_css_class(pr.id)
             b.get_style_context().add_class(css)
+            b.get_style_context().add_class("rcm-connect")
             b.connect("clicked", lambda _w, pid=pr.id: self.connect_selected(pid))
             self.button_box.add(b)
         self.button_box.show_all()
@@ -3292,6 +3450,59 @@ class Win(Gtk.Window):
         self.refresh_select_all()
         count = len(self.checked_sels())
         self.say(f"{count} connection(s) ticked" if count else "nothing ticked")
+
+    @help_topic_gui("rename-in-place", "Renaming in the list",
+                    ("rename", "edit", "in place", "double click", "group"),
+                    section="Connections")
+    def attach_cell_editing(self, renderer, column_index: int) -> None:
+        """Click a selected row's Connection, Host or User cell to edit it.
+
+        The slow double-click every file manager uses: one click selects the
+        row, the next click on the same cell opens it for typing. Enter
+        commits, Escape abandons. On a group heading row the Connection cell
+        renames the group — which moves the folder, taking every connection
+        and sub-group with it. Renaming a connection moves its file, so its
+        shortcut and keyring entry follow, exactly as the Edit dialog does.
+        """
+        if column_index not in (C_LABEL, C_HOST, C_USER):
+            return
+        renderer.set_property("editable", True)
+        renderer.connect("edited", self.on_cell_edited, column_index)
+
+    def on_cell_edited(self, _renderer, path, text, column_index: int) -> None:
+        text = text.strip()
+        if not text:
+            self.say("a name cannot be empty")
+            return
+        it = self.store.get_iter(path)
+        sel = self.store[it][C_SEL]
+        try:
+            if not sel:
+                if column_index != C_LABEL:
+                    return          # a group row has no host or user
+                group = self.group_of_row(self.store, it)
+                renamed = rcm.rename_group(group, text)
+                self.say(f"renamed group {group!r} → {renamed!r}")
+            else:
+                c = rcm.find(sel)
+                if c is None:
+                    return
+                if column_index == C_LABEL:
+                    if text == c.name:
+                        return
+                    moved = rcm.move_connection(c, c.group, text)
+                    self.say(f"renamed {sel!r} → {moved.sel!r}")
+                elif column_index == C_HOST:
+                    rcm.set_fields(c, host=text)
+                    self.say(f"{sel}: host is now {text}")
+                else:
+                    rcm.set_fields(c, username=text)
+                    self.say(f"{sel}: user is now {text}")
+        except (OSError, ValueError, RuntimeError) as problem:
+            self._dialog(Gtk.MessageType.ERROR, "Cannot rename", str(problem))
+            return
+        rcm.gen_launcher()
+        self.reload()
 
     def paint_group_headings(self) -> None:
         """Group rows get a tinted band so the list reads as sections.
