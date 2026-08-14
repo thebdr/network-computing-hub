@@ -426,11 +426,19 @@ class Win(Gtk.Window):
         return False
 
     def connection_matches_query(self, c) -> bool:
-        if self.query_group and not (c.group == self.query_group or
-                                     c.group.startswith(self.query_group + "/")):
+        query = self.query_group
+        if query.startswith("tag:"):
+            if query[len("tag:"):] not in c.tags:
+                return False
+        elif query.startswith("workspace:"):
+            if c.sel not in getattr(self, "workspace_filter_members", ()):
+                return False
+        elif query and not (c.group == query or
+                            c.group.startswith(query + "/")):
             return False
         if self.query_text:
-            haystack = " ".join([c.sel, c.host, c.username]).lower()
+            haystack = " ".join([c.sel, c.host, c.username,
+                                 " ".join("#" + t for t in c.tags)]).lower()
             if self.query_text.lower() not in haystack:
                 return False
         return True
@@ -493,6 +501,134 @@ class Win(Gtk.Window):
         self.layout_container.pack_start(builder(), True, True, 0)
         self.layout_container.show_all()
         self.reload()
+
+    @help_topic_gui("first-run", "The first-run checklist",
+                    ("first run", "setup", "empty", "checklist"),
+                    section="The window")
+    def build_first_run(self):
+        """With zero connections the window opens as a setup checklist.
+
+        Each step reports its real state — detected clients by name,
+        shortcuts installed or not, a DEFAULT credential present or missing —
+        and its button does the actual work: Detect scans for the configured
+        protocols' programs (recording an exe it finds, like `rcm detect
+        --write`), the others open the matching dialog. Create a connection
+        or import a CSV and the checklist gives way to the list; Skip shows
+        the empty list without nagging again this run. Everything here is
+        also a plain config file.
+        """
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_border_width(28)
+        title = Gtk.Label()
+        title.set_markup("<big><b>Set up your hub</b></big>")
+        outer.pack_start(title, False, False, 0)
+        progress = Gtk.Label()
+        progress.get_style_context().add_class("dim-label")
+        outer.pack_start(progress, False, False, 0)
+
+        detected = self.detect_installed_clients(scan=False)
+        shortcuts_in = any(i.startswith("rcm-") for i in rcm.parse_gsettings_list(
+            rcm.run_gsettings("get", rcm.GS_LIST, "custom-list")))
+        have_default = bool(rcm.secret_get("DEFAULT"))
+        have_conns = bool(rcm.conns_cached())
+
+        steps = (
+            (bool(detected),
+             "Detect installed clients"
+             + (f" — found {', '.join(detected)}" if detected else ""),
+             "Detect…", self.on_first_run_detect),
+            (shortcuts_in, "Install keyboard shortcuts — Super+R, Super+W/Q",
+             "Install…", self.on_first_run_shortcuts),
+            (have_default, "Set default credentials — stored in the keyring",
+             "Set…", lambda: (self.on_credentials(),
+                              self.apply_layout(self.ui_state["layout"]))),
+            (have_conns, "Create your first connection",
+             "New…", lambda: (self.edit_dialog(None),
+                              self.apply_layout(self.ui_state["layout"]))),
+            (have_conns, "…or import a CSV — group,name,host,user,port",
+             "Import…", lambda: (self.on_import(),
+                                 self.apply_layout(self.ui_state["layout"]))),
+        )
+        done = sum(1 for state, *_ in steps if state)
+        progress.set_markup(f"<small>{done} of {len(steps)} done — everything "
+                            "here is also a plain config file</small>")
+        for state, text, button_label, action in steps:
+            row = Gtk.Box(spacing=10)
+            mark = Gtk.Label(label="✓" if state else "○")
+            row.pack_start(mark, False, False, 0)
+            label = Gtk.Label(xalign=0, label=text)
+            label.set_line_wrap(True)
+            row.pack_start(label, True, True, 0)
+            button = Gtk.Button(label=button_label)
+            button.connect("clicked", lambda _b, act=action: act())
+            row.pack_start(button, False, False, 0)
+            outer.pack_start(row, False, False, 0)
+
+        skip = Gtk.Button(label="Skip — show me the empty list")
+        skip.set_relief(Gtk.ReliefStyle.NONE)
+
+        def on_skip(*_a):
+            self.first_run_skipped = True
+            self.apply_layout(self.ui_state["layout"])
+        skip.connect("clicked", on_skip)
+        outer.pack_start(skip, False, False, 8)
+        outer.set_halign(Gtk.Align.CENTER)
+        outer.set_valign(Gtk.Align.CENTER)
+        return outer
+
+    def detect_installed_clients(self, scan: bool) -> list[str]:
+        """Client names that resolve; scan=True also walks detect paths."""
+        found: list[str] = []
+        for proto in protocols_safe().values():
+            for tmpl in proto.launchers.values():
+                exe = rcm.launcher_exe(proto, tmpl)
+                if exe and (shutil.which(exe) or Path(exe).is_file()):
+                    name = Path(exe).name
+                    if name not in found:
+                        found.append(name)
+            if scan and not proto.exe:
+                candidates = rcm.protocol_detect(proto)
+                if candidates and Path(candidates[0]).name not in found:
+                    found.append(Path(candidates[0]).name)
+        return found
+
+    def on_first_run_detect(self) -> None:
+        """Scan for clients; record a found exe like `rcm detect --write`."""
+        self.say("detecting installed clients…")
+
+        def worker():
+            wrote = []
+            protos = rcm.load_protocols()
+            for proto in protos.values():
+                if proto.exe:
+                    continue
+                candidates = rcm.protocol_detect(proto)
+                if candidates:
+                    proto.exe = str(candidates[0])
+                    parts = candidates[0].parts
+                    if "drive_c" in parts:
+                        proto.env["WINEPREFIX"] = str(
+                            Path(*parts[:parts.index("drive_c")]))
+                    wrote.append(f"{proto.id}: {candidates[0]}")
+            if wrote:
+                rcm.save_protocols(protos)
+            names = self.detect_installed_clients(scan=False)
+            message = (f"found {', '.join(names)}" if names
+                       else "no configured clients found")
+            if wrote:
+                message += " · recorded " + "; ".join(wrote)
+
+            def apply():
+                self.say(message)
+                self.apply_layout(self.ui_state["layout"])
+            GLib.idle_add(apply)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_first_run_shortcuts(self) -> None:
+        count, warnings = rcm.shortcuts_install()
+        self.say(f"{count} shortcut(s) installed"
+                 + (f" — {warnings[0]}" if warnings else ""))
+        self.apply_layout(self.ui_state["layout"])
 
     def build_classic_layout(self):
         """The pre-redesign window, kept selectable for continuity."""
@@ -792,6 +928,7 @@ class Win(Gtk.Window):
         self.sidebar.append_column(Gtk.TreeViewColumn(
             "", Gtk.CellRendererText(), markup=0))
         self.sidebar.get_selection().connect("changed", self.on_sidebar_selected)
+        self.sidebar.connect("row-activated", self.on_sidebar_activated)
         side_scroller = Gtk.ScrolledWindow()
         side_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         side_scroller.add(self.sidebar)
@@ -825,11 +962,36 @@ class Win(Gtk.Window):
         outer.pack_start(self.build_connect_button_box(), False, False, 0)
         return outer
 
+    SIDEBAR_HEADER = "\x00header"
+
     def on_sidebar_selected(self, selection) -> None:
         model, it = selection.get_selected()
-        if it:
-            self.query_group = model[it][1]
-            self.reload()
+        if not it:
+            return
+        key = model[it][1]
+        if key == self.SIDEBAR_HEADER:
+            return
+        if key.startswith("workspace:"):
+            members = rcm.load_workspaces().get(key[len("workspace:"):], [])
+            self.workspace_filter_members = frozenset(m["sel"] for m in members)
+        self.query_group = key
+        self.reload()
+
+    def on_sidebar_activated(self, _tv, path, _col) -> None:
+        """Double-click / Enter on a workspace row connects the whole set."""
+        key = self.sidebar_store[path][1]
+        if not key.startswith("workspace:"):
+            return
+        name = key[len("workspace:"):]
+        self.say(f"connecting workspace {name}…")
+
+        def worker():
+            try:
+                lines = rcm.connect_workspace(name)
+            except (rcm.ConfigError, RuntimeError) as problem:
+                lines = [str(problem)]
+            GLib.idle_add(self.say, f"workspace {name}: " + "; ".join(lines))
+        threading.Thread(target=worker, daemon=True).start()
 
     def refresh_sidebar(self) -> None:
         if getattr(self, "sidebar", None) is None:
@@ -845,6 +1007,28 @@ class Win(Gtk.Window):
             nodes[group] = self.sidebar_store.append(
                 parent, [f"{GLib.markup_escape_text(group.rsplit('/', 1)[-1])}"
                          f"  <small>({count})</small>", group])
+        tag_counts: dict[str, int] = {}
+        for c in rcm.conns_cached():
+            for tag in c.tags:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+        if tag_counts:
+            header = self.sidebar_store.append(
+                None, ["<small><b>TAGS</b></small>", self.SIDEBAR_HEADER])
+            for tag in sorted(tag_counts):
+                self.sidebar_store.append(header, [
+                    f"#{GLib.markup_escape_text(tag)}"
+                    f"  <small>({tag_counts[tag]})</small>", f"tag:{tag}"])
+        try:
+            workspaces = rcm.load_workspaces()
+        except Exception:      # noqa: BLE001 -- sidebar must not die on a typo
+            workspaces = {}
+        if workspaces:
+            header = self.sidebar_store.append(
+                None, ["<small><b>WORKSPACES</b></small>", self.SIDEBAR_HEADER])
+            for name, members in workspaces.items():
+                self.sidebar_store.append(header, [
+                    f"▶ {GLib.markup_escape_text(name)}"
+                    f"  <small>({len(members)})</small>", f"workspace:{name}"])
         self.sidebar.expand_all()
         problems = len(rcm.config_health())
         self.setup_badge.set_label(
@@ -2267,7 +2451,10 @@ class Win(Gtk.Window):
 
         Group and Name are always editable — renaming or regrouping moves the
         .rdp file, and the keyring entries and keyboard shortcut follow
-        automatically. Typing a new group name creates the group.
+        automatically. Typing a new group name creates the group. Tags are
+        free labels orthogonal to groups (a host can carry many): typed here
+        comma-separated, they appear as #chips under TAGS in the Browse
+        sidebar and match in the filter box.
 
         Each configured protocol is a row: tick it to offer that protocol on
         this connection, pick one row as the Default (what double-click and
@@ -2324,6 +2511,9 @@ class Win(Gtk.Window):
                              "keyring entry and shortcut follow</small>")
         move_hint.get_style_context().add_class("dim-label")
         left.pack_start(move_hint, False, False, 2)
+        old_tags = ", ".join(c.tags) if c else ""
+        tags_entry = entry_row("Tags", old_tags)
+        tags_entry.set_placeholder_text("comma-separated — #chips in the sidebar")
         caption("TARGET")
         host_entry = entry_row("Host", c.host if c else "")
         user_entry = entry_row("Username", c.username if c else "")
@@ -2543,6 +2733,8 @@ class Win(Gtk.Window):
         via_choice = via_combo.get_active_text() or "(direct)"
         new_via = ("" if via_choice == "(direct)"
                    else via_choice.removesuffix(" (missing!)"))
+        new_tags = ",".join(t.strip() for t in
+                            tags_entry.get_text().split(",") if t.strip())
         d.destroy()
 
         if not n or not h:
@@ -2572,9 +2764,11 @@ class Win(Gtk.Window):
                            ports=ports, protocols=protos,
                            default_proto=default_pid)
 
+        old_tags_stored = c.extra.get("rcm-tags", "") if c else ""
         for key, old, new_val in (("rcm-pre", old_pre, new_pre),
                                   ("rcm-post", old_post, new_post),
-                                  ("rcm-via", old_via, new_via)):
+                                  ("rcm-via", old_via, new_via),
+                                  ("rcm-tags", old_tags_stored, new_tags)):
             if new_val != old:
                 rcm.set_connection_extra(target, key, new_val)
 

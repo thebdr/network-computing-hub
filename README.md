@@ -245,8 +245,15 @@ Everything notable — launches, scripts, probes, wakes, tunnels — is one JSON
 under `logs/`; the **Logs page** (▤ in the sidebar, or the Layout menu) filters it
 by kind, text and range back to 90 days, shows each event with its captured output,
 and exports the filtered view as CSV. History is the same page pre-filtered to one
-connection. **Workspaces** (`workspaces.conf`, `rcm workspace <name>`) open named
-sets together, focusing members that are already live.
+connection. **Tags** (`rcm-tags`, edited in the Edit dialog) are free labels
+orthogonal to groups: they appear as #chips with counts under TAGS in the Browse
+sidebar — click one to filter — and match in the filter box. **Workspaces**
+(`workspaces.conf`, `rcm workspace <name>`) open named sets together, focusing
+members that are already live; they sit under WORKSPACES in the same sidebar
+(click shows the members, double-click connects them all), a member with a
+monitor number gets its window moved there once it appears, and
+`workspace:<name> = <combo>` under `[sessions]` in shortcuts.conf binds a key to
+the whole set.
 
 ## Keyboard shortcuts
 

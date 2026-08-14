@@ -17,3 +17,4 @@ prev = <Super>q
 [sessions]
 # Focuses the connection if a session is live, otherwise connects it.
 # One line per connection, e.g.:  GROUP/Host = <Super><Alt>1
+# `workspace:<name> = <combo>` opens that whole workspace instead.
