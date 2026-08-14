@@ -845,6 +845,9 @@ DEFAULT||
 # stay put). Connect one with `rcm workspace <name>`, double-click it in the
 # Browse sidebar, or give it a keyboard shortcut under [sessions] in
 # shortcuts.conf as `workspace:<name> = <combo>`.
+#
+# Edit here, or in the manager: Setup > Workspaces (right-click a selection
+# > "Save as workspace..." starts one from whatever is highlighted).
 """,
     "ui.conf": """\
 # Manager window state. The GUI writes this; editing it by hand is equally fine.
@@ -1756,6 +1759,22 @@ def load_workspaces() -> dict[str, list[dict]]:
                                 "monitor": parts[2].strip()})
         out[name] = members
     return out
+
+
+def save_workspaces(spaces: dict[str, list[dict]]) -> None:
+    """Rewrite workspaces.conf. Managed file: the header is the documented
+    default, so hand-edits to comments don't survive a GUI save -- sections do."""
+    lines = [DEFAULT_CONFIGS["workspaces.conf"].rstrip("\n"), ""]
+    for name, members in spaces.items():
+        lines.append(f"[workspace:{name}]")
+        for index, member in enumerate(members, start=1):
+            parts = [member.get("sel", ""), member.get("protocol", ""),
+                     str(member.get("monitor", "") or "")]
+            while parts and not parts[-1]:
+                parts.pop()
+            lines.append(f"member.{index} = {'|'.join(parts)}")
+        lines.append("")
+    WORKSPACES_CONF.write_text("\n".join(lines).rstrip("\n") + "\n")
 
 
 def connect_workspace(name: str) -> list[str]:

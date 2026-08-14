@@ -9,3 +9,6 @@
 # stay put). Connect one with `rcm workspace <name>`, double-click it in the
 # Browse sidebar, or give it a keyboard shortcut under [sessions] in
 # shortcuts.conf as `workspace:<name> = <combo>`.
+#
+# Edit here, or in the manager: Setup > Workspaces (right-click a selection
+# > "Save as workspace..." starts one from whatever is highlighted).

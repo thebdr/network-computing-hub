@@ -1011,6 +1011,7 @@ class Win(Gtk.Window):
         self.sidebar.get_selection().set_select_function(
             lambda _sel, model, path, _cur: model[path][1] != self.SIDEBAR_HEADER)
         self.sidebar.connect("row-activated", self.on_sidebar_activated)
+        self.sidebar.connect("button-press-event", self.on_sidebar_click)
         side_scroller = Gtk.ScrolledWindow()
         side_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         side_scroller.add(self.sidebar)
@@ -1065,6 +1066,30 @@ class Win(Gtk.Window):
         # this fires; reload() rebuilds the sidebar model under that machinery
         # and segfaults libgtk (seen in the wild). Let the click finish first.
         GLib.idle_add(self.reload)
+
+    def on_sidebar_click(self, _tv, event):
+        if event.button != 3:
+            return False
+        info = self.sidebar.get_path_at_pos(int(event.x), int(event.y))
+        if not info:
+            return False
+        path = info[0]
+        key = self.sidebar_store[path][1]
+        if not key.startswith("workspace:"):
+            return False
+        name = key[len("workspace:"):]
+        menu = Gtk.Menu()
+        connect_item = Gtk.MenuItem(label=f"Connect workspace {name!r}")
+        connect_item.connect(
+            "activate", lambda *_: self.on_sidebar_activated(None, path, None))
+        menu.append(connect_item)
+        edit_item = Gtk.MenuItem(label="Edit workspaces…")
+        edit_item.connect("activate",
+                          lambda *_: self.on_workspaces(select=name))
+        menu.append(edit_item)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
 
     def on_sidebar_activated(self, _tv, path, _col) -> None:
         """Double-click / Enter on a workspace row connects the whole set."""
@@ -1902,10 +1927,11 @@ class Win(Gtk.Window):
     def on_setup(self) -> None:
         """Everything that used to hide in the menu lives on the Setup page.
 
-        Four cards — Protocols, Credentials, Keyboard shortcuts,
-        Import/Export — each fronting the same plain files you can edit by
-        hand. Warnings from the health check appear as a banner with a
-        one-click action, and the badge on the Setup entry counts them.
+        Five cards — Protocols, Credentials, Keyboard shortcuts,
+        Import/Export, Workspaces — each fronting the same plain files you
+        can edit by hand. Warnings from the health check appear as a banner
+        with a one-click action, and the badge on the Setup entry counts
+        them.
         """
         self.reset_body_references()
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
@@ -1980,6 +2006,10 @@ class Win(Gtk.Window):
              "CSV round-trip, .rdp files, Radmin phonebook (.rpb)",
              [("Import…", self.on_import), ("Export…", self.on_export),
               ("Phonebook…", self.on_phonebook)])
+        card(0, 2, "Workspaces",
+             "workspaces.conf — named sets opened together, with per-member "
+             "protocol and monitor and a shortcut per set",
+             [("Open…", self.on_workspaces)])
 
         foot = Gtk.Label(xalign=0)
         foot.set_markup(f"<small>all of it plain files in "
@@ -1990,6 +2020,247 @@ class Win(Gtk.Window):
         page.pack_start(foot, False, False, 0)
         self.layout_container.pack_start(page, True, True, 0)
         self.layout_container.show_all()
+
+    @help_topic_gui("workspace-editor", "Editing workspaces",
+                    ("workspace", "editor", "members", "monitor", "set"),
+                    section="Connections")
+    def on_workspaces(self, select: str = "") -> None:
+        """Setup ▸ Workspaces edits the named sets without leaving the window.
+
+        Pick or create a workspace, then shape its member list: add
+        connections, drag rows to set the launch order, and edit the
+        Protocol and Monitor cells in place (blank means the connection's
+        default and no placement; monitors are 1-based in xrandr order).
+        Each workspace can take a keyboard shortcut here too — stored as
+        `workspace:<name>` in shortcuts.conf. The quickest start is
+        right-click on a selection ▸ "Save as workspace…", then open this
+        editor for monitors and keys. Save rewrites workspaces.conf;
+        members that no longer exist are flagged, not silently dropped.
+        """
+        spaces = {name: [dict(m) for m in members]
+                  for name, members in rcm.load_workspaces().items()}
+        ws_bindings = {k[len("workspace:"):]: v
+                       for k, v in rcm.load_shortcuts()[1].items()
+                       if k.startswith("workspace:")}
+        d = Gtk.Dialog(title="Workspaces", transient_for=self, modal=True)
+        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                      Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        d.set_default_size(560, 420)
+        box = d.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(6)
+
+        picker_row = Gtk.Box(spacing=6)
+        picker = Gtk.ComboBoxText()
+        picker_row.pack_start(picker, True, True, 0)
+        new_btn = Gtk.Button(label="New…")
+        rename_btn = Gtk.Button(label="Rename…")
+        delete_btn = Gtk.Button(label="Delete")
+        for b in (new_btn, rename_btn, delete_btn):
+            picker_row.pack_start(b, False, False, 0)
+        box.pack_start(picker_row, False, False, 0)
+
+        store = Gtk.ListStore(str, str, str, str)   # sel, proto, monitor, mark
+        view = Gtk.TreeView(model=store)
+        view.set_reorderable(True)   # drag rows: member order is launch order
+        sel_col = Gtk.TreeViewColumn("Member", Gtk.CellRendererText(), text=0)
+        sel_col.set_expand(True)
+        view.append_column(sel_col)
+        proto_renderer = Gtk.CellRendererCombo(editable=True, has_entry=False)
+        proto_model = Gtk.ListStore(str)
+        proto_model.append(["(default)"])
+        for pid in rcm.protocol_ids():
+            proto_model.append([pid])
+        proto_renderer.set_property("model", proto_model)
+        proto_renderer.set_property("text-column", 0)
+
+        def on_proto_edited(_r, path, text):
+            store[path][1] = "" if text == "(default)" else text
+        proto_renderer.connect("edited", on_proto_edited)
+        proto_col = Gtk.TreeViewColumn("Protocol", proto_renderer)
+        proto_col.set_cell_data_func(
+            proto_renderer,
+            lambda _c, cell, model, it, _d:
+            cell.set_property("text", model[it][1] or "(default)"))
+        view.append_column(proto_col)
+        monitor_renderer = Gtk.CellRendererText(editable=True)
+
+        def on_monitor_edited(_r, path, text):
+            text = text.strip()
+            if text and not text.isdigit():
+                self.say(f"monitor must be a number (1-based), not {text!r}")
+                return
+            store[path][2] = text
+        monitor_renderer.connect("edited", on_monitor_edited)
+        monitor_col = Gtk.TreeViewColumn("Monitor", monitor_renderer)
+        monitor_col.set_cell_data_func(
+            monitor_renderer,
+            lambda _c, cell, model, it, _d:
+            cell.set_property("text", model[it][2] or "—"))
+        view.append_column(monitor_col)
+        view.append_column(Gtk.TreeViewColumn("", Gtk.CellRendererText(),
+                                              text=3))
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        scroller.add(view)
+        box.pack_start(scroller, True, True, 0)
+
+        add_row = Gtk.Box(spacing=6)
+        add_combo = Gtk.ComboBoxText()
+        add_row.pack_start(add_combo, True, True, 0)
+        add_btn = Gtk.Button(label="Add member")
+        add_row.pack_start(add_btn, False, False, 0)
+        remove_btn = Gtk.Button(label="Remove")
+        add_row.pack_start(remove_btn, False, False, 0)
+        box.pack_start(add_row, False, False, 0)
+
+        shortcut_row = Gtk.Box(spacing=8)
+        shortcut_row.pack_start(Gtk.Label(label="Shortcut", xalign=0),
+                                False, False, 0)
+        shortcut_btn = ShortcutButton("")
+        shortcut_row.pack_start(shortcut_btn, False, False, 0)
+        shortcut_hint = Gtk.Label(xalign=0)
+        shortcut_hint.set_markup("<small>opens the whole set — saved as "
+                                 "workspace:&lt;name&gt; in shortcuts.conf"
+                                 "</small>")
+        shortcut_hint.get_style_context().add_class("dim-label")
+        shortcut_row.pack_start(shortcut_hint, False, False, 0)
+        box.pack_start(shortcut_row, False, False, 0)
+
+        status = Gtk.Label(xalign=0)
+        status.get_style_context().add_class("dim-label")
+        box.pack_start(status, False, False, 0)
+
+        current = {"name": ""}
+
+        def refresh_add_choices():
+            add_combo.remove_all()
+            members = {row[0] for row in store}
+            for c in rcm.conns_cached():
+                if c.sel not in members:
+                    add_combo.append_text(c.sel)
+            add_combo.set_active(0)
+
+        def stash():
+            if current["name"]:
+                spaces[current["name"]] = [
+                    {"sel": row[0], "protocol": row[1], "monitor": row[2]}
+                    for row in store]
+                ws_bindings[current["name"]] = shortcut_btn.binding
+
+        def load_space(name):
+            current["name"] = name
+            store.clear()
+            missing = []
+            for member in spaces.get(name, []):
+                known = rcm.find(member["sel"]) is not None
+                if not known:
+                    missing.append(member["sel"])
+                store.append([member["sel"], member.get("protocol", ""),
+                              member.get("monitor", ""),
+                              "" if known else "⚠ not found"])
+            shortcut_btn.binding = ws_bindings.get(name, "")
+            shortcut_btn.refresh()
+            status.set_markup("<small>{}</small>".format(GLib.markup_escape_text(
+                f"⚠ unknown members kept as written: {', '.join(missing)}"
+                if missing else
+                "drag rows to reorder — members launch top to bottom, 2s apart")))
+            refresh_add_choices()
+            editable = bool(name)
+            for widget in (view, add_combo, add_btn, remove_btn, shortcut_btn,
+                           rename_btn, delete_btn):
+                widget.set_sensitive(editable)
+
+        def refresh_picker(select_name=""):
+            picker.remove_all()
+            for name in spaces:
+                picker.append_text(name)
+            names = list(spaces)
+            if select_name and select_name in names:
+                picker.set_active(names.index(select_name))
+            elif names:
+                picker.set_active(0)
+            else:
+                load_space("")
+
+        def on_picked(_c):
+            name = picker.get_active_text()
+            if name is not None and name != current["name"]:
+                stash()
+                load_space(name)
+        picker.connect("changed", on_picked)
+
+        def on_new(_b):
+            name = self._ask_text("New workspace", "Workspace name")
+            if not name:
+                return
+            if name in spaces:
+                self.say(f"workspace {name!r} already exists")
+                return
+            stash()
+            spaces[name] = []
+            refresh_picker(select_name=name)
+        new_btn.connect("clicked", on_new)
+
+        def on_rename(_b):
+            old = current["name"]
+            if not old:
+                return
+            name = self._ask_text("Rename workspace", "Workspace name", old)
+            if not name or name == old:
+                return
+            if name in spaces:
+                self.say(f"workspace {name!r} already exists")
+                return
+            stash()
+            spaces[name] = spaces.pop(old)
+            ws_bindings[name] = ws_bindings.pop(old, "")
+            current["name"] = ""
+            refresh_picker(select_name=name)
+        rename_btn.connect("clicked", on_rename)
+
+        def on_delete(_b):
+            name = current["name"]
+            if not name:
+                return
+            spaces.pop(name, None)
+            ws_bindings.pop(name, None)
+            current["name"] = ""
+            refresh_picker()
+        delete_btn.connect("clicked", on_delete)
+
+        def on_add(_b):
+            sel = add_combo.get_active_text()
+            if sel:
+                store.append([sel, "", "", ""])
+                refresh_add_choices()
+        add_btn.connect("clicked", on_add)
+
+        def on_remove(_b):
+            model, it = view.get_selection().get_selected()
+            if it:
+                model.remove(it)
+                refresh_add_choices()
+        remove_btn.connect("clicked", on_remove)
+
+        d.show_all()
+        refresh_picker(select_name=select)
+        response = d.run()
+        stash()
+        d.destroy()
+        if response != Gtk.ResponseType.OK:
+            return
+        rcm.save_workspaces(spaces)
+        globals_, per_session = rcm.load_shortcuts()
+        per_session = {k: v for k, v in per_session.items()
+                       if not k.startswith("workspace:")}
+        for name, binding in ws_bindings.items():
+            if name in spaces and binding:
+                per_session[f"workspace:{name}"] = binding
+        rcm.save_shortcuts(globals_, per_session)
+        self.install_shortcuts()
+        self.refresh_sidebar()
+        self.say(f"{len(spaces)} workspace(s) saved to workspaces.conf")
 
     @help_topic_gui("help-window", "The Help window (F1)",
                     ("help", "f1", "guide", "open code"), section="Help")
@@ -2550,6 +2821,29 @@ class Win(Gtk.Window):
         run_item.set_sensitive(bool(cs))
         run_item.connect("activate", lambda _m, sel=cs: self.run_script_dialog(sel))
         menu.append(run_item)
+
+        save_ws = Gtk.MenuItem(label=f"Save as workspace… ({len(cs)})" if cs
+                               else "Save as workspace…")
+        save_ws.set_sensitive(bool(cs))
+
+        def do_save_ws(_m):
+            name = self._ask_text("New workspace", "Workspace name")
+            if not name:
+                return
+            spaces = rcm.load_workspaces()
+            if name in spaces:
+                self._dialog(Gtk.MessageType.ERROR,
+                             f"Workspace {name!r} already exists")
+                return
+            spaces[name] = [{"sel": c.sel, "protocol": "", "monitor": ""}
+                            for c in cs]
+            rcm.save_workspaces(spaces)
+            self.refresh_sidebar()
+            self.say(f"workspace {name!r} saved — double-click it in the "
+                     "sidebar; monitors and a shortcut live in Setup ▸ "
+                     "Workspaces")
+        save_ws.connect("activate", do_save_ws)
+        menu.append(save_ws)
 
         if len(cs) == 1:
             history = Gtk.MenuItem(label="History")
