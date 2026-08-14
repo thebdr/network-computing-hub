@@ -831,6 +831,18 @@ default = Browser
 launcher.Browser = xdg-open https://{host}:{port}/
 # Deliberately unmatchable: a browser tab is not ours to track as a session.
 detect.process = ^$
+
+# Via-gateways: hosts only reachable through a bastion. Point a connection at
+# one (Edit > Hooks & gateway, stored as rcm-via) and connecting first opens
+# `ssh -f -L <free port>:<host>:<port> <gateway> sleep <hold>`, then hands the
+# launcher 127.0.0.1:<free port> in {host}/{port}. Key auth to the gateway --
+# BatchMode never sits on a hidden prompt.
+#
+# [via:plant-gw]
+# host = gw.example.local
+# user = maint
+# ; port = 22        ; the gateway's SSH port
+# ; hold = 30        ; seconds the tunnel waits for the client to attach
 """,
     "creds.conf": """\
 # Credentials for rcm. Passwords are NOT stored here -- they live in the OS
@@ -1058,13 +1070,100 @@ def launcher_names(proto: str) -> list[str]:
         return []
 
 
-def launch_placeholder_values(c: Conn, p: Protocol, password: str = "") -> dict[str, str]:
+@help_topic("via-gateways", "Via-gateways (SSH tunnels)",
+            ("via", "gateway", "tunnel", "jump host", "bastion"),
+            section="Connections")
+def load_vias() -> dict[str, dict]:
+    """A host behind a bastion connects through an SSH tunnel, automatically.
+
+    Define the gateway once in protocols.conf: a `[via:plant-gw]` section with
+    `host =` and optionally `user =`, `port =` (its SSH port, 22) and `hold =`
+    (seconds the tunnel waits for the client to attach, 30). Point a
+    connection at it under Edit ▸ Hooks & gateway — stored in the .rdp as
+    `rcm-via:s:plant-gw`. Connecting then runs `ssh -f -L <free local
+    port>:<host>:<port> <gateway> sleep <hold>` and the launcher receives
+    127.0.0.1 and that port in {host} and {port}; the tunnel needs key auth
+    to the gateway (BatchMode, so it never sits on a hidden prompt) and ends
+    when the client disconnects. Such a session appears in the live list
+    under the tunnel address rather than the connection's name, and the pre
+    hook still sees the real {host} — it runs before the tunnel opens.
+    """
+    if not PROTOCOLS_FILE.is_file():
+        return {}
+    cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
+    cp.optionxform = str
+    cp.read(PROTOCOLS_FILE)
+    out: dict[str, dict] = {}
+    for section in cp.sections():
+        if not section.startswith("via:"):
+            continue
+        name = section.split(":", 1)[1].strip()
+        if not name:
+            raise ConfigError(f"{PROTOCOLS_FILE}: a [via:] section has no name")
+        raw = {k: v.strip() for k, v in cp.items(section)}
+        if not raw.get("host"):
+            raise ConfigError(f"{PROTOCOLS_FILE} [{section}] needs host =")
+        via = {"host": raw["host"], "user": raw.get("user", "")}
+        for key, default in (("port", 22), ("hold", 30)):
+            try:
+                via[key] = int(raw.get(key) or default)
+            except ValueError:
+                raise ConfigError(
+                    f"{PROTOCOLS_FILE} [{section}] {key}={raw[key]!r} "
+                    "is not a whole number") from None
+        out[name] = via
+    return out
+
+
+def open_via_tunnel(via_name: str, dest_host: str, dest_port: int) -> int:
+    """`ssh -f -L` to dest through the named gateway; returns the local port.
+
+    `-f` + ExitOnForwardFailure means a zero exit guarantees the forward is
+    listening; ssh backgrounds itself, holds `sleep <hold>` for the client to
+    attach, then lives exactly as long as the forwarded connection does.
+    """
+    vias = load_vias()
+    if via_name not in vias:
+        raise ConfigError(f"unknown via {via_name!r} -- {PROTOCOLS_FILE} "
+                          "defines: " + (", ".join(sorted(vias)) or "none"))
+    via = vias[via_name]
+    import socket
+    # Picked-then-released, so a parallel launch could steal it; ssh fails
+    # loudly (ExitOnForwardFailure) rather than silently sharing.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        local_port = probe.getsockname()[1]
+    target = f"{via['user']}@{via['host']}" if via["user"] else via["host"]
+    argv = ["ssh", "-f", "-o", "BatchMode=yes",
+            "-o", "ExitOnForwardFailure=yes", "-o", "ConnectTimeout=10",
+            "-L", f"{local_port}:{dest_host}:{dest_port}",
+            "-p", str(via["port"]), target, "sleep", str(via["hold"])]
+    # Output goes to a file, not pipes: the backgrounded (-f) tunnel keeps
+    # stderr open for its whole life, and reading a pipe to EOF would block
+    # the launch here until the tunnel died.
+    with tempfile.TemporaryFile(mode="w+") as output:
+        completed = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                                   stdout=output, stderr=output, timeout=45)
+        output.seek(0)
+        ssh_said = output.read().strip()
+    log_event("via", via=via_name, host=dest_host, port=dest_port,
+              local_port=local_port, exit_code=completed.returncode)
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"via {via_name}: tunnel failed (exit {completed.returncode}): "
+            f"{ssh_said or ' '.join(argv)}")
+    return local_port
+
+
+def launch_placeholder_values(c: Conn, p: Protocol, password: str = "",
+                              via: str = "") -> dict[str, str]:
     return {"file": str(c.path), "host": c.host, "user": c.username,
             "port": str(c.port_for(p)), "name": c.name, "exe": p.exe,
-            "password": password}
+            "password": password, "via": via}
 
 
-def build_argv(c: Conn, proto: str, launcher: str = "") -> list[str]:
+def build_argv(c: Conn, proto: str, launcher: str = "",
+               overrides: dict | None = None) -> list[str]:
     p = protocol(proto)
     name = launcher or p.default
     tmpl = p.launchers.get(name, "")
@@ -1072,6 +1171,8 @@ def build_argv(c: Conn, proto: str, launcher: str = "") -> list[str]:
         raise RuntimeError(f"{PROTOCOLS_FILE}: protocol {proto!r} has no launcher"
                            + (f" named {name!r}" if name else ""))
     vals = launch_placeholder_values(c, p)
+    if overrides:
+        vals.update(overrides)
     # Substitute per token so a path with spaces stays a single argument.
     return [tok.format(**vals) for tok in shlex.split(tmpl)]
 
@@ -1083,21 +1184,25 @@ def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
 
     The Connect buttons use each protocol's default launcher; right-click a
     row or a chip for the alternatives. A pre hook (rcm-pre) must exit 0
-    first or the launch stops; clients that refuse a password on the command
-    line get it typed into their prompt per the protocol's inject steps; the
-    MAC is learned after launch so ⚡ Wake works later; and every launch is
-    one line in the event log.
+    first or the launch stops; a via-gateway (rcm-via) then opens its SSH
+    tunnel and the client is pointed at the localhost end; clients that
+    refuse a password on the command line get it typed into their prompt per
+    the protocol's inject steps; the MAC is learned after launch so ⚡ Wake
+    works later; and every launch is one line in the event log.
     """
     p = protocol(proto or next(iter(load_protocols())))
+    via_name = (c.extra.get("rcm-via") or "").strip()
     argv = build_argv(c, p.id, launcher)
     if not shutil.which(argv[0]) and not Path(argv[0]).is_file():
         raise RuntimeError(f"{argv[0]} is not installed "
                            f"(launcher {launcher or p.default!r} for {p.label})")
     # Pre-hook: must exit 0 or the launch stops -- that is the contract that
-    # makes gateway tunnels and mount scripts safe to rely on.
+    # makes gateway tunnels and mount scripts safe to rely on. It sees the
+    # real {host}: it runs before any via-tunnel exists.
     pre_command = (c.extra.get("rcm-pre") or "").strip()
     if pre_command:
-        rendered = pre_command.format(**launch_placeholder_values(c, p))
+        rendered = pre_command.format(
+            **launch_placeholder_values(c, p, via=via_name))
         completed = subprocess.run(rendered, shell=True, capture_output=True,
                                    text=True, timeout=120)
         log_event("pre-hook", sel=c.sel, command=rendered,
@@ -1106,17 +1211,25 @@ def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
             raise RuntimeError(
                 f"pre hook failed (exit {completed.returncode}): "
                 f"{completed.stderr.strip() or rendered}")
+    if via_name:
+        local_port = open_via_tunnel(via_name, c.host, c.port_for(p))
+        argv = build_argv(c, p.id, launcher,
+                          {"host": "127.0.0.1", "port": str(local_port)})
     if p.injects:
         result = inject_credentials(c, p, argv)
     else:
         spawn_detached(argv, env=p.env or None)
         result = f"{p.label} -> {c.sel} ({c.host}) via {Path(argv[0]).name}"
+    if via_name:
+        result += f" (through via {via_name})"
     log_event("launch", sel=c.sel, host=c.host, protocol=p.id,
-              launcher=launcher or p.default)
+              launcher=launcher or p.default,
+              **({"via": via_name} if via_name else {}))
     post_command = (c.extra.get("rcm-post") or "").strip()
     if post_command:
         spawn_detached(["/bin/sh", "-c",
-                        post_command.format(**launch_placeholder_values(c, p))])
+                        post_command.format(
+                            **launch_placeholder_values(c, p, via=via_name))])
     # Remember the MAC while the host is surely on: that is what Wake needs later.
     mac = learn_mac(c.host)
     if mac and c.extra.get("rcm-mac") != mac:
@@ -1746,7 +1859,9 @@ def read_log_events(days: int = 7, kind: str = "", sel: str = "") -> list[dict]:
     from datetime import datetime, timedelta, timezone
     events: list[dict] = []
     today = datetime.now(timezone.utc).date()
-    for offset in range(days):
+    # Oldest file first, so the final reverse() is newest-first globally,
+    # not just within each day.
+    for offset in reversed(range(days)):
         day_file = LOGS_DIR / f"{today - timedelta(days=offset):%Y-%m-%d}.jsonl"
         if not day_file.is_file():
             continue
@@ -1902,9 +2017,10 @@ def config_health() -> list[HealthWarning]:
     layout's per-row columns, and warning banners on the Setup page itself.
 
     Checked: protocols.conf parses; each protocol's exe exists when set; each
-    protocol can detect its sessions (detect.process); a DEFAULT credential
-    exists so unmatched connections have a password; and how many connections
-    would prompt because nothing on their credential chain has one.
+    protocol can detect its sessions (detect.process); every rcm-via points
+    at a defined [via:*] gateway; a DEFAULT credential exists so unmatched
+    connections have a password; and how many connections would prompt
+    because nothing on their credential chain has one.
     """
     warnings: list[HealthWarning] = []
     try:
@@ -1926,6 +2042,19 @@ def config_health() -> list[HealthWarning]:
             warnings.append(HealthWarning(
                 f"no-launchers-{proto.id}",
                 f"{proto.id}: no launcher commands configured", "protocols"))
+
+    try:
+        vias = load_vias()
+    except ConfigError as broken:
+        vias = {}
+        warnings.append(HealthWarning("vias-broken", str(broken), "protocols"))
+    for c in conns_cached():
+        wanted = (c.extra.get("rcm-via") or "").strip()
+        if wanted and wanted not in vias:
+            warnings.append(HealthWarning(
+                f"via-missing-{c.sel}",
+                f"{c.sel}: via {wanted!r} has no [via:{wanted}] section "
+                "in protocols.conf", "protocols"))
 
     default_entry = creds_conf_table().get("DEFAULT")
     if not (secret_get("DEFAULT") or (default_entry and default_entry[1])):

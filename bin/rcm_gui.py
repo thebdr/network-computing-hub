@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import shlex
 import shutil
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -137,6 +138,40 @@ def protocols_safe() -> dict:
         return rcm.load_protocols()
     except rcm.ConfigError:
         return {}
+
+
+def event_summary(record: dict) -> str:
+    """One readable line for a log event; falls back to raw k=v pairs."""
+    kind = record.get("kind", "")
+    if kind == "script":
+        base = record.get("script", "?")
+        if "error" in record:
+            return f"{base} — {record['error']}"
+        code = record.get("exit_code")
+        extra = f" ({record['transport']})" if record.get("transport") else ""
+        return f"{base} — {'ok' if code == 0 else f'exit {code}'}{extra}"
+    if kind == "send-script":
+        return f"{record.get('script', '?')} typed into the terminal"
+    if kind == "launch":
+        text = f"{record.get('protocol', '?')} via {record.get('launcher', '?')}"
+        if record.get("via"):
+            text += f" (through {record['via']})"
+        return text
+    if kind == "terminal":
+        return f"terminal opened ({record.get('transport', 'ssh')})"
+    if kind == "probe":
+        return "came up" if record.get("state") == "up" else "went down"
+    if kind == "wake":
+        return f"magic packet → {record.get('mac', '?')}"
+    if kind == "via":
+        return (f"tunnel 127.0.0.1:{record.get('local_port')} → "
+                f"port {record.get('port')} (exit {record.get('exit_code')})")
+    if kind == "pre-hook":
+        return f"exit {record.get('exit_code')}: {record.get('command', '')}"
+    if kind == "workspace":
+        return f"{record.get('name')} — {record.get('members')} member(s)"
+    return " ".join(f"{k}={v}" for k, v in record.items()
+                    if k not in ("ts", "kind", "sel"))
 
 
 def proto_label(pid: str) -> str:
@@ -288,9 +323,12 @@ class Win(Gtk.Window):
             row.set_sensitive(layout_id in self.IMPLEMENTED_LAYOUTS)
             row.connect("toggled", self.on_layout_chosen, layout_id)
             box.pack_start(row, False, False, 2)
+        logs_row = Gtk.ModelButton(label="Logs…")
+        logs_row.connect("clicked", lambda *_: (popover.popdown(), self.show_logs()))
         setup_row = Gtk.ModelButton(label="Setup…")
         setup_row.connect("clicked", lambda *_: (popover.popdown(), self.on_setup()))
         box.pack_start(Gtk.Separator(), False, False, 4)
+        box.pack_start(logs_row, False, False, 0)
         box.pack_start(setup_row, False, False, 0)
         foot = Gtk.Label(xalign=0)
         foot.set_markup("<small>saved as <tt>layout =</tt> in ui.conf</small>")
@@ -759,6 +797,10 @@ class Win(Gtk.Window):
         side_scroller.add(self.sidebar)
         side.pack_start(side_scroller, True, True, 0)
         side.pack_start(Gtk.Separator(), False, False, 0)
+        logs_button = Gtk.Button(label="▤ Logs")
+        logs_button.set_relief(Gtk.ReliefStyle.NONE)
+        logs_button.connect("clicked", lambda *_: self.show_logs())
+        side.pack_start(logs_button, False, False, 0)
         self.setup_badge = Gtk.Button()
         self.setup_badge.set_relief(Gtk.ReliefStyle.NONE)
         self.setup_badge.connect("clicked", lambda *_: self.on_setup())
@@ -1018,8 +1060,12 @@ class Win(Gtk.Window):
         With the VTE library present the terminal opens in a tab in the bottom
         pane and shows exact live state — the shell is a child of this process.
         Without VTE it falls back to launching your external terminal. Multiple
-        hosts open one tab each. "Send script" feeds a script's lines into the
-        live terminal with the usual placeholder substitution.
+        hosts open one tab each. Right-click the terminal for Send script — it
+        types a file from scripts/ into the live session, substituting the
+        known {placeholders} ({host} {port} {user} {name} {file} {via}) and
+        leaving every other brace alone, since shell scripts have plenty of
+        their own. {password} is deliberately not substituted: a terminal is
+        scrollback, and scrollback is where passwords go to be found.
         """
         if not HAVE_VTE:
             rcm.spawn_detached(["x-terminal-emulator", "-e",
@@ -1029,6 +1075,8 @@ class Win(Gtk.Window):
             return
         self.ensure_terminal_pane()
         terminal = Vte.Terminal()
+        terminal.rcm_conn = c
+        terminal.connect("button-press-event", self.on_terminal_click)
         terminal.spawn_async(
             Vte.PtyFlags.DEFAULT, None,
             ["/usr/bin/ssh", f"{c.username}@{c.host}"], None,
@@ -1049,6 +1097,66 @@ class Win(Gtk.Window):
         self.terminal_pane.set_reveal_child(True)
         rcm.log_event("terminal", sel=c.sel, transport=transport)
 
+    def on_terminal_click(self, terminal, event):
+        if event.button != 3:
+            return False
+        menu = Gtk.Menu()
+        send = Gtk.MenuItem(label="Send script")
+        scripts_dir = rcm.APP / "scripts"
+        scripts = sorted(f for f in scripts_dir.glob("*") if f.is_file()) \
+            if scripts_dir.is_dir() else []
+        if scripts:
+            sub = Gtk.Menu()
+            for script in scripts:
+                mi = Gtk.MenuItem(label=script.name)
+                mi.connect("activate",
+                           lambda _m, path=script:
+                           self.send_script_to_terminal(terminal, path))
+                sub.append(mi)
+            send.set_submenu(sub)
+        else:
+            send.set_sensitive(False)
+        menu.append(send)
+        menu.append(Gtk.SeparatorMenuItem())
+        copy_item = Gtk.MenuItem(label="Copy")
+        copy_item.connect(
+            "activate",
+            lambda *_: terminal.copy_clipboard_format(Vte.Format.TEXT)
+            if hasattr(Vte, "Format") else terminal.copy_clipboard())
+        menu.append(copy_item)
+        paste_item = Gtk.MenuItem(label="Paste")
+        paste_item.connect("activate", lambda *_: terminal.paste_clipboard())
+        menu.append(paste_item)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+        return True
+
+    def send_script_to_terminal(self, terminal, script_path) -> None:
+        c = terminal.rcm_conn
+        try:
+            p = rcm.protocol("ssh")
+        except rcm.ConfigError:
+            p = rcm.protocol(c.default_protocol)
+        vals = rcm.launch_placeholder_values(
+            c, p, via=(c.extra.get("rcm-via") or "").strip())
+        del vals["password"]     # never into scrollback; {password} stays put
+        text = script_path.read_text(errors="replace")
+        rendered = re.sub(r"\{(%s)\}" % "|".join(vals),
+                          lambda mo: str(vals[mo.group(1)]), text)
+        if not rendered.endswith("\n"):
+            rendered += "\n"
+        self.feed_terminal(terminal, rendered)
+        rcm.log_event("send-script", sel=c.sel, script=script_path.name)
+        self.say(f"sent {script_path.name} into the {c.sel} terminal")
+
+    @staticmethod
+    def feed_terminal(terminal, text: str) -> None:
+        data = text.encode()
+        try:
+            terminal.feed_child(data)
+        except TypeError:    # older VTE introspection wants (text, length)
+            terminal.feed_child(text, len(data))
+
     def ensure_terminal_pane(self) -> None:
         if getattr(self, "terminal_pane", None) is not None:
             return
@@ -1067,22 +1175,30 @@ class Win(Gtk.Window):
     def run_script_dialog(self, conns: list) -> None:
         """Right-click ▸ Run script sends one script to every selected host.
 
-        Scripts are plain files in scripts/ — hand-editable and git-friendly.
-        Each host gets a verdict (✓ ok, ⟳ running, ✗ with its exit code and a
-        log link); "stop on first failure" halts the batch, Abort cancels the
-        rest. Transport is SSH when the host answers, WinRM otherwise. Output
-        is captured under logs/output/.
+        Scripts are plain files in scripts/ — hand-editable and git-friendly,
+        sent verbatim (no placeholder substitution; that is Send script's
+        job). Transport per host: SSH when port 22 answers (key auth — there
+        is no terminal to type a password into), else PowerShell over WinRM
+        (5985/5986, credentials from the chain; pywinrm installs itself on
+        first use). Each host's verdict stays in the dialog — ✓ ok,
+        ⟳ running, ✗ with its exit code — and double-clicking a finished row
+        opens its captured output under logs/output/. "Stop on first
+        failure" skips the rest after a ✗; Abort stops between hosts.
         """
         scripts_dir = rcm.APP / "scripts"
-        scripts = sorted(scripts_dir.glob("*")) if scripts_dir.is_dir() else []
+        scripts = sorted(f for f in scripts_dir.glob("*") if f.is_file()) \
+            if scripts_dir.is_dir() else []
         if not scripts:
             self._dialog(Gtk.MessageType.INFO, "No scripts",
                          f"Put runnable files in {scripts_dir} first.")
             return
         d = Gtk.Dialog(title=f"Run script on {len(conns)} host(s)",
-                       transient_for=self, modal=True)
-        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
-                      "Run", Gtk.ResponseType.OK)
+                       transient_for=self, modal=False)
+        close_btn = d.add_button(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
+        abort_btn = d.add_button("Abort", 1)
+        run_btn = d.add_button("Run", Gtk.ResponseType.OK)
+        abort_btn.set_sensitive(False)
+        d.set_default_response(Gtk.ResponseType.OK)
         box = d.get_content_area()
         box.set_border_width(10)
         box.set_spacing(6)
@@ -1091,70 +1207,191 @@ class Win(Gtk.Window):
             chooser.append_text(script.name)
         chooser.set_active(0)
         box.add(chooser)
+        transport_note = Gtk.Label(xalign=0)
+        transport_note.set_markup(
+            "<small>transport: SSH if 22 answers, else PowerShell (WinRM) · "
+            "sent, run, exit code collected</small>")
+        transport_note.get_style_context().add_class("dim-label")
+        box.add(transport_note)
         stop_toggle = Gtk.CheckButton(label="Stop on first failure")
         stop_toggle.set_active(True)
         box.add(stop_toggle)
-        results = Gtk.ListStore(str, str)
+        results = Gtk.ListStore(str, str, str)   # sel, verdict, output path
         view = Gtk.TreeView(model=results)
         for i, title in enumerate(("Host", "Result")):
             view.append_column(Gtk.TreeViewColumn(
                 title, Gtk.CellRendererText(), text=i))
-        box.add(view)
-        d.show_all()
-        if chooser.get_active_text():
-            for c in conns:
-                results.append([c.sel, "⟳ queued"])
-        response = d.run()
-        script_name = chooser.get_active_text()
-        stop_on_fail = stop_toggle.get_active()
-        d.destroy()
-        if response != Gtk.ResponseType.OK or not script_name:
-            return
-        self.run_script(scripts_dir / script_name, conns, stop_on_fail)
+        view.set_tooltip_text("double-click a finished row to open its output")
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(160)
+        scroller.add(view)
+        box.pack_start(scroller, True, True, 0)
+        for c in conns:
+            results.append([c.sel, "queued", ""])
+        view.connect("row-activated",
+                     lambda _tv, path, _col:
+                     results[path][2] and rcm.spawn_detached(
+                         ["xdg-open", results[path][2]]))
 
-    def run_script(self, script_path, conns: list, stop_on_fail: bool) -> None:
-        """Execute one script per host over ssh, logging each verdict."""
-        import threading
+        abort = threading.Event()
+
+        def on_response(_d, response):
+            if response == Gtk.ResponseType.OK:
+                script_name = chooser.get_active_text()
+                if not script_name:
+                    return
+                run_btn.set_sensitive(False)
+                chooser.set_sensitive(False)
+                stop_toggle.set_sensitive(False)
+                abort_btn.set_sensitive(True)
+                self._script_batch(scripts_dir / script_name, conns,
+                                   stop_toggle.get_active(), abort, results,
+                                   done=lambda: (abort_btn.set_sensitive(False),
+                                                 close_btn.grab_focus()))
+                return
+            if response == 1:            # Abort: between hosts, not mid-host
+                abort.set()
+                abort_btn.set_sensitive(False)
+                return
+            abort.set()
+            d.destroy()
+
+        d.connect("response", on_response)
+        d.show_all()
+
+    def _script_batch(self, script_path, conns: list, stop_on_fail: bool,
+                      abort: threading.Event, results, done) -> None:
+        """Worker thread: one host after another, verdicts into `results`."""
         output_dir = rcm.LOGS_DIR / "output"
         output_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+
+        def set_row(i, verdict, out_path=""):
+            def apply():
+                results[i][1] = verdict
+                if out_path:
+                    results[i][2] = out_path
+            GLib.idle_add(apply)
 
         def worker():
-            for c in conns:
-                target = f"{c.username}@{c.host}"
+            counts = {"ok": 0, "fail": 0}
+            for i, c in enumerate(conns):
+                if abort.is_set():
+                    set_row(i, "— aborted")
+                    continue
+                if counts["fail"] and stop_on_fail:
+                    set_row(i, "— skipped")
+                    continue
+                set_row(i, "⟳ running…")
+                out_file = output_dir / f"{rcm.slugify(c.sel)}-{stamp}.log"
                 try:
-                    with open(script_path) as script:
-                        completed = subprocess.run(
-                            ["ssh", target, "bash -s"], stdin=script,
-                            capture_output=True, text=True, timeout=300)
-                    verdict = ("✓ ok" if completed.returncode == 0
-                               else f"✗ exit {completed.returncode}")
-                    (output_dir / f"{rcm.slugify(c.sel)}.log").write_text(
-                        completed.stdout + completed.stderr)
+                    code, output, transport = self._script_one_host(
+                        c, script_path)
+                    out_file.write_text(output)
                     rcm.log_event("script", sel=c.sel, script=script_path.name,
-                                  exit_code=completed.returncode)
-                except (OSError, subprocess.SubprocessError) as problem:
-                    verdict = f"✗ {problem}"
+                                  transport=transport, exit_code=code,
+                                  output=str(out_file))
+                    if code == 0:
+                        counts["ok"] += 1
+                        set_row(i, f"✓ ok ({transport})", str(out_file))
+                    else:
+                        counts["fail"] += 1
+                        set_row(i, f"✗ exit {code} — double-click for log",
+                                str(out_file))
+                except Exception as problem:   # noqa: BLE001 -- verdict, not crash
+                    counts["fail"] += 1
                     rcm.log_event("script", sel=c.sel, script=script_path.name,
                                   error=str(problem))
-                GLib.idle_add(self.say, f"{c.sel}: {verdict}")
-                if stop_on_fail and verdict.startswith("✗"):
-                    break
+                    set_row(i, f"✗ {problem}")
+            GLib.idle_add(done)
+            GLib.idle_add(self.say,
+                          f"{script_path.name}: {counts['ok']} ✓, "
+                          f"{counts['fail']} ✗ on {len(conns)} host(s)")
 
         threading.Thread(target=worker, daemon=True).start()
-        self.say(f"running {script_path.name} on {len(conns)} host(s)…")
+
+    def _script_one_host(self, c, script_path) -> tuple[int, str, str]:
+        """(exit code, output, transport) for one host: SSH else WinRM."""
+        if rcm.probe_host(c.host, 22, timeout=2.0):
+            target = f"{c.username}@{c.host}" if c.username else c.host
+            with open(script_path) as script:
+                completed = subprocess.run(
+                    ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                     target, "bash -s"], stdin=script,
+                    capture_output=True, text=True, timeout=300)
+            return (completed.returncode,
+                    completed.stdout + completed.stderr, "ssh")
+        winrm_port = next((p for p in (5985, 5986)
+                           if rcm.probe_host(c.host, p, timeout=2.0)), 0)
+        if not winrm_port:
+            raise RuntimeError("no transport — nothing on 22 (ssh) "
+                               "or 5985/5986 (winrm)")
+        winrm = self._ensure_pywinrm()
+        user, pw = rcm.creds_lookup(c.sel, c.username)
+        if not pw or pw == "CHANGEME":
+            raise RuntimeError("winrm needs a password on the credential chain")
+        scheme = "https" if winrm_port == 5986 else "http"
+        session = winrm.Session(
+            f"{scheme}://{c.host}:{winrm_port}/wsman", auth=(user, pw),
+            transport="ntlm", server_cert_validation="ignore")
+        if script_path.suffix.lower() == ".ps1":
+            reply = session.run_ps(script_path.read_text(errors="replace"))
+        else:
+            # Send-then-run, same shape as the sftp path: the bytes land in
+            # %TEMP% and cmd runs them, so .bat files behave exactly as if
+            # double-clicked on the machine.
+            import base64
+            b64 = base64.b64encode(script_path.read_bytes()).decode()
+            reply = session.run_ps(
+                f"$p = Join-Path $env:TEMP 'rcm-{script_path.name}'; "
+                f"[IO.File]::WriteAllBytes($p, "
+                f"[Convert]::FromBase64String('{b64}')); "
+                "& cmd.exe /c $p; exit $LASTEXITCODE")
+        output = (reply.std_out + reply.std_err).decode(errors="replace")
+        return reply.status_code, output, f"winrm:{winrm_port}"
+
+    def _ensure_pywinrm(self):
+        """Import pywinrm, pip-installing --user on first WinRM use."""
+        try:
+            import winrm
+            return winrm
+        except ImportError:
+            pass
+        GLib.idle_add(self.say, "installing pywinrm (first WinRM use)…")
+        import sys
+        done = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--user", "pywinrm"],
+            capture_output=True, text=True, timeout=300)
+        if done.returncode != 0:
+            tail = (done.stderr.strip() or "?").splitlines()[-1]
+            raise RuntimeError(f"pip install --user pywinrm failed: {tail}")
+        import importlib
+        import site
+        importlib.invalidate_caches()
+        if site.getusersitepackages() not in sys.path:
+            sys.path.append(site.getusersitepackages())
+        import winrm
+        return winrm
 
     @help_topic_gui("logs-page", "The Logs page", ("logs", "history", "audit"),
                     section="Logs")
-    def show_logs(self) -> None:
+    def show_logs(self, sel: str = "") -> None:
         """Every session, script run, probe change and wake is on the Logs page.
 
-        Filter by kind and text, read the detail of any row including captured
-        script output, and Export. Right-click ▸ History on a connection opens
-        the same viewer pre-filtered to that one connection.
+        Reached from the Layout menu (Logs…), ▤ Logs under the Browse
+        sidebar, or right-click ▸ History — the same page pre-filtered to one
+        connection. The chips narrow to sessions / scripts / probes, the text
+        box matches any field, and the range reaches back up to 90 days.
+        Selecting a row shows every field the event carries, plus the
+        captured output for script runs (one file per host per run under
+        logs/output/). Export… writes exactly what the filters show, as CSV.
         """
         self.reset_body_references()
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         page.set_border_width(12)
+        holder = {"records": [], "filtered": [], "sel": sel}
+
         bar = Gtk.Box(spacing=8)
         back = Gtk.Button(label="‹ Back")
         back.connect("clicked",
@@ -1163,29 +1400,209 @@ class Win(Gtk.Window):
         heading = Gtk.Label()
         heading.set_markup("<b>Logs</b>")
         bar.pack_start(heading, False, False, 0)
+
+        chip_groups = (("All", None), ("Sessions", {"launch", "terminal"}),
+                       ("Scripts", {"script", "send-script"}),
+                       ("Probes", {"probe", "wake"}), ("Other", "other"))
+        named_union = {k for _t, kinds in chip_groups
+                       if isinstance(kinds, set) for k in kinds}
+        holder["kinds"] = None
+        chip_anchor = None
+        for title, kinds in chip_groups:
+            chip = Gtk.RadioButton.new_with_label_from_widget(chip_anchor, title)
+            chip.set_mode(False)     # draw as a toggle, not a dot
+            chip_anchor = chip_anchor or chip
+
+            def on_chip(button, kinds=kinds):
+                if button.get_active():
+                    holder["kinds"] = kinds
+                    refilter()
+            chip.connect("toggled", on_chip)
+            bar.pack_start(chip, False, False, 0)
+
+        entry = Gtk.SearchEntry()
+        entry.set_placeholder_text("filter connection, host, text…")
+        entry.connect("search-changed", lambda *_: refilter())
+        bar.pack_start(entry, True, True, 0)
+
+        days_combo = Gtk.ComboBoxText()
+        for label in ("Today", "7 days", "14 days", "30 days", "90 days"):
+            days_combo.append_text(label)
+        days_combo.set_active(2)
+
+        def on_days(_combo):
+            days = {0: 1, 1: 7, 2: 14, 3: 30, 4: 90}[days_combo.get_active()]
+            holder["records"] = rcm.read_log_events(days=days)
+            refilter()
+        days_combo.connect("changed", on_days)
+        bar.pack_start(days_combo, False, False, 0)
+
+        export_btn = Gtk.Button(label="Export…")
+        bar.pack_start(export_btn, False, False, 0)
         page.pack_start(bar, False, False, 0)
 
-        store = Gtk.ListStore(str, str, str)
-        for record in rcm.read_log_events(days=14):
-            extras = " ".join(f"{k}={v}" for k, v in record.items()
-                              if k not in ("ts", "kind"))
-            store.append([record["ts"], record["kind"], extras])
+        history_row = Gtk.Box(spacing=6)
+        history_chip = Gtk.Button()
+        history_chip.set_relief(Gtk.ReliefStyle.NONE)
+
+        def sync_history_chip():
+            if holder["sel"]:
+                history_chip.set_label(f"history: {holder['sel']}  ✕")
+                history_row.show_all()
+            else:
+                history_row.hide()
+
+        def clear_history(*_a):
+            holder["sel"] = ""
+            sync_history_chip()
+            refilter()
+        history_chip.connect("clicked", clear_history)
+        history_row.pack_start(history_chip, False, False, 0)
+        page.pack_start(history_row, False, False, 0)
+
+        store = Gtk.ListStore(str, str, str, str, int)
         view = Gtk.TreeView(model=store)
-        for i, title in enumerate(("When", "Kind", "Detail")):
-            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+        for i, (title, expand) in enumerate((("Time", False), ("Kind", False),
+                                             ("Connection", False),
+                                             ("Event", True))):
+            # Only Event ellipsizes; the narrow columns show whole values.
+            renderer = Gtk.CellRendererText(
+                ellipsize=Pango.EllipsizeMode.END if expand
+                else Pango.EllipsizeMode.NONE)
             col = Gtk.TreeViewColumn(title, renderer, text=i)
             col.set_resizable(True)
+            col.set_expand(expand)
             view.append_column(col)
         scroller = Gtk.ScrolledWindow()
         scroller.add(view)
         scroller.set_shadow_type(Gtk.ShadowType.IN)
-        page.pack_start(scroller, True, True, 0)
+
+        detail_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        detail_head = Gtk.Box(spacing=8)
+        detail_title = Gtk.Label(xalign=0)
+        detail_title.set_markup("<small>select an event for its detail</small>")
+        detail_title.get_style_context().add_class("dim-label")
+        detail_head.pack_start(detail_title, True, True, 0)
+        copy_btn = Gtk.Button(label="Copy")
+        copy_btn.set_sensitive(False)
+        detail_head.pack_end(copy_btn, False, False, 0)
+        detail_box.pack_start(detail_head, False, False, 0)
+        detail_view = Gtk.TextView(editable=False, monospace=True)
+        detail_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        detail_scroller = Gtk.ScrolledWindow()
+        detail_scroller.add(detail_view)
+        detail_scroller.set_shadow_type(Gtk.ShadowType.IN)
+        detail_box.pack_start(detail_scroller, True, True, 0)
+
+        split = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+        split.pack1(scroller, True, False)
+        split.pack2(detail_box, False, True)
+        split.set_position(320)
+        page.pack_start(split, True, True, 0)
+
+        foot = Gtk.Label(xalign=0)
+        foot.set_markup(f"<small>{GLib.markup_escape_text(str(rcm.LOGS_DIR))}"
+                        "/YYYY-MM-DD.jsonl · one line per event, plain files, "
+                        "rotated daily · script output under logs/output/"
+                        "</small>")
+        foot.get_style_context().add_class("dim-label")
+        page.pack_start(foot, False, False, 0)
+
+        def when(ts: str) -> str:
+            from datetime import datetime
+            try:
+                t = datetime.fromisoformat(ts).astimezone()
+            except ValueError:
+                return ts
+            now = datetime.now().astimezone()
+            return (t.strftime("%H:%M:%S") if t.date() == now.date()
+                    else t.strftime("%b %d %H:%M"))
+
+        def refilter(*_a):
+            text = entry.get_text().strip().lower()
+            store.clear()
+            holder["filtered"] = []
+            for record in holder["records"]:
+                if holder["sel"] and record.get("sel") != holder["sel"]:
+                    continue
+                kind = record.get("kind", "")
+                wanted = holder["kinds"]
+                if wanted == "other":
+                    if kind in named_union:
+                        continue
+                elif wanted and kind not in wanted:
+                    continue
+                if text and text not in " ".join(
+                        str(v).lower() for v in record.values()):
+                    continue
+                holder["filtered"].append(record)
+                store.append([when(record.get("ts", "")), kind,
+                              record.get("sel", ""), event_summary(record),
+                              len(holder["filtered"]) - 1])
+
+        def on_row_selected(selection):
+            model, it = selection.get_selected()
+            if not it:
+                return
+            record = holder["filtered"][model[it][4]]
+            detail_title.set_markup("<b>{}</b>  <small>{}</small>".format(
+                GLib.markup_escape_text(
+                    record.get("sel", "") or record.get("kind", "")),
+                GLib.markup_escape_text(record.get("ts", ""))))
+            lines = [f"{k} = {v}" for k, v in record.items()]
+            out_path = record.get("output", "")
+            if not out_path and record.get("kind") == "script" \
+                    and record.get("sel"):
+                legacy = (rcm.LOGS_DIR / "output"
+                          / f"{rcm.slugify(record['sel'])}.log")
+                if legacy.is_file():
+                    out_path = str(legacy)
+            if out_path and Path(out_path).is_file():
+                captured = Path(out_path).read_text(errors="replace")
+                lines += ["", f"--- captured output ({out_path}) ---",
+                          captured[-20000:]]
+            detail_view.get_buffer().set_text("\n".join(lines))
+            copy_btn.set_sensitive(True)
+        view.get_selection().connect("changed", on_row_selected)
+
+        def do_copy(*_a):
+            buffer = detail_view.get_buffer()
+            text = buffer.get_text(buffer.get_start_iter(),
+                                   buffer.get_end_iter(), False)
+            Gtk.Clipboard.get_default(Gdk.Display.get_default()).set_text(
+                text, -1)
+            self.say("event detail copied")
+        copy_btn.connect("clicked", do_copy)
+
+        def do_export(*_a):
+            dest = self._file_dialog("Export filtered log",
+                                     Gtk.FileChooserAction.SAVE,
+                                     name="rcm-log.csv")
+            if not dest:
+                return
+            import csv
+            import json
+            with open(dest, "w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["ts", "kind", "connection", "event", "raw"])
+                for record in holder["filtered"]:
+                    writer.writerow([record.get("ts", ""),
+                                     record.get("kind", ""),
+                                     record.get("sel", ""),
+                                     event_summary(record),
+                                     json.dumps(record, ensure_ascii=False)])
+            self.say(f"exported {len(holder['filtered'])} event(s) → {dest}")
+        export_btn.connect("clicked", do_export)
+
+        holder["records"] = rcm.read_log_events(days=14)
+        refilter()
         self.layout_container.pack_start(page, True, True, 0)
         self.layout_container.show_all()
+        sync_history_chip()
 
     def show_connection_history(self, c) -> None:
-        self.show_logs()   # viewer; a per-connection filter is a later refinement
-        self.say(f"history for {c.sel}")
+        """Right-click ▸ History: the Logs page pre-filtered to one host."""
+        self.show_logs(sel=c.sel)
 
     @help_topic_gui("help-window", "The Help window (F1)",
                     ("help", "f1", "guide", "open code"), section="Help")
@@ -1859,7 +2276,10 @@ class Win(Gtk.Window):
         kept, shown as e.g. "port 5901 kept", and return on re-tick.
 
         The password override and the shortcut live in their own expanders;
-        a blank password always means "leave as is".
+        a blank password always means "leave as is". Hooks & gateway holds
+        the pre/post commands (pre must exit 0 or the launch stops) and the
+        via-gateway picker for hosts that are only reachable through a
+        bastion's SSH tunnel.
         """
         new = c is None
         registry = protocols_safe()
@@ -2035,6 +2455,61 @@ class Win(Gtk.Window):
         sc_box.pack_start(sc_row, False, False, 0)
         body.pack_start(shortcut_expander, False, False, 0)
 
+        # ---- hooks + via-gateway (10b/10c) -------------------------------- #
+        old_pre = c.extra.get("rcm-pre", "") if c else ""
+        old_post = c.extra.get("rcm-post", "") if c else ""
+        old_via = c.extra.get("rcm-via", "") if c else ""
+        try:
+            via_names = sorted(rcm.load_vias())
+        except rcm.ConfigError:
+            via_names = []
+        hooks_expander = Gtk.Expander(
+            label="Hooks & gateway",
+            expanded=bool(old_pre or old_post or old_via))
+        hk_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        hk_box.set_border_width(6)
+        hooks_expander.add(hk_box)
+
+        def hook_row(label_text, value, placeholder):
+            row = Gtk.Box(spacing=6)
+            lab = Gtk.Label(label=label_text, xalign=0)
+            lab.set_width_chars(4)
+            row.pack_start(lab, False, False, 0)
+            entry = Gtk.Entry(text=value, activates_default=True)
+            entry.set_placeholder_text(placeholder)
+            row.pack_start(entry, True, True, 0)
+            hk_box.pack_start(row, False, False, 0)
+            return entry
+
+        pre_entry = hook_row("pre", old_pre,
+                             "must exit 0 or the launch stops")
+        post_entry = hook_row("post", old_post,
+                              "optional — runs after the launch")
+        via_row = Gtk.Box(spacing=6)
+        via_lab = Gtk.Label(label="via", xalign=0)
+        via_lab.set_width_chars(4)
+        via_row.pack_start(via_lab, False, False, 0)
+        via_combo = Gtk.ComboBoxText()
+        via_combo.append_text("(direct)")
+        for nm in via_names:
+            via_combo.append_text(nm)
+        if old_via and old_via not in via_names:
+            via_combo.append_text(f"{old_via} (missing!)")
+            via_combo.set_active(len(via_names) + 1)
+        else:
+            via_combo.set_active(via_names.index(old_via) + 1 if old_via else 0)
+        via_row.pack_start(via_combo, False, False, 0)
+        hk_box.pack_start(via_row, False, False, 0)
+        hook_hint = Gtk.Label(xalign=0)
+        hook_hint.set_markup(
+            "<small>placeholders: {host} {port} {user} {name} {file} {via}\n"
+            "via = SSH tunnel through a [via:*] gateway from protocols.conf "
+            "(key auth)</small>")
+        hook_hint.get_style_context().add_class("dim-label")
+        hook_hint.set_line_wrap(True)
+        hk_box.pack_start(hook_hint, False, False, 0)
+        body.pack_start(hooks_expander, False, False, 0)
+
         d.show_all()
         refresh_row_states()
         if d.run() != Gtk.ResponseType.OK:
@@ -2063,6 +2538,11 @@ class Win(Gtk.Window):
         new_pw = epw.get_text()
         drop_pw = clear_pw.get_active()
         new_binding = sc_btn.binding
+        new_pre = pre_entry.get_text().strip()
+        new_post = post_entry.get_text().strip()
+        via_choice = via_combo.get_active_text() or "(direct)"
+        new_via = ("" if via_choice == "(direct)"
+                   else via_choice.removesuffix(" (missing!)"))
         d.destroy()
 
         if not n or not h:
@@ -2091,6 +2571,12 @@ class Win(Gtk.Window):
             rcm.set_fields(target, host=h, username=u, port=rdp_port,
                            ports=ports, protocols=protos,
                            default_proto=default_pid)
+
+        for key, old, new_val in (("rcm-pre", old_pre, new_pre),
+                                  ("rcm-post", old_post, new_post),
+                                  ("rcm-via", old_via, new_via)):
+            if new_val != old:
+                rcm.set_connection_extra(target, key, new_val)
 
         sel = target.sel
         if drop_pw:
