@@ -207,7 +207,10 @@ rcm creds migrate       # move leftover plaintext into the keyring
 Two independent mechanisms, on purpose:
 
 - **Tick boxes** choose what the Connect buttons act on. Ticking a group ticks all of
-  its members. (With nothing ticked the buttons fall back to the highlighted rows.)
+  its members, and the tickbox in the column header ticks every *visible* row —
+  ✓ when all are ticked, – when only some are — so filtering first and then
+  ticking the header selects a whole group, tag or search result. (With nothing
+  ticked the buttons fall back to the highlighted rows.)
 - **Ctrl/Shift selection** chooses what the right-click menu acts on — connect with a
   specific program, edit, delete, or **Export ▸** the selection as `.rdp` files, a
   re-importable CSV, or a Radmin phonebook. A selected group means all of it.
@@ -267,6 +270,19 @@ Set a connection's shortcut in its **Edit** dialog; the general keys live under
 | `Super+R` | raise the manager |
 | `Super+W` / `Super+Q` | switcher: hold Super, tap to move, release to switch |
 | `Super+Alt+1…` | jump to a connection — focus if live, connect if not |
+
+The switcher grid shows live sessions as solid cards and every shortcut-bound
+connection that is *not* running as a dashed one. **W and Q cycle live sessions
+only** — switching means switching — while a dashed card is a launcher you
+**click**. Clicking any card commits it immediately; clicking the backdrop
+cancels. With nothing running, nothing is selected, so releasing Super closes
+the grid instead of connecting something you did not pick.
+
+Escape and Enter work only when the switcher can take the keyboard, which it
+cannot while Super is held: Cinnamon owns a keyboard grab for its own binding
+for the whole hold, so the popup gets the pointer instead and says so in its
+footer. That is also why W and Q keep working — each repeat re-fires the
+Cinnamon binding, which signals the running switcher.
 
 ```bash
 rcm shortcuts list|install|remove

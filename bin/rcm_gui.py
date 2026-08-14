@@ -110,6 +110,9 @@ def pretty_key(binding: str) -> str:
         return ""
     mods = re.findall(r"<([^>]+)>", binding)
     key = re.sub(r"<[^>]+>", "", binding)
+    # A lone letter reads as a key cap, not a character: Super+W, not Super+w.
+    if len(key) == 1 and key.isalpha():
+        key = key.upper()
     return "+".join([m.replace("Primary", "Ctrl") for m in mods] + [key])
 
 
@@ -542,7 +545,7 @@ class Win(Gtk.Window):
             child.destroy()
         for name in ("tree", "store", "slist", "sstore", "button_box", "sidebar",
                      "setup_badge", "filter_entry", "inspector_store",
-                     "cockpit_cards", "cards_revealer"):
+                     "cockpit_cards", "cards_revealer", "select_all_check"):
             setattr(self, name, None)
 
     def apply_layout(self, layout_id: str) -> None:
@@ -740,6 +743,7 @@ class Win(Gtk.Window):
         toggle.connect("toggled", self.on_check_toggled)
         col = Gtk.TreeViewColumn("", toggle, active=C_CHECK)
         col.set_min_width(30)
+        self.attach_select_all_header(col)
         self.tree.append_column(col)
 
         r = Gtk.CellRendererText()
@@ -843,6 +847,7 @@ class Win(Gtk.Window):
         toggle.connect("toggled", self.on_check_toggled)
         col = Gtk.TreeViewColumn("", toggle, active=C_CHECK)
         col.set_min_width(30)
+        self.attach_select_all_header(col)
         self.tree.append_column(col)
         live_renderer = Gtk.CellRendererText()
         col = Gtk.TreeViewColumn("Live", live_renderer, text=C_MARK)
@@ -1969,14 +1974,22 @@ class Win(Gtk.Window):
                         column_homogeneous=True)
         page.pack_start(grid, False, False, 0)
 
-        def card(col, row, title, blurb, buttons):
+        def card(col, row, title, blurb, buttons, summary_markup="",
+                 warn=False):
             frame = Gtk.Frame()
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             box.set_border_width(12)
             frame.add(box)
             head = Gtk.Label(xalign=0)
-            head.set_markup(f"<b>{title}</b>")
+            head.set_markup(f"<b>{title}</b>" + ("  ⚠" if warn else ""))
             box.pack_start(head, False, False, 0)
+            if summary_markup:
+                # The card states what is configured right now; the dim line
+                # under it names the file that says so.
+                summary = Gtk.Label(xalign=0)
+                summary.set_markup(summary_markup)
+                summary.set_line_wrap(True)
+                box.pack_start(summary, False, False, 0)
             sub = Gtk.Label(xalign=0)
             sub.set_markup(f"<small>{GLib.markup_escape_text(blurb)}</small>")
             sub.get_style_context().add_class("dim-label")
@@ -1990,26 +2003,71 @@ class Win(Gtk.Window):
             box.pack_start(row_box, False, False, 2)
             grid.attach(frame, col, row, 1, 1)
 
-        card(0, 0, "Protocols",
-             "protocols.conf — launchers, colours, detection, credential "
-             "typing, via-gateways",
-             [("Open…", self.on_protocols)])
-        card(1, 0, "Credentials",
-             "creds.conf maps scopes to usernames; passwords live in the "
-             "keyring only",
-             [("Open…", self.on_credentials)])
-        card(0, 1, "Keyboard shortcuts",
-             "shortcuts.conf — global keys, per-connection jumps, "
-             "workspace:<name> bindings",
-             [("Open…", self.on_shortcuts)])
+        registry = protocols_safe()
+        chips = protocol_badges(list(registry), registry) if registry else \
+            "<small>none configured</small>"
+        card(0, 0, "Protocols", "protocols.conf — launchers, colours, "
+             "detection, credential typing, via-gateways",
+             [("Edit…", self.on_protocols),
+              ("Add protocol", lambda: self.on_protocols(add=True))],
+             summary_markup=chips, warn=not registry)
+
+        scopes = rcm.creds_scopes()
+        have_default = rcm.creds_status("DEFAULT")[1]
+        scope_line = "  ·  ".join(
+            GLib.markup_escape_text(s) for s in scopes[:6]) or "none yet"
+        if len(scopes) > 6:
+            scope_line += f"  <small>+{len(scopes) - 6} more</small>"
+        card(1, 0, "Credentials", "usernames in creds.conf, passwords in the "
+             "OS keyring — never on disk",
+             ([("Set default…", self.on_credentials)] if not have_default
+              else []) + [("Manage…", self.on_credentials)],
+             summary_markup=scope_line
+             + ("" if have_default else
+                "\n<small>no DEFAULT password set — unmatched connections "
+                "will prompt</small>"),
+             warn=not have_default)
+
+        global_keys, per_session = rcm.load_shortcuts()
+        key_bits = []
+        if global_keys.get("focus"):
+            key_bits.append(f"{pretty_key(global_keys['focus'])} raise")
+        if global_keys.get("next"):
+            switcher = pretty_key(global_keys["next"])
+            if global_keys.get("prev"):
+                switcher += "/" + pretty_key(global_keys["prev"]).split("+")[-1]
+            key_bits.append(f"{switcher} switcher")
+        workspace_keys = sum(1 for k in per_session if k.startswith("workspace:"))
+        connection_keys = len(per_session) - workspace_keys
+        summary = "  ·  ".join(key_bits + [f"{connection_keys} connection keys"]
+                               + ([f"{workspace_keys} workspace keys"]
+                                  if workspace_keys else []))
+        card(0, 1, "Keyboard shortcuts", "shortcuts.conf — global keys, "
+             "per-connection jumps, workspace:<name> bindings",
+             [("Edit…", self.on_shortcuts),
+              ("Reinstall", lambda: self.say(
+                  "{} shortcut(s) reinstalled".format(
+                      self.install_shortcuts()[0])))],
+             summary_markup=GLib.markup_escape_text(summary))
+
         card(1, 1, "Import / Export",
              "CSV round-trip, .rdp files, Radmin phonebook (.rpb)",
-             [("Import…", self.on_import), ("Export…", self.on_export),
-              ("Phonebook…", self.on_phonebook)])
+             [("Import CSV…", self.on_import), ("Export…", self.on_export),
+              ("Phonebook…", self.on_phonebook)],
+             summary_markup="<small>{} connection(s) in {} group(s)</small>"
+             .format(len(rcm.conns_cached()), len(rcm.groups())))
+
+        try:
+            spaces = rcm.load_workspaces()
+        except Exception:      # noqa: BLE001 -- a typo here must not blank Setup
+            spaces = {}
+        space_line = "  ·  ".join(
+            f"{GLib.markup_escape_text(name)} <small>({len(members)})</small>"
+            for name, members in list(spaces.items())[:4]) or "none yet"
         card(0, 2, "Workspaces",
              "workspaces.conf — named sets opened together, with per-member "
              "protocol and monitor and a shortcut per set",
-             [("Open…", self.on_workspaces)])
+             [("Edit…", self.on_workspaces)], summary_markup=space_line)
 
         foot = Gtk.Label(xalign=0)
         foot.set_markup(f"<small>all of it plain files in "
@@ -2480,6 +2538,7 @@ class Win(Gtk.Window):
                                     else f"({visible} of {total})")
         if self.filter_entry is not None:
             self.filter_entry.set_tooltip_text(f"{visible} of {total} match")
+        self.refresh_select_all()
         self.refresh_sidebar()
         self.refresh_live()
         self.refresh_health()
@@ -2540,6 +2599,87 @@ class Win(Gtk.Window):
         self.store[it][C_CHECK] = bool(kids) and all(
             self.store[k][C_CHECK] for k in kids)
 
+    @help_topic_gui("select-all", "Ticking rows in bulk",
+                    ("select all", "tick", "header", "bulk"),
+                    section="Connections")
+    def attach_select_all_header(self, column) -> None:
+        """The tickbox in the column header ticks everything you can see.
+
+        It reports the list's state as much as it sets it: ✓ when every
+        visible row is ticked, – when only some are, empty when none. Because
+        it acts on *visible* rows, filtering first and then ticking the header
+        is the way to select a whole group, tag or search result. The Connect
+        buttons act on ticked rows, so this is how one click reaches many
+        machines.
+        """
+        header_check = Gtk.CheckButton()
+        header_check.show()
+        header_check.set_tooltip_text("tick or untick every visible row")
+        column.set_widget(header_check)
+        column.set_clickable(True)
+        # Two click targets, one behaviour: the checkbox itself consumes the
+        # clicks that land on it (so the column signal never fires there),
+        # while clicks elsewhere in the header only reach the column.
+        header_check.connect("toggled", self.on_select_all_toggled)
+        column.connect("clicked", self.on_select_all_clicked)
+        self.select_all_check = header_check
+
+    def on_select_all_toggled(self, header_check) -> None:
+        if getattr(self, "_select_all_syncing", False):
+            return       # our own repaint, not a click
+        self._select_all_event = Gtk.get_current_event_time()
+        self.apply_select_all(header_check.get_active())
+
+    def on_select_all_clicked(self, _column) -> None:
+        header_check = getattr(self, "select_all_check", None)
+        if header_check is None:
+            return
+        # One click can reach both paths (checkbox first, then the header
+        # button around it). Whichever ran first owns this event.
+        if Gtk.get_current_event_time() == getattr(self, "_select_all_event",
+                                                   None):
+            return
+        # none -> all, some -> all, all -> none: from a partial state the
+        # useful click is "finish selecting", not "lose my ticks".
+        self.apply_select_all(not header_check.get_active())
+
+    def apply_select_all(self, want: bool) -> None:
+        if self.store is None:
+            return
+
+        def paint_all(it):
+            while it is not None:
+                self.store[it][C_CHECK] = want
+                paint_all(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        paint_all(self.store.get_iter_first())
+        self.refresh_select_all()
+        count = len(self.checked_sels())
+        self.say(f"{count} connection(s) ticked" if count else "nothing ticked")
+
+    def refresh_select_all(self) -> None:
+        """Header tickbox mirrors the visible rows: all / some / none."""
+        header_check = getattr(self, "select_all_check", None)
+        if header_check is None or self.store is None:
+            return
+        totals = {"rows": 0, "ticked": 0}
+
+        def count(it):
+            while it is not None:
+                if self.store[it][C_SEL]:
+                    totals["rows"] += 1
+                    totals["ticked"] += bool(self.store[it][C_CHECK])
+                count(self.store.iter_children(it))
+                it = self.store.iter_next(it)
+        count(self.store.get_iter_first())
+        every = totals["rows"] and totals["ticked"] == totals["rows"]
+        self._select_all_syncing = True
+        try:
+            header_check.set_inconsistent(0 < totals["ticked"] < totals["rows"])
+            header_check.set_active(bool(every))
+        finally:
+            self._select_all_syncing = False
+
     def on_check_toggled(self, _renderer, path) -> None:
         """Tick a row. A group carries its whole subtree with it, at any depth."""
         it = self.store.get_iter(path)
@@ -2555,8 +2695,7 @@ class Win(Gtk.Window):
         while parent is not None:
             self._sync_group_check(parent)
             parent = self.store.iter_parent(parent)
-        n = len(self.checked_sels())
-        self.say(f"{n} connection(s) ticked" if n else "nothing ticked")
+        self.refresh_select_all()
         n = len(self.checked_sels())
         self.say(f"{n} connection(s) ticked" if n else "nothing ticked")
 
@@ -3433,8 +3572,12 @@ class Win(Gtk.Window):
         self.say(f"jump list rebuilt for {rcm.gen_launcher()} connection(s)")
 
     # ---- protocols ----------------------------------------------------------- #
-    def on_protocols(self, *_):
-        """Edit protocols.conf: buttons, commands, detection and credential typing."""
+    def on_protocols(self, *_, add: bool = False):
+        """Edit protocols.conf: buttons, commands, detection and credential typing.
+
+        `add=True` opens straight into the new-protocol prompt, which is what
+        Setup ▸ Protocols ▸ "Add protocol" wants.
+        """
         d = Gtk.Dialog(title="Protocols", transient_for=self, modal=True)
         d.add_buttons(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
         d.set_default_size(760, 620)
@@ -3672,6 +3815,8 @@ class Win(Gtk.Window):
         save.connect("clicked", do_save)
 
         d.show_all()
+        if add:
+            GLib.idle_add(do_new)
         d.run()
         d.destroy()
 
