@@ -253,7 +253,9 @@ members that are already live; they sit under WORKSPACES in the same sidebar
 (click shows the members, double-click connects them all), a member with a
 monitor number gets its window moved there once it appears, and
 `workspace:<name> = <combo>` under `[sessions]` in shortcuts.conf binds a key to
-the whole set.
+the whole set. Build them with right-click ▸ **Save as workspace…** on a
+selection, then shape members, launch order (drag), monitors and the shortcut
+under **Setup ▸ Workspaces**.
 
 ## Keyboard shortcuts
 
