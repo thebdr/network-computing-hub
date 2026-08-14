@@ -216,14 +216,25 @@ Two independent mechanisms, on purpose:
   re-importable CSV, or a Radmin phonebook. A selected group means all of it.
 
 **Ctrl+C / Ctrl+V** copy connections and whole groups (subtree included) and paste
-them into whichever group you are in — the sidebar selection, else the highlighted
-row's group, else the top level. A pasted copy is a byte copy of the `.rdp`, so tags,
-hooks, gateway and per-protocol ports come along; names never collide, since an
-existing name becomes `<name> (copy)`, then `(copy 2)`. Pasting into the same place
-is therefore how you duplicate, and copying a group and pasting it straight back puts
-the duplicate beside the original rather than inside it. Passwords are deliberately
-not copied: the keyring entry belongs to the original's name, so the copy inherits
-from its group chain until you give it one of its own.
+them **inside** whichever group you are in — the sidebar selection, else the
+highlighted row's group, else the top level. That one rule holds whatever is on the
+clipboard and wherever you paste it, including a group pasted into itself (staged
+through a temporary copy so it cannot walk into what it is writing). A pasted copy is
+a byte copy of the `.rdp`, so tags, hooks, gateway and per-protocol ports come along;
+names never collide, since an existing name becomes `<name> (copy)`, then `(copy 2)`.
+Passwords are deliberately not copied: the keyring entry belongs to the original's
+name, so the copy inherits from its group chain until you give it one of its own.
+
+| Key | Action |
+|---|---|
+| `Ctrl+C` / `Ctrl+V` | copy the selection · paste inside the current group |
+| `Ctrl+D` | duplicate the selection beside itself |
+| `Ctrl+E` | edit the highlighted connection |
+| `Delete` | delete the selection |
+
+Right-clicking a group in the Browse sidebar copies, pastes into, or deletes that
+whole group; groups fold away with their expander in both the sidebar and the list,
+and stay folded until you open them again (a filter match opens what it matched).
 
 ## The manager
 
@@ -233,9 +244,11 @@ collapsible group sidebar (the ⊞ button), Live and per-protocol filter chips, 
 live sessions appearing as a strip of one-line cards only while any exist — each with
 👁 to focus it and an unplugged-cable button to disconnect. Browse also has an **icon
 view** (the grid button, saved as `browse_view` in `ui.conf`): every connection as a
-machine with its protocol chips on it, double-click a chip to connect over that
-protocol, and a details pane beside the grid carrying the full record of whatever is
-selected; **Inspector** — a
+machine with its protocol chips across its screen — wrapping, spilling past the case
+when there are many, the default underlined — grouped under the same headings and
+tickboxes as the list, with a details pane beside the grid carrying the full record of
+whatever is selected. A single click selects; double-click a chip to connect over that
+protocol, or the tile for its default; **Inspector** — a
 read-only audit showing where every connection's password comes from and whether its
 protocols are healthy; **Classic** — the original window. (Earlier builds shipped
 Browse's variants as separate Rail/Spotlight/Cockpit modes; they were one layout
