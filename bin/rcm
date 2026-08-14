@@ -870,8 +870,11 @@ DEFAULT||
 #   member.1 = <group/name>|<protocol>|<monitor>
 #
 # protocol and monitor are optional; blank means the connection's default and
-# no placement. Connect one with `rcm workspace <name>`, or give it a keyboard
-# shortcut under [sessions] in shortcuts.conf as `workspace:<name> = <combo>`.
+# no placement. monitor is 1-based in xrandr order: the member's window is
+# moved there once it appears (a move, not a resize; already-live windows
+# stay put). Connect one with `rcm workspace <name>`, double-click it in the
+# Browse sidebar, or give it a keyboard shortcut under [sessions] in
+# shortcuts.conf as `workspace:<name> = <combo>`.
 """,
     "ui.conf": """\
 # Manager window state. The GUI writes this; editing it by hand is equally fine.
@@ -913,6 +916,7 @@ prev = <Super>q
 [sessions]
 # Focuses the connection if a session is live, otherwise connects it.
 # One line per connection, e.g.:  GROUP/Host = <Super><Alt>1
+# `workspace:<name> = <combo>` opens that whole workspace instead.
 """,
 }
 
@@ -2256,7 +2260,8 @@ def save_shortcuts(globals_: dict[str, str], per_session: dict[str, str]) -> Non
         L.append(f"# {desc}")
         L.append(f"{key} = {val}")
     L += ["", "[sessions]",
-          "# Focuses the connection if a session is live, otherwise connects it."]
+          "# Focuses the connection if a session is live, otherwise connects it.",
+          "# `workspace:<name> = <combo>` opens that whole workspace instead."]
     for sel, binding in per_session.items():
         L.append(f"{sel} = {binding.strip()}")
     SHORTCUTS.write_text("\n".join(L) + "\n")
