@@ -101,6 +101,9 @@ def build_protocol_css(protos) -> bytes:
     out.append("button.rcm-tab { padding: 0px 8px; min-height: 0; "
                "font-size: 85%; }\n"
                "button.rcm-tab image { padding: 0; min-height: 0; }\n")
+    # Group headings in the icon view read as bands, like the list's rows.
+    out.append(".rcm-group-heading { background-color: alpha("
+               "@theme_selected_bg_color, 0.16); padding: 2px 6px; }\n")
     return "".join(out).encode()
 
 
@@ -266,6 +269,8 @@ class Win(Gtk.Window):
         # Copy/paste holds real objects, not text: it survives a reload and
         # knows the difference between a group and its members.
         self.clipboard = {"conns": [], "groups": []}
+        # Groups the operator folded away, by full path; survives reloads.
+        self.collapsed_groups: set[str] = set()
         self.layout_button = Gtk.MenuButton()
         self.layout_button.set_tooltip_text("Window layout — saved in ui.conf")
         self.layout_label = Gtk.Label(label=f"Layout: {self.ui_state['layout'].title()} ▾")
@@ -507,7 +512,41 @@ class Win(Gtk.Window):
             if key_name in ("v", "V"):
                 self.paste_clipboard_here()
                 return True
+            if key_name in ("d", "D"):
+                self.duplicate_selection()
+                return True
+            if key_name in ("e", "E"):
+                self.on_edit()
+                return True
+        if key_name == "Delete" and not isinstance(self.get_focus(),
+                                                   (Gtk.Entry, Gtk.TextView)):
+            self.on_delete()
+            return True
         return False
+
+    def duplicate_selection(self) -> None:
+        """Ctrl+D: a copy beside each selected connection or group."""
+        rows = self.selected_rows_for_copy()
+        if not rows["conns"] and not rows["groups"]:
+            self.say("select something to duplicate")
+            return
+        made: list[str] = []
+        try:
+            for c in rows["conns"]:
+                made += rcm.paste_into(c.group, [c], [])
+            for group in rows["groups"]:
+                parent = group.rsplit("/", 1)[0] if "/" in group else ""
+                made += rcm.paste_into(parent, [], [group])
+        except (OSError, ValueError) as problem:
+            self._dialog(Gtk.MessageType.ERROR, "Cannot duplicate",
+                         str(problem))
+            return
+        rcm.gen_launcher()
+        self.reload()
+        self.select_after_paste(made)
+        self.say(f"duplicated {len(made)} item(s) — "
+                 + ", ".join(name.rsplit("/", 1)[-1] for name in made[:3])
+                 + ("…" if len(made) > 3 else ""))
 
     @help_topic_gui("copy-paste-keys", "Copy and paste in the list",
                     ("ctrl+c", "ctrl+v", "copy", "paste", "duplicate"),
@@ -515,14 +554,19 @@ class Win(Gtk.Window):
     def copy_selection(self) -> None:
         """Ctrl+C copies the highlighted rows; Ctrl+V pastes into where you are.
 
-        Whole groups copy with everything under them. The paste target is the
-        group you have selected in the sidebar (or the group of the
-        highlighted row, or the top level) — so pasting into the same place
-        duplicates, with "(copy)" appended rather than a name clash. Copying
-        a group and pasting it straight back puts the duplicate beside the
-        original rather than inside it. Nothing is ever overwritten. The
-        selection also lands on the system clipboard as plain text, which is
-        handy for pasting a host list into a ticket.
+        Whole groups copy with everything under them. Paste always means
+        "inside the target": the group selected in the sidebar, else the
+        group of the highlighted row, else the top level — the same rule
+        whether you copied a connection or a group, and whether the target is
+        the place you copied from or another one. Nothing is ever
+        overwritten; a name already in use becomes "(copy)", then "(copy 2)".
+
+        **Ctrl+D** is the neighbour gesture: it duplicates the selection
+        beside itself without touching the clipboard. **Delete** removes the
+        selection, **Ctrl+E** edits the highlighted connection.
+
+        The selection also lands on the system clipboard as plain text, which
+        is handy for pasting a host list into a ticket.
         """
         rows = self.selected_rows_for_copy()
         if not rows["conns"] and not rows["groups"]:
@@ -548,6 +592,9 @@ class Win(Gtk.Window):
         """
         out = {"conns": [], "groups": []}
         if self.tree is None:
+            # Icon view: tiles are connections; whole groups are copied from
+            # the sidebar's right-click menu instead.
+            out["conns"] = self.selected_tiles()
             return out
         model, paths = self.tree.get_selection().get_selected_rows()
         picked_groups: list[str] = []
@@ -603,23 +650,10 @@ class Win(Gtk.Window):
             self.say("clipboard is empty — Ctrl+C copies the selection first")
             return
         target = self.paste_target_group()
-        # Copying a group and pasting with it still selected means "duplicate
-        # this", not the impossible "put it inside itself": such a group lands
-        # beside the original instead.
-        plans: dict[str, dict] = {target: {"conns": board["conns"],
-                                           "groups": []}}
-        for group in board["groups"]:
-            where = target
-            if where == group or where.startswith(group + "/"):
-                where = group.rsplit("/", 1)[0] if "/" in group else ""
-            plans.setdefault(where, {"conns": [], "groups": []})
-            plans[where]["groups"].append(group)
-        made: list[str] = []
+        # One rule, whatever is on the clipboard and wherever you are: paste
+        # puts things INSIDE the selected group. "Beside this one" is Ctrl+D.
         try:
-            for where, work in plans.items():
-                if work["conns"] or work["groups"]:
-                    made += rcm.paste_into(where, work["conns"],
-                                           work["groups"])
+            made = rcm.paste_into(target, board["conns"], board["groups"])
         except (OSError, ValueError) as problem:
             self._dialog(Gtk.MessageType.ERROR, "Cannot paste", str(problem))
             return
@@ -637,10 +671,11 @@ class Win(Gtk.Window):
     def select_after_paste(self, made: list[str]) -> None:
         wanted = set(made)
         if getattr(self, "icon_box", None) is not None:
-            self.icon_box.unselect_all()
-            for child in self.icon_box.get_children():
-                if getattr(child, "rcm_sel", "") in wanted:
-                    self.icon_box.select_child(child)
+            for flow in getattr(self, "icon_flows", []) or []:
+                flow.unselect_all()
+                for child in flow.get_children():
+                    if getattr(child, "rcm_sel", "") in wanted:
+                        flow.select_child(child)
             return
         if self.tree is None:
             return
@@ -1021,7 +1056,12 @@ class Win(Gtk.Window):
         for idx, title, minw in ((C_LABEL, "Connection", 150),
                                  (C_HOST, "Host", 118), (C_USER, "User", 78),
                                  (C_PROTOS, "Protocols", 168), (C_KEY, "Key", 86)):
-            renderer = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            # Protocols never ellipsises: a half-drawn chip row reads as a
+            # missing protocol, so that column sizes to its content and the
+            # list scrolls sideways instead of lying.
+            renderer = Gtk.CellRendererText(
+                ellipsize=Pango.EllipsizeMode.NONE if idx == C_PROTOS
+                else Pango.EllipsizeMode.END)
             if idx in (C_LABEL, C_HOST, C_PROTOS):
                 col = Gtk.TreeViewColumn(title, renderer, markup=idx)
             else:
@@ -1031,9 +1071,15 @@ class Win(Gtk.Window):
             col.set_resizable(True)
             col.set_min_width(minw)
             col.set_expand(idx == C_LABEL)
+            if idx == C_PROTOS:
+                col.set_sizing(Gtk.TreeViewColumnSizing.AUTOSIZE)
             self.tree.append_column(col)
             if idx == C_PROTOS:
                 self.protocols_column = col
+        self.paint_group_headings()
+        self.tree.connect("row-expanded", self.on_group_expansion_changed, True)
+        self.tree.connect("row-collapsed", self.on_group_expansion_changed,
+                          False)
         self.tree.connect("row-activated", self.on_row_activated)
         self.tree.connect("button-press-event", self.on_tree_click)
         scroller = Gtk.ScrolledWindow()
@@ -1240,26 +1286,28 @@ class Win(Gtk.Window):
     def build_icon_view(self):
         """Browse can show machines instead of rows — the ⊞/▦ button switches.
 
-        Each connection is one machine: a computer with its protocol chips on
-        it, its name and host underneath. Double-click a chip to connect over
+        Each connection is one machine: a computer with its protocol chips
+        across its screen — wrapping onto as many rows as they need, spilling
+        past the case when there are many — the default protocol underlined,
+        and its name and host underneath. Double-click a chip to connect over
         that protocol; double-click anywhere else on the tile for its default
-        one. Single-click fills the details pane on the right, which is the
-        whole record — host, user, protocols, shortcut, tags, gateway, hooks,
-        where its password comes from — so the grid stays uncluttered without
-        hiding anything. The choice is saved as `browse_view` in ui.conf.
+        one. A single click only selects: it fills the details pane on the
+        right, which is the whole record — host, user, protocols, shortcut,
+        tags, gateway, hooks, where its password comes from — so the grid
+        stays uncluttered without hiding anything.
+
+        Groups and tickboxes work as they do in the list: machines sit under
+        their group heading, the heading's tickbox takes the whole group, and
+        the Connect buttons act on what is ticked. The choice of view is
+        saved as `browse_view` in ui.conf.
         """
         split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        self.icon_box = Gtk.FlowBox()
-        self.icon_box.set_valign(Gtk.Align.START)
-        self.icon_box.set_max_children_per_line(12)
-        self.icon_box.set_min_children_per_line(2)
-        self.icon_box.set_row_spacing(6)
-        self.icon_box.set_column_spacing(6)
+        # A column of group sections, each with its own tile grid: the icon
+        # view keeps the list's grouping and its tickboxes.
+        self.icon_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
         self.icon_box.set_border_width(6)
-        self.icon_box.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
-        self.icon_box.connect("selected-children-changed",
-                              lambda *_: self.refresh_details_pane())
-        self.icon_box.connect("child-activated", self.on_tile_activated)
+        self.icon_flows: list = []
+        self.icon_checked: set[str] = getattr(self, "icon_checked", set())
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.add(self.icon_box)
@@ -1288,103 +1336,200 @@ class Win(Gtk.Window):
         return split
 
     def refresh_icon_view(self) -> None:
-        """Rebuild the tiles from the current filter."""
+        """Rebuild the group sections and their tiles from the current filter."""
         if getattr(self, "icon_box", None) is None:
             return
         for child in self.icon_box.get_children():
             child.destroy()
+        self.icon_flows = []
         registry = protocols_safe()
         live = rcm.active_sels()
-        shown = 0
+        by_group: dict[str, list] = {}
         for c in rcm.conns_cached():
             if not (self.connection_matches_query(c)
                     and self.chip_filters_allow(c)):
                 continue
-            shown += 1
-            tile = Gtk.FlowBoxChild()
-            tile.rcm_sel = c.sel
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            box.set_border_width(6)
+            by_group.setdefault(c.group, []).append(c)
+        shown = sum(len(v) for v in by_group.values())
 
-            # The machine, with its protocols sitting on it.
-            overlay = Gtk.Overlay()
-            machine = Gtk.Image.new_from_icon_name("computer",
-                                                   Gtk.IconSize.DIALOG)
-            machine.set_pixel_size(56)
-            overlay.add(machine)
-            chip_row = Gtk.Box(spacing=2)
-            chip_row.set_halign(Gtk.Align.CENTER)
-            chip_row.set_valign(Gtk.Align.END)
-            for pid in c.protocols:
-                proto = registry.get(pid)
-                if not proto:
-                    continue
-                chip = Gtk.EventBox()
-                chip.rcm_pid = pid
-                label = Gtk.Label()
-                label.set_markup(
-                    f'<span background="{resolve_colour(proto.color)}" '
-                    f'foreground="#ffffff" size="x-small"> '
-                    f'{GLib.markup_escape_text(proto.label)} </span>')
-                chip.add(label)
-                chip.set_tooltip_text(
-                    f"double-click: connect {c.sel} over {proto.label}")
-                chip.connect("button-press-event", self.on_tile_chip_press,
-                             c.sel, pid)
-                chip_row.pack_start(chip, False, False, 0)
-            overlay.add_overlay(chip_row)
-            box.pack_start(overlay, False, False, 0)
+        for group in sorted(by_group):
+            heading = Gtk.Box(spacing=6)
+            group_check = Gtk.CheckButton()
+            group_check.set_tooltip_text("tick every machine in this group")
+            members = [c.sel for c in by_group[group]]
+            ticked_here = [s for s in members if s in self.icon_checked]
+            group_check.set_inconsistent(0 < len(ticked_here) < len(members))
+            group_check.set_active(len(ticked_here) == len(members))
+            group_check.connect("toggled", self.on_icon_group_toggled, members)
+            heading.pack_start(group_check, False, False, 0)
+            title = Gtk.Label(xalign=0)
+            title.set_markup(
+                f"<b>{GLib.markup_escape_text(group or '(top level)')}</b>"
+                f"  <small>({len(members)})</small>")
+            heading.pack_start(title, False, False, 0)
+            heading.get_style_context().add_class("rcm-group-heading")
+            self.icon_box.pack_start(heading, False, False, 0)
 
-            name = Gtk.Label()
-            marker = "● " if c.sel in live else ""
-            name.set_markup(f"<b>{marker}{GLib.markup_escape_text(c.name)}</b>")
-            name.set_ellipsize(Pango.EllipsizeMode.END)
-            name.set_max_width_chars(18)
-            box.pack_start(name, False, False, 0)
-            host = Gtk.Label()
-            host.set_markup(f"<small>{GLib.markup_escape_text(c.host)}</small>")
-            host.get_style_context().add_class("dim-label")
-            host.set_ellipsize(Pango.EllipsizeMode.END)
-            host.set_max_width_chars(18)
-            box.pack_start(host, False, False, 0)
-            tile.add(box)
-            tile.set_tooltip_text(f"{c.sel} — double-click connects "
-                                  f"{proto_label(c.default_protocol)}")
-            self.icon_box.add(tile)
+            flow = Gtk.FlowBox()
+            flow.set_valign(Gtk.Align.START)
+            flow.set_max_children_per_line(12)
+            flow.set_min_children_per_line(1)
+            flow.set_row_spacing(6)
+            flow.set_column_spacing(6)
+            flow.set_selection_mode(Gtk.SelectionMode.MULTIPLE)
+            # Single click selects and fills the details pane; connecting is
+            # a double-click, like the list's rows.
+            flow.set_activate_on_single_click(False)
+            flow.connect("selected-children-changed",
+                         lambda *_: self.refresh_details_pane())
+            flow.connect("child-activated", self.on_tile_activated)
+            self.icon_flows.append(flow)
+            self.icon_box.pack_start(flow, False, False, 0)
+
+            for c in by_group[group]:
+                flow.add(self.build_tile(c, registry, live))
         self.icon_box.show_all()
         if getattr(self, "count_lbl", None):
             total = len(rcm.conns_cached())
             self.count_lbl.set_text(f"({shown})" if shown == total
                                     else f"({shown} of {total})")
 
-    def on_tile_chip_press(self, _widget, event, sel: str, pid: str):
-        """Double-click a chip: that protocol. Single click still selects."""
+    def build_tile(self, c, registry, live):
+        """One machine: tickbox, computer with its protocols on the screen."""
+        tile = Gtk.FlowBoxChild()
+        tile.rcm_sel = c.sel
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_border_width(4)
+        box.set_size_request(132, -1)   # room for two chips side by side
+
+        top = Gtk.Box()
+        check = Gtk.CheckButton()
+        check.set_active(c.sel in self.icon_checked)
+        check.set_tooltip_text(f"tick {c.sel} for the Connect buttons")
+        check.connect("toggled", self.on_icon_tile_toggled, c.sel)
+        top.pack_start(check, False, False, 0)
+        box.pack_start(top, False, False, 0)
+
+        overlay = Gtk.Overlay()
+        # FILL, not the image's own width: the overlay child may then use the
+        # whole tile, so a machine with many protocols spills its chips into
+        # the space either side of the case instead of stacking one per row.
+        overlay.set_halign(Gtk.Align.FILL)
+        machine = Gtk.Image.new_from_icon_name("computer", Gtk.IconSize.DIALOG)
+        machine.set_pixel_size(72)
+        machine.set_halign(Gtk.Align.CENTER)
+        overlay.add(machine)
+        # The chips ride on the screen of the machine: two per row, wrapping
+        # downward, and free to overhang the case when there are several.
+        chip_grid = Gtk.FlowBox()
+        chip_grid.set_selection_mode(Gtk.SelectionMode.NONE)
+        chip_grid.set_max_children_per_line(2)
+        chip_grid.set_min_children_per_line(2)
+        chip_grid.set_row_spacing(1)
+        chip_grid.set_column_spacing(1)
+        chip_grid.set_halign(Gtk.Align.CENTER)
+        chip_grid.set_valign(Gtk.Align.CENTER)
+        chip_grid.set_margin_bottom(16)      # sit on the screen, not the base
+        for pid in c.protocols:
+            proto = registry.get(pid)
+            if not proto:
+                continue
+            chip = Gtk.EventBox()
+            chip.rcm_pid = pid
+            label = Gtk.Label()
+            name = GLib.markup_escape_text(proto.label)
+            if pid == c.default_protocol:
+                name = f"<u>{name}</u>"
+            label.set_markup(
+                f'<span background="{resolve_colour(proto.color)}" '
+                f'foreground="#ffffff" size="small"> {name} </span>')
+            chip.add(label)
+            chip.set_tooltip_text(
+                f"double-click: connect {c.sel} over {proto.label}"
+                + ("  (default)" if pid == c.default_protocol else ""))
+            chip.connect("button-press-event", self.on_tile_chip_press,
+                         c.sel, pid)
+            chip_grid.add(chip)
+        overlay.add_overlay(chip_grid)
+        box.pack_start(overlay, False, False, 0)
+
+        name_label = Gtk.Label()
+        marker = "● " if c.sel in live else ""
+        name_label.set_markup(f"<b>{marker}"
+                              f"{GLib.markup_escape_text(c.name)}</b>")
+        name_label.set_ellipsize(Pango.EllipsizeMode.END)
+        name_label.set_max_width_chars(18)
+        box.pack_start(name_label, False, False, 0)
+        host = Gtk.Label()
+        host.set_markup(f"<small>{GLib.markup_escape_text(c.host)}</small>")
+        host.get_style_context().add_class("dim-label")
+        host.set_ellipsize(Pango.EllipsizeMode.END)
+        host.set_max_width_chars(18)
+        box.pack_start(host, False, False, 0)
+        tile.add(box)
+        tile.set_tooltip_text(f"{c.sel} — double-click connects "
+                              f"{proto_label(c.default_protocol)}")
+        return tile
+
+    def on_icon_tile_toggled(self, check, sel: str) -> None:
+        if check.get_active():
+            self.icon_checked.add(sel)
+        else:
+            self.icon_checked.discard(sel)
+        count = len(self.icon_checked)
+        self.say(f"{count} connection(s) ticked" if count else "nothing ticked")
+
+    def on_icon_group_toggled(self, check, members: list) -> None:
+        if getattr(self, "_icon_group_syncing", False):
+            return
+        if check.get_active():
+            self.icon_checked.update(members)
+        else:
+            self.icon_checked.difference_update(members)
+        self._icon_group_syncing = True
+        try:
+            self.refresh_icon_view()
+        finally:
+            self._icon_group_syncing = False
+        count = len(self.icon_checked)
+        self.say(f"{count} connection(s) ticked" if count else "nothing ticked")
+
+    def on_tile_chip_press(self, widget, event, sel: str, pid: str):
+        """A chip owns every click that lands on it.
+
+        Swallowing the singles too is what makes the double reliable: the
+        FlowBox activates the tile from the second button-press, which
+        arrives before the double-click event does, so a chip that let
+        presses through would connect twice — once over its own protocol and
+        once over the default.
+        """
         if event.type == Gdk.EventType._2BUTTON_PRESS:
             c = rcm.find(sel)
             if c:
-                # The tile's own activation fires for the same double-click;
-                # this stamp tells it to stand down.
-                self._chip_activated = Gtk.get_current_event_time()
                 self.connect_selected(pid, "", [c])
             return True
-        return False
+        if event.type == Gdk.EventType.BUTTON_PRESS:
+            tile = widget.get_ancestor(Gtk.FlowBoxChild)
+            if tile is not None:
+                for flow in getattr(self, "icon_flows", []) or []:
+                    flow.unselect_all()
+                parent = tile.get_parent()
+                if isinstance(parent, Gtk.FlowBox):
+                    parent.select_child(tile)
+        return True
 
     def on_tile_activated(self, _box, child) -> None:
-        if Gtk.get_current_event_time() == getattr(self, "_chip_activated",
-                                                   None):
-            return          # a chip already handled this double-click
         c = rcm.find(getattr(child, "rcm_sel", ""))
         if c:
             self.connect_selected(c.default_protocol, "", [c])
 
     def selected_tiles(self) -> list:
-        if getattr(self, "icon_box", None) is None:
-            return []
         out = []
-        for child in self.icon_box.get_selected_children():
-            c = rcm.find(getattr(child, "rcm_sel", ""))
-            if c:
-                out.append(c)
+        for flow in getattr(self, "icon_flows", []) or []:
+            for child in flow.get_selected_children():
+                c = rcm.find(getattr(child, "rcm_sel", ""))
+                if c:
+                    out.append(c)
         return out
 
     def refresh_details_pane(self) -> None:
@@ -1466,21 +1611,107 @@ class Win(Gtk.Window):
             return False
         path = info[0]
         key = self.sidebar_store[path][1]
-        if not key.startswith("workspace:"):
+        if key.startswith("workspace:"):
+            name = key[len("workspace:"):]
+            menu = Gtk.Menu()
+            connect_item = Gtk.MenuItem(label=f"Connect workspace {name!r}")
+            connect_item.connect(
+                "activate",
+                lambda *_: self.on_sidebar_activated(None, path, None))
+            menu.append(connect_item)
+            edit_item = Gtk.MenuItem(label="Edit workspaces…")
+            edit_item.connect("activate",
+                              lambda *_: self.on_workspaces(select=name))
+            menu.append(edit_item)
+            menu.show_all()
+            menu.popup_at_pointer(event)
+            return True
+        if key == self.SIDEBAR_HEADER or key.startswith("tag:"):
             return False
-        name = key[len("workspace:"):]
+        return self.popup_sidebar_group(key, event)
+
+    @help_topic_gui("sidebar-groups", "Working on groups in the sidebar",
+                    ("sidebar", "group", "copy", "paste", "delete", "rename"),
+                    section="Connections")
+    def popup_sidebar_group(self, group: str, event) -> bool:
+        """Right-click a group in the sidebar to act on the whole group.
+
+        Copy takes the group with everything under it; Paste puts whatever is
+        on the clipboard inside this group; Delete removes the group and its
+        connections after asking, naming exactly how many. "All" is the whole
+        collection: it accepts a paste at the top level and refuses to be
+        copied or deleted.
+        """
         menu = Gtk.Menu()
-        connect_item = Gtk.MenuItem(label=f"Connect workspace {name!r}")
-        connect_item.connect(
-            "activate", lambda *_: self.on_sidebar_activated(None, path, None))
-        menu.append(connect_item)
-        edit_item = Gtk.MenuItem(label="Edit workspaces…")
-        edit_item.connect("activate",
-                          lambda *_: self.on_workspaces(select=name))
-        menu.append(edit_item)
+        label = group or "All"
+        copy_item = Gtk.MenuItem(label=f"Copy group {label!r}")
+        copy_item.set_sensitive(bool(group))
+        copy_item.connect("activate", lambda *_: self.copy_group(group))
+        menu.append(copy_item)
+
+        board = self.clipboard
+        held = len(board["conns"]) + len(board["groups"])
+        paste_item = Gtk.MenuItem(
+            label=f"Paste {held} item(s) into {label!r}" if held
+            else "Paste")
+        paste_item.set_sensitive(bool(held))
+        paste_item.connect("activate",
+                           lambda *_: self.paste_into_group(group))
+        menu.append(paste_item)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        delete_item = Gtk.MenuItem(label=f"Delete group {label!r}…")
+        delete_item.set_sensitive(bool(group))
+        delete_item.connect("activate", lambda *_: self.delete_group(group))
+        menu.append(delete_item)
         menu.show_all()
         menu.popup_at_pointer(event)
         return True
+
+    def copy_group(self, group: str) -> None:
+        if not group:
+            return
+        self.clipboard = {"conns": [], "groups": [group]}
+        Gtk.Clipboard.get_default(Gdk.Display.get_default()).set_text(group, -1)
+        self.say(f"copied group {group!r} with "
+                 f"{len(rcm.group_members(group))} connection(s)")
+
+    def paste_into_group(self, group: str) -> None:
+        board = self.clipboard
+        if not (board["conns"] or board["groups"]):
+            self.say("clipboard is empty")
+            return
+        try:
+            made = rcm.paste_into(group, board["conns"], board["groups"])
+        except (OSError, ValueError) as problem:
+            self._dialog(Gtk.MessageType.ERROR, "Cannot paste", str(problem))
+            return
+        rcm.gen_launcher()
+        self.reload()
+        self.select_after_paste(made)
+        self.say(f"pasted {len(made)} item(s) into {group or 'the top level'}")
+
+    def delete_group(self, group: str) -> None:
+        if not group:
+            return
+        members = rcm.group_members(group)
+        answer = self._dialog(
+            Gtk.MessageType.QUESTION, f"Delete group {group!r}?",
+            f"{len(members)} connection(s) and every sub-group go with it. "
+            "Their keyring passwords are left alone.",
+            buttons=Gtk.ButtonsType.YES_NO)
+        if answer != Gtk.ResponseType.YES:
+            return
+        try:
+            removed = rcm.delete_group(group)
+        except OSError as problem:
+            self._dialog(Gtk.MessageType.ERROR, "Cannot delete", str(problem))
+            return
+        rcm.gen_launcher()
+        self.query_group = "" if self.query_group.startswith(group) \
+            else self.query_group
+        self.reload()
+        self.say(f"deleted group {group!r} — {removed} connection(s) removed")
 
     def on_sidebar_activated(self, _tv, path, _col) -> None:
         """Double-click / Enter on a workspace row connects the whole set."""
@@ -1508,6 +1739,14 @@ class Win(Gtk.Window):
             self._sidebar_rebuilding = False
 
     def _refresh_sidebar_rows(self) -> None:
+        # Which sections were open, so a rebuild does not re-open what the
+        # operator folded away. First build has none: everything opens.
+        was_open: set[str] = set()
+        first_build = not hasattr(self, "_sidebar_built")
+        if not first_build:
+            self.sidebar.map_expanded_rows(
+                lambda _tv, path: was_open.add(self.sidebar_store[path][1]))
+        self._sidebar_built = True
         self.sidebar_store.clear()
         total = len(rcm.conns_cached())
         all_row = self.sidebar_store.append(
@@ -1541,7 +1780,17 @@ class Win(Gtk.Window):
                 self.sidebar_store.append(header, [
                     f"▶ {GLib.markup_escape_text(name)}"
                     f"  <small>({len(members)})</small>", f"workspace:{name}"])
-        self.sidebar.expand_all()
+        if first_build:
+            self.sidebar.expand_all()
+        else:
+            def reopen(it):
+                while it is not None:
+                    if self.sidebar_store[it][1] in was_open:
+                        self.sidebar.expand_row(
+                            self.sidebar_store.get_path(it), False)
+                    reopen(self.sidebar_store.iter_children(it))
+                    it = self.sidebar_store.iter_next(it)
+            reopen(self.sidebar_store.get_iter_first())
         # Rebuilding lost the highlight; put it back on the active filter.
         wanted = self.query_group
 
@@ -2892,46 +3141,32 @@ class Win(Gtk.Window):
                 protocol_badges(c.protocols, registry, c.default_protocol),
                 pretty_key(keys.get(c.sel, "")), c.sel, 400, Pango.Style.NORMAL])
 
+        # One shape for every layout: groups are real parent rows, so a group
+        # tick carries its members, and a group can be collapsed.
         visible = 0
-        if self.flat_list:
-            # Flat list with italic dim heading rows on group changes (Rail,
-            # Spotlight, Cockpit). Headings carry no C_SEL, so selection and
-            # ticking of them is inert by the existing rules.
-            last_group = None
-            for c in rcm.conns_cached():
-                if not self.connection_matches_query(c):
-                    continue
-                if not self.chip_filters_allow(c):
-                    continue
-                if c.group != last_group and c.group:
-                    heading = GLib.markup_escape_text(c.group.replace("/", " / "))
-                    self.store.append(None, [False, "", "", heading, "", "", "",
-                                             "", "", 400, Pango.Style.ITALIC])
-                    last_group = c.group
-                connection_row(c, None)
-                visible += 1
-        else:
-            nodes: dict[str, Gtk.TreeIter] = {}
+        nodes: dict[str, Gtk.TreeIter] = {}
 
-            def group_iter(path: str):
-                if not path:
-                    return None
-                if path not in nodes:
-                    parent = group_iter(path.rsplit("/", 1)[0] if "/" in path else "")
-                    nodes[path] = self.store.append(
-                        parent, [False, "", "", GLib.markup_escape_text(
-                            path.rsplit("/", 1)[-1]), "", "", "", "", "",
-                            700, Pango.Style.ITALIC])
-                return nodes[path]
+        def group_iter(path: str):
+            if not path:
+                return None
+            if path not in nodes:
+                parent = group_iter(path.rsplit("/", 1)[0] if "/" in path else "")
+                nodes[path] = self.store.append(
+                    parent, [False, "", "", GLib.markup_escape_text(
+                        path.rsplit("/", 1)[-1]), "", "", "", "", "",
+                        700, Pango.Style.NORMAL])
+            return nodes[path]
 
-            for c in rcm.conns_cached():
-                if not self.connection_matches_query(c):
-                    continue
-                connection_row(c, group_iter(c.group))
-                visible += 1
-            for path in sorted(nodes, key=lambda g: g.count("/"), reverse=True):
-                self._sync_group_check(nodes[path])
-            self.tree.expand_all()
+        for c in rcm.conns_cached():
+            if not self.connection_matches_query(c):
+                continue
+            if self.flat_list and not self.chip_filters_allow(c):
+                continue
+            connection_row(c, group_iter(c.group))
+            visible += 1
+        for path in sorted(nodes, key=lambda g: g.count("/"), reverse=True):
+            self._sync_group_check(nodes[path])
+        self.restore_expansion(nodes)
 
         total = len(rcm.conns_cached())
         if getattr(self, "count_lbl", None):
@@ -3058,6 +3293,56 @@ class Win(Gtk.Window):
         count = len(self.checked_sels())
         self.say(f"{count} connection(s) ticked" if count else "nothing ticked")
 
+    def paint_group_headings(self) -> None:
+        """Group rows get a tinted band so the list reads as sections.
+
+        A cell data function rather than a store column: it runs after the
+        attribute mapping, so every existing column keeps its markup and only
+        gains a background.
+        """
+        ok, accent = self.get_style_context().lookup_color(
+            "theme_selected_bg_color")
+        band = Gdk.RGBA(accent.red, accent.green, accent.blue, 0.16) if ok \
+            else Gdk.RGBA(0.5, 0.5, 0.5, 0.16)
+
+        def paint(_column, cell, model, it, _data):
+            heading = not model[it][C_SEL]
+            cell.set_property("cell-background-rgba", band if heading else None)
+
+        for column in self.tree.get_columns():
+            for cell in column.get_cells():
+                column.set_cell_data_func(cell, paint)
+
+    @help_topic_gui("collapsing-groups", "Collapsing groups",
+                    ("collapse", "expand", "groups", "tree"),
+                    section="Connections")
+    def restore_expansion(self, nodes: dict) -> None:
+        """Groups collapse with their expander, and stay that way.
+
+        Every layout shows groups as real parent rows: the arrow beside a
+        group folds it away, ticking a group ticks everything inside it, and
+        the list remembers which groups you closed for the rest of the
+        session — reloading, filtering or connecting will not spring them
+        open again. A filter that matches something inside a closed group
+        opens it, so nothing hides from a search.
+        """
+        collapsed = getattr(self, "collapsed_groups", set())
+        searching = bool(self.query_text.strip())
+        for path, it in nodes.items():
+            row = self.store.get_path(it)
+            if searching or path not in collapsed:
+                self.tree.expand_row(row, False)
+            else:
+                self.tree.collapse_row(row)
+
+    def on_group_expansion_changed(self, _tree, it, _path, expanded: bool) -> None:
+        group = self.group_of_row(self.store, it)
+        if not group:
+            return
+        collapsed = getattr(self, "collapsed_groups", set())
+        collapsed.discard(group) if expanded else collapsed.add(group)
+        self.collapsed_groups = collapsed
+
     def refresh_select_all(self) -> None:
         """Header tickbox mirrors the visible rows: all / some / none."""
         header_check = getattr(self, "select_all_check", None)
@@ -3103,7 +3388,8 @@ class Win(Gtk.Window):
     def checked_sels(self) -> set[str]:
         out: set[str] = set()
         if self.store is None:
-            return out            # icon view has no tickboxes
+            # Icon view keeps its ticks in a set, not in a model column.
+            return set(getattr(self, "icon_checked", set()))
 
         def walk(it):
             while it:
@@ -3179,13 +3465,14 @@ class Win(Gtk.Window):
             out.append(rcm.Session(r[0], r[1], r[2], r[4], r[5]))
         return out
 
-    def _dialog(self, kind, text, secondary=""):
+    def _dialog(self, kind, text, secondary="", buttons=Gtk.ButtonsType.OK):
         d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=kind,
-                              buttons=Gtk.ButtonsType.OK, text=text)
+                              buttons=buttons, text=text)
         if secondary:
             d.format_secondary_text(secondary)
-        d.run()
+        answer = d.run()
         d.destroy()
+        return answer
 
     # ---- connecting --------------------------------------------------------- #
     def connect_selected(self, proto: str, launcher: str = "",

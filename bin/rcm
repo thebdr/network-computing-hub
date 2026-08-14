@@ -504,6 +504,26 @@ def delete_conn(c: Conn) -> list[str]:
     return prune_empty_parents(c.path.parent)
 
 
+def delete_group(group: str) -> int:
+    """Delete a group folder and everything under it; returns connections lost.
+
+    Keyring entries are deliberately left alone: they are keyed by connection
+    name, cost nothing, and a mistaken delete would otherwise take the
+    passwords with it. `rcm creds` lists and clears them when you mean it.
+    """
+    if not group:
+        raise ValueError("refusing to delete the whole collection")
+    folder = RDP_DIR / group
+    if not folder.is_dir():
+        raise ValueError(f"no such group: {group}")
+    lost = len(group_members(group))
+    shutil.rmtree(folder)
+    prune_empty_parents(folder.parent)
+    conns_cached(refresh=True)
+    log_event("delete-group", group=group, connections=lost)
+    return lost
+
+
 def copy_conn(c: Conn, new_name: str) -> Path:
     dest = c.path.with_name(f"{new_name}.rdp")
     if dest.exists():
@@ -553,9 +573,11 @@ def paste_into(group: str, connections: list[Conn] | None = None,
     keeping every rcm-* setting (tags, hooks, via, MAC, per-protocol ports).
     A copied group brings its whole subtree. Names never collide — an
     existing name becomes "<name> (copy)", then "(copy 2)" — so pasting into
-    the same group is how you duplicate. Passwords are NOT copied: the
-    keyring entry belongs to the original connection's name, and the copy
-    inherits from its group chain until you give it one of its own.
+    the same group is how you duplicate. Paste always means "inside the
+    target", including a group pasted into itself; Ctrl+D is the separate
+    gesture for "beside this one". Passwords are NOT copied: the keyring
+    entry belongs to the original connection's name, and the copy inherits
+    from its group chain until you give it one of its own.
     """
     made: list[str] = []
     for c in connections or []:
@@ -566,13 +588,18 @@ def paste_into(group: str, connections: list[Conn] | None = None,
         made.append(f"{group}/{name}" if group else name)
     for source in groups or []:
         leaf = source.rsplit("/", 1)[-1]
-        # Pasting a group into itself or into its own subtree would recurse
-        # forever; the caller is told rather than silently skipped.
-        if group == source or group.startswith(source + "/"):
-            raise ValueError(f"cannot paste group {source!r} into itself")
         name = unique_group(group, leaf)
         destination = ((RDP_DIR / group) if group else RDP_DIR) / name
-        shutil.copytree(RDP_DIR / source, destination)
+        if group == source or group.startswith(source + "/"):
+            # Pasting a group into itself is a real request ("keep a copy in
+            # here"), but copying a tree into its own subtree would walk the
+            # copy it is writing. Stage it outside first, then move it in.
+            staged = Path(tempfile.mkdtemp(prefix="rcm-paste-")) / name
+            shutil.copytree(RDP_DIR / source, staged)
+            shutil.move(str(staged), str(destination))
+            staged.parent.rmdir()
+        else:
+            shutil.copytree(RDP_DIR / source, destination)
         made.append(f"{group}/{name}" if group else name)
     conns_cached(refresh=True)
     log_event("paste", into=group or "(top level)", created=len(made))
