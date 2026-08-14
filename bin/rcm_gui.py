@@ -936,6 +936,9 @@ class Win(Gtk.Window):
         self.sidebar.append_column(Gtk.TreeViewColumn(
             "", Gtk.CellRendererText(), markup=0))
         self.sidebar.get_selection().connect("changed", self.on_sidebar_selected)
+        # Section headers (TAGS, WORKSPACES) are labels, not filters.
+        self.sidebar.get_selection().set_select_function(
+            lambda _sel, model, path, _cur: model[path][1] != self.SIDEBAR_HEADER)
         self.sidebar.connect("row-activated", self.on_sidebar_activated)
         side_scroller = Gtk.ScrolledWindow()
         side_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
@@ -970,9 +973,13 @@ class Win(Gtk.Window):
         outer.pack_start(self.build_connect_button_box(), False, False, 0)
         return outer
 
-    SIDEBAR_HEADER = "\x00header"
+    # \x01 survives GTK's C strings (\x00 truncated to "", which reads as
+    # the All row) and no real directory will ever be named this.
+    SIDEBAR_HEADER = "\x01header"
 
     def on_sidebar_selected(self, selection) -> None:
+        if getattr(self, "_sidebar_rebuilding", False):
+            return
         model, it = selection.get_selected()
         if not it:
             return
@@ -983,7 +990,10 @@ class Win(Gtk.Window):
             members = rcm.load_workspaces().get(key[len("workspace:"):], [])
             self.workspace_filter_members = frozenset(m["sel"] for m in members)
         self.query_group = key
-        self.reload()
+        # A real click is still inside GTK's button/selection machinery when
+        # this fires; reload() rebuilds the sidebar model under that machinery
+        # and segfaults libgtk (seen in the wild). Let the click finish first.
+        GLib.idle_add(self.reload)
 
     def on_sidebar_activated(self, _tv, path, _col) -> None:
         """Double-click / Enter on a workspace row connects the whole set."""
@@ -1004,6 +1014,13 @@ class Win(Gtk.Window):
     def refresh_sidebar(self) -> None:
         if getattr(self, "sidebar", None) is None:
             return
+        self._sidebar_rebuilding = True
+        try:
+            self._refresh_sidebar_rows()
+        finally:
+            self._sidebar_rebuilding = False
+
+    def _refresh_sidebar_rows(self) -> None:
         self.sidebar_store.clear()
         total = len(rcm.conns_cached())
         all_row = self.sidebar_store.append(
@@ -1038,6 +1055,19 @@ class Win(Gtk.Window):
                     f"▶ {GLib.markup_escape_text(name)}"
                     f"  <small>({len(members)})</small>", f"workspace:{name}"])
         self.sidebar.expand_all()
+        # Rebuilding lost the highlight; put it back on the active filter.
+        wanted = self.query_group
+
+        def restore(it):
+            while it is not None:
+                if self.sidebar_store[it][1] == wanted:
+                    self.sidebar.get_selection().select_iter(it)
+                    return True
+                if restore(self.sidebar_store.iter_children(it)):
+                    return True
+                it = self.sidebar_store.iter_next(it)
+            return False
+        restore(self.sidebar_store.get_iter_first())
         problems = len(rcm.config_health())
         self.setup_badge.set_label(
             f"⚙ Setup{f'  ({problems}⚠)' if problems else ''}")
