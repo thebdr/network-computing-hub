@@ -155,6 +155,31 @@ Steps are `type:<text>`, `key:<keysym>`, `sleep:<seconds>`, `activate` and `clea
 disk. `rcm calibrate <connection> [protocol]` opens the prompt, reports exactly what it
 is, saves a screenshot of it, and types nothing — use it when writing the steps.
 
+### Hooks and via-gateways
+
+Every connection can carry a `pre` and `post` command (**Edit ▸ Hooks & gateway**,
+stored as `rcm-pre` / `rcm-post` in its file). `pre` runs first and must exit 0 or
+the launch stops — mount a share, bring up a VPN, check a precondition; `post` fires
+after the client starts. Both get the launcher placeholders.
+
+A host that is only reachable through a bastion points at a gateway instead:
+
+```ini
+[via:plant-gw]         ; in protocols.conf
+host = gw.example.local
+user = maint
+; port = 22            ; the gateway's SSH port
+; hold = 30            ; seconds the tunnel waits for the client to attach
+```
+
+Pick it in **Edit ▸ Hooks & gateway** (stored as `rcm-via`). Connecting then opens
+`ssh -f -L <free port>:<host>:<port>` through the gateway and hands the launcher
+`127.0.0.1:<free port>` in `{host}`/`{port}` — any protocol, no client support
+needed. The tunnel wants key auth to the gateway (it runs BatchMode, so it fails
+loudly instead of sitting on an invisible prompt) and lives exactly as long as the
+client's connection. The pre hook still sees the real `{host}`: it runs before the
+tunnel opens. A dangling `rcm-via` shows up in config health.
+
 ### Credentials
 
 Passwords live in the login keyring. `creds.conf` holds only `key|username|`. Lookup is
@@ -211,11 +236,17 @@ link to that file and line.
 The **Net** column probes reachability (one TCP connect at a time, visible rows
 first, paused while hidden — cheap even at hundreds of hosts); offline rows with a
 learned MAC offer **⚡ Wake** (`rcm wake <sel>`). Right-click also gives **Open
-terminal** (embedded VTE tabs when the library is present), **Run script** across the
-selection with per-host verdicts, and **History**. Everything notable — launches,
-scripts, probes, wakes — is one JSONL line under `logs/`, browsable on the Logs page.
-**Workspaces** (`workspaces.conf`, `rcm workspace <name>`) open named sets together,
-focusing members that are already live.
+terminal** (embedded VTE tabs when the library is present; right-click a tab to
+**Send script** — it types a file from `scripts/` into the live session with the
+placeholders substituted, `{password}` deliberately never), **Run script** across
+the selection — SSH when port 22 answers, PowerShell over WinRM otherwise, live
+per-host verdicts in the dialog, output captured per run — and **History**.
+Everything notable — launches, scripts, probes, wakes, tunnels — is one JSONL line
+under `logs/`; the **Logs page** (▤ in the sidebar, or the Layout menu) filters it
+by kind, text and range back to 90 days, shows each event with its captured output,
+and exports the filtered view as CSV. History is the same page pre-filtered to one
+connection. **Workspaces** (`workspaces.conf`, `rcm workspace <name>`) open named
+sets together, focusing members that are already live.
 
 ## Keyboard shortcuts
 
@@ -295,6 +326,8 @@ named with its full path (`Plant/Line2`). Names, hosts and usernames are correct
   place of libsecret, a tray agent owning `RegisterHotKey` (Windows has no per-command
   keybinding registry, and Win+W/Win+Q are shell-reserved), PyInstaller bundling GTK
 - VNC is implemented but has not been exercised against a real server
+- The WinRM script transport is exercised against a stub in tests, not yet against
+  a real Windows host; same for via-gateways and a real bastion
 
 ## Icon
 
