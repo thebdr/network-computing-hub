@@ -136,9 +136,23 @@ class Conn:
             return self.port
 
 
+def rdp_text(path: Path, errors: str = "strict") -> str:
+    """An .rdp file's text. mstsc saves UTF-16 with a BOM; ours are UTF-8.
+
+    Newlines are normalised the way read_text() would, so a CRLF file written
+    back in text mode on Windows stays CRLF instead of becoming CR CR LF.
+    """
+    raw = path.read_bytes()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = raw.decode("utf-16", errors=errors)
+    else:
+        text = raw.decode("utf-8-sig", errors=errors)
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def parse_rdp(path: Path) -> dict:
     out = {}
-    for line in path.read_text(errors="replace").splitlines():
+    for line in rdp_text(path, errors="replace").splitlines():
         m = re.match(r"^([^:]+):([sib]):(.*)$", line)
         if m:
             out[m.group(1)] = m.group(3).strip("\r")
@@ -242,7 +256,7 @@ def creds_conf_table() -> dict[str, tuple[str, str]]:
     table: dict[str, tuple[str, str]] = {}
     if not p:
         return table
-    for line in p.read_text().splitlines():
+    for line in p.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -328,7 +342,7 @@ def creds_status(key: str) -> tuple[str, bool, bool]:
 def creds_set_user(key: str, username: str) -> None:
     """Upsert a scope's username in creds.conf. Passwords never go in this file."""
     path = CREDS
-    lines = path.read_text().splitlines() if path.is_file() else []
+    lines = path.read_text(encoding="utf-8").splitlines() if path.is_file() else []
     out, done = [], False
     for line in lines:
         s = line.strip()
@@ -340,7 +354,7 @@ def creds_set_user(key: str, username: str) -> None:
         out.append(line)
     if not done:
         out.append(f"{key}|{username}|")
-    path.write_text("\n".join(out) + "\n")
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
     path.chmod(0o600)
 
 
@@ -349,10 +363,10 @@ def creds_delete(key: str) -> None:
     secret_clear(key)
     if not CREDS.is_file():
         return
-    out = [ln for ln in CREDS.read_text().splitlines()
+    out = [ln for ln in CREDS.read_text(encoding="utf-8").splitlines()
            if not (ln.strip() and not ln.strip().startswith("#")
                    and ln.strip().split("|")[0] == key)]
-    CREDS.write_text("\n".join(out) + "\n")
+    CREDS.write_text("\n".join(out) + "\n", encoding="utf-8")
     CREDS.chmod(0o600)
 
 
@@ -368,7 +382,7 @@ def creds_migrate() -> tuple[int, int]:
         raise RuntimeError("no creds.conf found")
     moved = skipped = 0
     out: list[str] = []
-    for line in p.read_text().splitlines():
+    for line in p.read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
             out.append(line)
@@ -385,7 +399,7 @@ def creds_migrate() -> tuple[int, int]:
             skipped += 1
             out.append(line)
     target = CREDS
-    target.write_text("\n".join(out) + "\n")
+    target.write_text("\n".join(out) + "\n", encoding="utf-8")
     target.chmod(0o600)
     return moved, skipped
 
@@ -404,7 +418,7 @@ def write_rdp(group: str, name: str, host: str, username: str,
     dest = dest_dir / f"{name}.rdp"
     if dest.exists() and not overwrite:
         raise FileExistsError(dest)
-    body = TEMPLATE.read_text()
+    body = rdp_text(TEMPLATE)
     body = body.replace("{{HOST}}", host).replace("{{USERNAME}}", username)
     body = re.sub(r"^server port:i:.*$", f"server port:i:{port}", body, flags=re.M)
     # rcm-* keys are our own extensions. RDP clients ignore keys they don't know.
@@ -415,7 +429,7 @@ def write_rdp(group: str, name: str, host: str, username: str,
         body += f"rcm-protocols:s:{protocols}\n"
     if default_proto:
         body += f"rcm-default-proto:s:{default_proto}\n"
-    dest.write_text(body)
+    dest.write_text(body, encoding="utf-8")
     return dest
 
 
@@ -644,7 +658,7 @@ def set_fields(c: Conn, host: str | None = None, username: str | None = None,
                protocols: str | None = None,
                default_proto: str | None = None) -> None:
     """Rewrite the per-host fields in place, leaving every other setting alone."""
-    lines = c.path.read_text().splitlines()
+    lines = rdp_text(c.path).splitlines()
     def repl(key, val):
         pat = re.compile(rf"^{re.escape(key)}:([sib]):")
         for i, ln in enumerate(lines):
@@ -666,7 +680,7 @@ def set_fields(c: Conn, host: str | None = None, username: str | None = None,
         repl("rcm-protocols", protocols)
     if default_proto is not None:
         repl("rcm-default-proto", default_proto)
-    c.path.write_text("\n".join(lines) + "\n")
+    c.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -740,7 +754,7 @@ def load_protocols() -> dict[str, Protocol]:
                           "or open the manager once")
     cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
     cp.optionxform = str
-    cp.read(PROTOCOLS_FILE)
+    cp.read(PROTOCOLS_FILE, encoding="utf-8")
 
     out: dict[str, Protocol] = {}
     for section in cp.sections():
@@ -859,7 +873,7 @@ launcher.Thincast = flatpak run com.thincast.client {file}
 launcher.xfreerdp = xfreerdp3 /v:{host}:{port} /u:{user} +clipboard +fonts /dynamic-resolution /cert:ignore
 launcher.Remmina = remmina -c {file}
 launcher.mstsc = mstsc {file}
-detect.process = (^|/)(rdc|xfreerdp3?|freerdp|mstsc(\.exe)?)\b
+detect.process = (^|[/\\"])(rdc|xfreerdp3?|freerdp|mstsc(\.exe)?)\b
 detect.window = {host}
 
 [protocol:vnc]
@@ -870,7 +884,7 @@ port = 5900
 default = Remmina
 launcher.Remmina = remmina -c vnc://{host}:{port}
 launcher.TigerVNC = vncviewer {host}::{port}
-detect.process = vnc://|(^|/)(vncviewer|xtigervncviewer)\b
+detect.process = vnc://|(^|[/\\"])(vncviewer|xtigervncviewer)\b
 detect.window = {host}
 
 [protocol:radmin]
@@ -883,7 +897,7 @@ env.WINEPREFIX =
 default = Native
 launcher.Wine = wine-stable {exe} /connect:{host}:{port}
 launcher.Native = {exe} /connect:{host}:{port}
-detect.process = Radmin(\.exe)? .*/connect:
+detect.process = Radmin(\.exe)?"? .*/connect:
 detect.window = {host}
 # Radmin has no /password: switch by design, so the password must be typed.
 inject.window_class = [Rr]admin
@@ -904,7 +918,7 @@ phonebook =
 # order = 40
 # default = AnyDesk
 # launcher.AnyDesk = anydesk {host}
-# detect.process = (^|/)anydesk\b
+# detect.process = (^|[/\\"])anydesk\b
 # inject.window_title = Password
 # inject.wait = 20
 # inject.steps = type:{password} | key:Return
@@ -917,7 +931,7 @@ order = 50
 port = 22
 default = Terminal
 launcher.Terminal = gnome-terminal -- ssh {user}@{host} -p {port}
-detect.process = (^|/)ssh\s+.*@
+detect.process = (^|[/\\"])ssh(\.exe)?"?\s+.*@
 
 [protocol:web]
 label = Web
@@ -1036,7 +1050,7 @@ def write_default_configs(names: list[str] | None = None) -> list[str]:
         if dest.is_file():
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(DEFAULT_CONFIGS[name])
+        dest.write_text(DEFAULT_CONFIGS[name], encoding="utf-8")
         if name == "creds.conf":
             dest.chmod(0o600)
         written.append(name)
@@ -1121,7 +1135,7 @@ def save_protocols(protos: dict[str, Protocol]) -> None:
         for k, v in p.extras.items():
             L.append(f"{k} = {v}")
         L.append("")
-    PROTOCOLS_FILE.write_text("\n".join(L) + "\n")
+    PROTOCOLS_FILE.write_text("\n".join(L) + "\n", encoding="utf-8")
 
 
 def migrate_launchers() -> bool:
@@ -1130,7 +1144,7 @@ def migrate_launchers() -> bool:
         return False
     cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
     cp.optionxform = str
-    cp.read(LEGACY_LAUNCHERS)
+    cp.read(LEGACY_LAUNCHERS, encoding="utf-8")
     write_default_configs(["protocols.conf"])
     protos = load_protocols()
     for pid in ("rdp", "vnc"):
@@ -1199,7 +1213,7 @@ def load_vias() -> dict[str, dict]:
         return {}
     cp = configparser.ConfigParser(inline_comment_prefixes=(";",))
     cp.optionxform = str
-    cp.read(PROTOCOLS_FILE)
+    cp.read(PROTOCOLS_FILE, encoding="utf-8")
     out: dict[str, dict] = {}
     for section in cp.sections():
         if not section.startswith("via:"):
@@ -1542,7 +1556,7 @@ def sessions() -> list[Session]:
         seen.add(key)
 
         win = ""
-        if host:
+        if host and PLATFORM.window_control:
             pattern = (p.detect_window or "{host}").format(host=host, name=label)
             for w in xdotool("search", "--name", pattern).splitlines():
                 if w.strip():
@@ -1577,7 +1591,8 @@ def focus_session(s: Session) -> bool:
 def kill_session(s: Session) -> None:
     try:
         os.kill(s.pid, 15)
-    except ProcessLookupError:
+    # Already gone: ProcessLookupError on Linux, "access denied" on Windows.
+    except (ProcessLookupError, PermissionError):
         pass
 
 
@@ -1602,7 +1617,7 @@ def export_csv(dest: Path, conns: list[Conn] | None = None) -> int:
     rows = conns if conns is not None else conns_cached(refresh=True)
     fields = csv_fields()
     keys = session_bindings()
-    with dest.open("w", newline="") as fh:
+    with dest.open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=fields)
         w.writeheader()
         for c in rows:
@@ -1634,7 +1649,9 @@ def import_csv(src: Path, overwrite: bool = False,
                dry_run: bool = False) -> tuple[list[str], list[str]]:
     """Returns (created, skipped) as human-readable lines."""
     created, skipped = [], []
-    with src.open(newline="") as fh:
+    # utf-8-sig: Excel's "CSV UTF-8" leads with a BOM that would otherwise
+    # glue itself onto the first column name.
+    with src.open(newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
         missing = {"name", "host"} - set(reader.fieldnames or [])
         if missing:
@@ -1844,9 +1861,10 @@ def dump_help_html() -> int:
                 f"<hr><p><small>⌁ the source is the full manual: "
                 f"{html.escape(topic.source_file)}:{topic.source_line} "
                 f"{html.escape(topic.symbol)}()</small></p>"
-                f'<p><a href="index.html">← guide index</a></p>')
+                f'<p><a href="index.html">← guide index</a></p>',
+                encoding="utf-8")
         index_lines.append("</ul>")
-    (HELP_DIR / "index.html").write_text("\n".join(index_lines))
+    (HELP_DIR / "index.html").write_text("\n".join(index_lines), encoding="utf-8")
     return len(HELP_TOPICS)
 
 
@@ -1872,7 +1890,7 @@ def load_workspaces() -> dict[str, list[dict]]:
         return {}
     parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
     parser.optionxform = str
-    parser.read(WORKSPACES_CONF)
+    parser.read(WORKSPACES_CONF, encoding="utf-8")
     out: dict[str, list[dict]] = {}
     for section in parser.sections():
         if not section.startswith("workspace:"):
@@ -1904,7 +1922,7 @@ def save_workspaces(spaces: dict[str, list[dict]]) -> None:
                 parts.pop()
             lines.append(f"member.{index} = {'|'.join(parts)}")
         lines.append("")
-    WORKSPACES_CONF.write_text("\n".join(lines).rstrip("\n") + "\n")
+    WORKSPACES_CONF.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
 
 
 def connect_workspace(name: str) -> list[str]:
@@ -1967,6 +1985,12 @@ def place_workspace_members(pending: list[tuple[str, str]], lines: list[str],
             lines.append(f"{sel}: monitor {monitor_raw!r} is not a number")
     if not todo:
         return
+    # The members are already connected by now; losing their result lines to
+    # a raise would hide that, so say what was skipped and keep them.
+    if not PLATFORM.window_control:
+        lines.append(f"monitor placement skipped: not available on "
+                     f"{PLATFORM.name} yet")
+        return
     monitors = monitor_geometry()
     deadline = time.time() + wait_seconds
     while todo and time.time() < deadline:
@@ -2008,7 +2032,7 @@ def log_event(kind: str, **fields) -> None:
     stamp = datetime.now(timezone.utc)
     record = {"ts": stamp.isoformat(timespec="seconds"), "kind": kind, **fields}
     day_file = LOGS_DIR / f"{stamp:%Y-%m-%d}.jsonl"
-    with day_file.open("a") as handle:
+    with day_file.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
@@ -2024,7 +2048,7 @@ def read_log_events(days: int = 7, kind: str = "", sel: str = "") -> list[dict]:
         day_file = LOGS_DIR / f"{today - timedelta(days=offset):%Y-%m-%d}.jsonl"
         if not day_file.is_file():
             continue
-        for line in day_file.read_text().splitlines():
+        for line in day_file.read_text(encoding="utf-8").splitlines():
             try:
                 record = json.loads(line)
             except ValueError:
@@ -2080,12 +2104,12 @@ def wake(mac: str, host: str = "", port: int = 9) -> None:
 
 def set_connection_extra(c: Conn, key: str, value: str) -> None:
     """Upsert one rcm-* key in a connection's .rdp file."""
-    lines = c.path.read_text().splitlines()
+    lines = rdp_text(c.path).splitlines()
     prefix = f"{key}:s:"
     lines = [line for line in lines if not line.startswith(prefix)]
     if value:
         lines.append(f"{prefix}{value}")
-    c.path.write_text("\n".join(lines) + "\n")
+    c.path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -2111,7 +2135,7 @@ def load_ui_state() -> dict:
         return state
     parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
     parser.optionxform = str
-    parser.read(UI_CONF)
+    parser.read(UI_CONF, encoding="utf-8")
     layout = parser.get("ui", "layout", fallback="browse").strip().lower()
     layout = LEGACY_LAYOUT_NAMES.get(layout, layout)
     state["layout"] = layout if layout in LAYOUTS else "browse"
@@ -2138,7 +2162,7 @@ def save_ui_state(state: dict) -> None:
     for index, (label, group, text) in enumerate(state.get("tabs", []), start=1):
         lines.append(f"tab.{index} = {label}|{group}|{text}")
     lines += ["", "[help]", f"editor = {state.get('editor', '')}"]
-    UI_CONF.write_text("\n".join(lines) + "\n")
+    UI_CONF.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 @dataclass
@@ -2315,7 +2339,7 @@ def switcher_pid() -> int:
     selection never moves, which is exactly how this failed the first time.
     """
     try:
-        pid = int(SWITCH_PIDFILE.read_text().strip())
+        pid = int(SWITCH_PIDFILE.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return 0
     if pid == os.getpid():
@@ -2354,7 +2378,7 @@ def save_shortcuts(globals_: dict[str, str], per_session: dict[str, str]) -> Non
           "# `workspace:<name> = <combo>` opens that whole workspace instead."]
     for sel, binding in per_session.items():
         L.append(f"{sel} = {binding.strip()}")
-    SHORTCUTS.write_text("\n".join(L) + "\n")
+    SHORTCUTS.write_text("\n".join(L) + "\n", encoding="utf-8")
 
 
 def load_shortcuts() -> tuple[dict[str, str], dict[str, str]]:
@@ -2364,13 +2388,17 @@ def load_shortcuts() -> tuple[dict[str, str], dict[str, str]]:
     cp = configparser.ConfigParser(delimiters=("=",))
     cp.optionxform = str  # connection names are case-sensitive
     if SHORTCUTS.is_file():
-        cp.read(SHORTCUTS)
+        cp.read(SHORTCUTS, encoding="utf-8")
     g = dict(cp.items("global")) if cp.has_section("global") else {}
     s = dict(cp.items("sessions")) if cp.has_section("sessions") else {}
     return g, s
 
 
 def run_gsettings(*args: str) -> str:
+    # Without gsettings (Windows, or a desktop lacking GLib's tools) every key
+    # reads as empty: nothing of ours is installed and nothing conflicts.
+    if not shutil.which("gsettings"):
+        return ""
     return subprocess.run(["gsettings", *args], capture_output=True, text=True).stdout.strip()
 
 
@@ -2567,7 +2595,7 @@ def gen_launcher() -> int:
           f"Exec={me} cycle"]
     DESKTOP_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = DESKTOP_FILE.with_suffix(".tmp")
-    tmp.write_text("\n".join(L) + "\n")
+    tmp.write_text("\n".join(L) + "\n", encoding="utf-8")
     tmp.chmod(0o644)
     tmp.replace(DESKTOP_FILE)
     subprocess.run(["update-desktop-database", str(DESKTOP_FILE.parent)],
@@ -2873,6 +2901,9 @@ def main(argv: list[str]) -> int:
         return 0
 
     if cmd == "gen-launcher":
+        if not PLATFORM.desktop_files:
+            raise PlatformError(f".desktop jump lists do not exist on "
+                                f"{PLATFORM.name}; nothing written")
         print(f"{gen_launcher()} connection(s) -> {DESKTOP_FILE}")
         return 0
 
@@ -2979,6 +3010,10 @@ def main(argv: list[str]) -> int:
         return 0
 
     if cmd in ("next", "prev", "cycle"):
+        if not PLATFORM.window_control:
+            raise PlatformError(f"the session switcher is not available on "
+                                f"{PLATFORM.name} yet -- it needs the window "
+                                "control the tray agent phase brings")
         delta = -1 if cmd == "prev" else 1
         # A switcher is already on screen: tell it to move and get out of the way.
         pid = switcher_pid()
@@ -3000,6 +3035,9 @@ def main(argv: list[str]) -> int:
             active = parse_gsettings_list(run_gsettings("get", GS_LIST, "custom-list"))
             if not specs:
                 print("nothing configured in", SHORTCUTS)
+            if not PLATFORM.system_shortcuts:
+                print(f"  (system shortcuts are not available on {PLATFORM.name} "
+                      "yet; these stay unregistered)")
             for _id, name, cmdline, binding in specs:
                 state = "installed" if _id in active else "not installed"
                 print(f"  {binding:22} {name:28} [{state}]")
@@ -3029,7 +3067,14 @@ def main(argv: list[str]) -> int:
         # already-loaded __main__ under that name so the GUI shares this module
         # (and its caches) instead of loading a second copy.
         sys.modules.setdefault("rcm", sys.modules["__main__"])
-        import rcm_gui
+        try:
+            import rcm_gui
+        except ImportError as e:
+            if e.name != "gi":
+                raise
+            print(f"rcm: the manager needs PyGObject (GTK 3), which this Python "
+                  f"({sys.executable}) does not have", file=sys.stderr)
+            return 1
         return rcm_gui.run()
 
     print(f"unknown command: {cmd}\n\n{USAGE}", file=sys.stderr)
@@ -3037,4 +3082,16 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    # Windows encodes a redirected or piped stdout in the ANSI code page, where
+    # a connection named in Cyrillic cannot be written at all and `rcm list`
+    # dies mid-listing. UTF-8 is Python's own default from 3.15 (PEP 686).
+    for stream in (sys.stdout, sys.stderr):
+        if stream and stream.encoding.lower().replace("-", "") != "utf8":
+            stream.reconfigure(encoding="utf-8")
+    # Anything a port phase has not reached yet says so in one line, rather
+    # than as a traceback ending in the same sentence.
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except PlatformError as e:
+        print(f"rcm: {e}", file=sys.stderr)
+        sys.exit(1)

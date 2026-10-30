@@ -1981,6 +1981,7 @@ class Win(Gtk.Window):
         focus_item = Gtk.MenuItem(label=f"Focus {session.label}")
         focus_item.connect("activate",
                            lambda *_: rcm.focus_session(session))
+        focus_item.set_sensitive(bool(session.window))
         menu.append(focus_item)
         end_item = Gtk.MenuItem(label=f"Disconnect {session.label}")
         end_item.connect("activate", lambda *_: (rcm.kill_session(session),
@@ -2056,7 +2057,9 @@ class Win(Gtk.Window):
                 focus = Gtk.Button.new_from_icon_name("view-reveal-symbolic",
                                                       Gtk.IconSize.MENU)
                 focus.set_relief(Gtk.ReliefStyle.NONE)
-                focus.set_tooltip_text(f"Focus {session.label}")
+                focus.set_tooltip_text(f"Focus {session.label}" if session.window
+                                       else f"no window found for {session.label}")
+                focus.set_sensitive(bool(session.window))
                 focus.get_style_context().add_class("rcm-tab")
                 focus.connect("clicked",
                               lambda _b, sess=session: rcm.focus_session(sess))
@@ -2381,7 +2384,7 @@ class Win(Gtk.Window):
         vals = rcm.launch_placeholder_values(
             c, p, via=(c.extra.get("rcm-via") or "").strip())
         del vals["password"]     # never into scrollback; {password} stays put
-        text = script_path.read_text(errors="replace")
+        text = script_path.read_text(encoding="utf-8", errors="replace")
         rendered = re.sub(r"\{(%s)\}" % "|".join(vals),
                           lambda mo: str(vals[mo.group(1)]), text)
         if not rendered.endswith("\n"):
@@ -2528,7 +2531,7 @@ class Win(Gtk.Window):
                 try:
                     code, output, transport = self._script_one_host(
                         c, script_path)
-                    out_file.write_text(output)
+                    out_file.write_text(output, encoding="utf-8")
                     rcm.log_event("script", sel=c.sel, script=script_path.name,
                                   transport=transport, exit_code=code,
                                   output=str(out_file))
@@ -2576,7 +2579,7 @@ class Win(Gtk.Window):
             f"{scheme}://{c.host}:{winrm_port}/wsman", auth=(user, pw),
             transport="ntlm", server_cert_validation="ignore")
         if script_path.suffix.lower() == ".ps1":
-            reply = session.run_ps(script_path.read_text(errors="replace"))
+            reply = session.run_ps(script_path.read_text(encoding="utf-8", errors="replace"))
         else:
             # Send-then-run, same shape as the sftp path: the bytes land in
             # %TEMP% and cmd runs them, so .bat files behave exactly as if
@@ -2799,7 +2802,7 @@ class Win(Gtk.Window):
                 if legacy.is_file():
                     out_path = str(legacy)
             if out_path and Path(out_path).is_file():
-                captured = Path(out_path).read_text(errors="replace")
+                captured = Path(out_path).read_text(encoding="utf-8", errors="replace")
                 lines += ["", f"--- captured output ({out_path}) ---",
                           captured[-20000:]]
             detail_view.get_buffer().set_text("\n".join(lines))
@@ -2823,7 +2826,7 @@ class Win(Gtk.Window):
                 return
             import csv
             import json
-            with open(dest, "w", newline="") as handle:
+            with open(dest, "w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(["ts", "kind", "connection", "event", "raw"])
                 for record in holder["filtered"]:
