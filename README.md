@@ -18,9 +18,9 @@ client does not provide a credentials management, automate the insertion on a pa
 - **Any protocol you can launch**, defined in config: label, colour, commands,
   session detection, and optional credential typing. 
 - **Connections in one tree**, grouped, defined by ordinary `.rdp` files
-- **Credentials in the OS keyring** (libsecret / GNOME Keyring), never on disk, with a
-  precedence chain from per-connection down to a global default, and per-protocol
-  entries for the same host.
+- **Credentials in the OS keyring** (libsecret / GNOME Keyring, or Windows Credential
+  Manager), never on disk, with a precedence chain from per-connection down to a
+  global default, and per-protocol entries for the same host.
 - **Any client you have installed**, per protocol, configured as command lines with placeholders
 - **Live session list** — see what is connected, focus it, disconnect it
 - **System-wide shortcuts** and an Alt-Tab-style switcher across active sessions
@@ -28,7 +28,8 @@ client does not provide a credentials management, automate the insertion on a pa
 - **Tick connections** to queue them up for the Connect buttons; right-click any
   selection to export it as `.rdp` files, a CSV, or a Radmin phonebook
 
-Linux/X11 (developed on Cinnamon). A Windows port is planned — see [Roadmap](#roadmap).
+Linux/X11 (developed on Cinnamon). On Windows the command line and the manager run,
+without window control yet — see [Windows](#windows) and the [Roadmap](#roadmap).
 
 ---
 
@@ -48,6 +49,45 @@ mkdir -p ~/bin && ln -s ~/network-computing-hub/bin/rcm ~/bin/rcm
 ```
 
 Open the manager once (`rcm gui`) and it will create any missing config for you.
+
+### Windows
+
+The command line runs under any Windows Python 3.11+. The manager needs GTK 3, which
+on Windows comes from MSYS2, so the manager runs under MSYS2's own Python rather than
+one from python.org.
+
+```powershell
+winget install --id MSYS2.MSYS2 --exact
+```
+
+Then in the **MSYS2 UCRT64** shell from the Start menu:
+
+```bash
+pacman -Syu     # run it twice: the first pass may only update pacman itself
+pacman -S --needed mingw-w64-ucrt-x86_64-{gtk3,python,python-gobject,librsvg,python-keyring}
+```
+
+And back in PowerShell:
+
+```powershell
+git clone https://github.com/thebdr/network-computing-hub.git
+cd network-computing-hub
+C:\msys64\ucrt64\bin\python.exe bin\rcm init
+C:\msys64\ucrt64\bin\python.exe bin\rcm gui
+```
+
+Passwords go to Windows Credential Manager through `keyring`; a python.org Python that
+only runs the command line needs `pip install keyring` for the same.
+
+The default launchers in `protocols.conf` are Linux clients. Set `default = mstsc` under
+`[protocol:rdp]`, or pick mstsc from a connection's right-click menu
+(`rcm connect <sel> --via mstsc` from the command line).
+
+Not on Windows yet, and each says so rather than failing: focusing a session's window,
+system shortcuts and the switcher, workspace monitor placement, the icon and `.desktop`
+installers, and credential typing — so Radmin, which relies on it, refuses to connect
+until you remove its `inject.*` lines and type the password yourself. These belong to
+the tray agent phase on the [Roadmap](#roadmap).
 
 ## Quick start
 
@@ -368,6 +408,20 @@ Things that cost real time, kept here so they cost you less:
   processes that share a pattern with real sessions, discriminate on
   `readlink /proc/<pid>/exe` instead.
 - Wayland breaks the Radmin injection silently; `ydotool` is the fallback.
+- **Python on Windows writes text in the ANSI code page**, not UTF-8. One `⊞` in a
+  default config killed `rcm init` half-way, leaving an empty `ui.conf`. Every text
+  read and write names its encoding, and stdout is reconfigured too, or
+  `rcm list > file` dies at the first Cyrillic name.
+- **mstsc saves `.rdp` files as UTF-16 with a BOM.** Sniff the bytes. Decoding bytes
+  also skips newline translation, so normalise CRLF before writing back in text mode,
+  or every line grows CR CR LF.
+- **PowerShell writes to a pipe in the OEM code page.** The process query sets
+  `[Console]::OutputEncoding` to UTF-8, or `Café Box.rdp` never matches its own path.
+- **Windows gives an empty command line for processes it will not reveal** (System,
+  other users' without elevation). An empty string matches `^$` — the pattern meant
+  to match nothing — so drop those rows instead.
+- **`os.kill` on a PID that has already exited raises `PermissionError` on Windows**,
+  not `ProcessLookupError`.
 
 ### The Radmin phonebook format
 
@@ -392,8 +446,9 @@ named with its full path (`Plant/Line2`). Names, hosts and usernames are correct
   window control, monitor placement, credential typing and system shortcuts).
   Still to come: the tray agent owning `RegisterHotKey` and window management
   (Windows has no per-command keybinding registry, and Win+W/Win+Q are
-  shell-reserved), then PyInstaller bundling GTK. Nothing of the Windows class has
-  met a real Windows machine yet — its parsers are tested against fixtures.
+  shell-reserved), then PyInstaller bundling GTK. First run on a real machine
+  (Windows 11, October 2026): the command line, and the manager under MSYS2's GTK —
+  every layout, Setup, Logs, connecting through mstsc, live cards and disconnect.
 - VNC is implemented but has not been exercised against a real server
 - The WinRM script transport is exercised against a stub in tests, not yet against
   a real Windows host; same for via-gateways and a real bastion
