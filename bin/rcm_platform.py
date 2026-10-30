@@ -46,11 +46,16 @@ def parse_ps_lines(text: str) -> list[tuple[int, str]]:
 
 
 def parse_pipe_processes(text: str) -> list[tuple[int, str]]:
-    """`<pid>|<command line>` lines (the PowerShell process query) -> rows."""
+    """`<pid>|<command line>` lines (the PowerShell process query) -> rows.
+
+    System processes, and other users' unless elevated, report no command line
+    at all. That means "unreadable", not "no arguments", so they are dropped:
+    left in, an empty string matches web's deliberately unmatchable `^$`.
+    """
     rows: list[tuple[int, str]] = []
     for line in text.splitlines():
         pid, sep, args = line.partition("|")
-        if not sep:
+        if not sep or not args.strip():
             continue
         try:
             rows.append((int(pid.strip()), args.strip()))
@@ -221,11 +226,17 @@ class WindowsNative:
                          stderr=subprocess.DEVNULL, creationflags=flags)
 
     def process_command_lines(self) -> list[tuple[int, str]]:
+        # PowerShell writes a pipe in the OEM code page by default, which turns
+        # "Café.rdp" into something no saved connection path matches.
+        # CREATE_NO_WINDOW: the manager polls this every few seconds, and from
+        # a process without a console each run would flash one up.
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
+             "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
              "Get-CimInstance Win32_Process | ForEach-Object "
              "{ '{0}|{1}' -f $_.ProcessId, $_.CommandLine }"],
-            capture_output=True, text=True).stdout
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", creationflags=subprocess.CREATE_NO_WINDOW).stdout
         return parse_pipe_processes(out)
 
     # ---- windows ---------------------------------------------------------- #
@@ -241,7 +252,8 @@ class WindowsNative:
     # ---- network / displays ----------------------------------------------- #
     def mac_for_host(self, host: str) -> str:
         out = subprocess.run(["arp", "-a", host], capture_output=True,
-                             text=True).stdout
+                             text=True,
+                             creationflags=subprocess.CREATE_NO_WINDOW).stdout
         return parse_arp_windows(out, host)
 
     def monitor_geometry(self) -> dict[int, tuple[int, int, int, int]]:

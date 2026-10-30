@@ -32,7 +32,7 @@ def dbg(msg: str) -> None:
     if not DEBUG:
         return
     try:
-        with LOG.open("a") as fh:
+        with LOG.open("a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%H:%M:%S')} [{os.getpid()}] {msg}\n")
     except OSError:
         pass
@@ -351,7 +351,7 @@ def run(delta: int = 1) -> int:
     w.show_all()
 
     rcm.SWITCH_PIDFILE.parent.mkdir(parents=True, exist_ok=True)
-    rcm.SWITCH_PIDFILE.write_text(str(os.getpid()))
+    rcm.SWITCH_PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
     try:
         seat = Gdk.Display.get_default().get_default_seat()
         # One grab, best available: ALL when we can have the keyboard too,
