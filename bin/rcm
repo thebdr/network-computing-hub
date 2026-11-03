@@ -1001,17 +1001,18 @@ DEFAULT||
 #      the list in a run folder under remote_temp there
 #   3. starts the PC's own archiver through WMI at below-normal priority and
 #      waits for it
-#   4. fetches the archive to <dest>\<YYYYMMDD_HHMM>\<Group_Name>_<stamp>.<ext>
+#   4. fetches the archive to <dest>\<YYYYMMDD>\<Group_Name>_<YYYYMMDD_HHMM>.<ext>
 #      with the archiver's log beside it, then removes the run folder
-# Afterwards, run folders under dest older than keep_days are deleted.
+# Afterwards, day folders under each dest older than keep_days are deleted.
 #
 # The PCs must answer on 445 (SMB) and allow WMI (135 + the dynamic RPC
 # ports), and the account must be an administrator there.
+#
+# Edit here, or in the manager: Setup > Backups (with a preview of what the
+# skip regex leaves out, listed from the PC itself).
 
 [backup]
-# Where archives land on this computer.
-dest = ~/Backups
-# Run folders under dest older than this many days are deleted (0 keeps all).
+# Day folders older than this many days are deleted (0 keeps all).
 keep_days = 30
 # The archiver, run ON each PC from its own installation: plant PCs commonly
 # let only approved, installed programs run, so nothing copied over could.
@@ -1031,6 +1032,12 @@ extension = rar
 remote_temp = C:\Windows\Temp
 # Stop waiting for one PC's archive after this many minutes.
 timeout_minutes = 60
+
+[dest]
+# Where archives land on this computer, per scope like [folders] below -- a
+# project's group can send its PCs' archives straight to its own folder.
+DEFAULT = ~/Backups
+#   FVT_LaPoste = D:\Projects\FVT_LaPoste\Backup
 
 [folders]
 # What to back up, per scope, most specific first exactly like creds.conf:
@@ -2068,19 +2075,19 @@ def place_workspace_members(pending: list[tuple[str, str]], lines: list[str],
 # --------------------------------------------------------------------------- #
 # backups: folders on remote PCs, archived there, fetched here
 # --------------------------------------------------------------------------- #
-BACKUP_STAMP = "%Y%m%d_%H%M"
+BACKUP_STAMP = "%Y%m%d_%H%M"     # in the archive's name; its day folder is [:8]
 
 
 @dataclass
 class BackupSettings:
-    dest: Path
     keep_days: int
     archiver: str
     extension: str
     remote_temp: str
     timeout_minutes: float
-    folders: dict[str, str]
-    skip: dict[str, str]
+    dest: dict[str, str]          # scope -> folder on this computer
+    folders: dict[str, str]       # scope -> "C:\A; D:\B" ("" = nothing here)
+    skip: dict[str, str]          # scope -> regex ("" = skip nothing)
 
 
 @dataclass
@@ -2095,6 +2102,8 @@ class BackupResult:
     skipped: int = 0
     skipped_size: int = 0
     largest: list[tuple[int, str]] = field(default_factory=list)
+    skipped_largest: list[tuple[int, str]] = field(default_factory=list)
+    dest_dir: Path | None = None
     idle: bool = False     # no folders configured: nothing to do, not a failure
 
 
@@ -2127,15 +2136,67 @@ def load_backup_settings() -> BackupSettings:
         if placeholder not in archiver:
             raise ConfigError(f"{BACKUPS_CONF} [backup] archiver has no "
                               f"{placeholder}")
+    table = {name: dict(cp.items(name)) if cp.has_section(name) else {}
+             for name in ("dest", "folders", "skip")}
+    if raw.get("dest", "").strip() and "DEFAULT" not in table["dest"]:
+        table["dest"]["DEFAULT"] = raw["dest"]   # written before [dest] existed
     return BackupSettings(
-        dest=Path(expand_user_and_vars(need("dest"))),
         keep_days=number("keep_days", int),
         archiver=archiver,
         extension=need("extension").lstrip("."),
         remote_temp=need("remote_temp").rstrip("\\"),
         timeout_minutes=number("timeout_minutes", float),
-        folders=dict(cp.items("folders")) if cp.has_section("folders") else {},
-        skip=dict(cp.items("skip")) if cp.has_section("skip") else {})
+        **table)
+
+
+def save_backup_settings(settings: BackupSettings) -> None:
+    """Rewrite backups.conf: its documented template, carrying these values.
+
+    The comments are regenerated rather than round-tripped, as for
+    protocols.conf -- configparser cannot keep them, and a file that lost
+    its documentation is worse than one that got it back.
+    """
+    values = {"keep_days": str(settings.keep_days),
+              "archiver": settings.archiver, "extension": settings.extension,
+              "remote_temp": settings.remote_temp,
+              "timeout_minutes": f"{settings.timeout_minutes:g}"}
+    tables = {"dest": settings.dest, "folders": settings.folders,
+              "skip": settings.skip}
+    out: list[str] = []
+    section = ""
+
+    def close_table():
+        if section in tables:
+            while out and not out[-1].strip():
+                out.pop()
+            out.extend(f"{scope} = {value}".rstrip()
+                       for scope, value in tables[section].items())
+            out.append("")
+
+    for line in DEFAULT_CONFIGS["backups.conf"].splitlines():
+        header = re.match(r"^\[(\w+)\]\s*$", line)
+        if header:
+            close_table()
+            section = header.group(1)
+            out.append(line)
+            continue
+        key = re.match(r"^(\w+)\s*=", line)
+        if section == "backup" and key and key.group(1) in values:
+            out.append(f"{key.group(1)} = {values[key.group(1)]}")
+        elif section in tables and line.strip() and not line.startswith("#"):
+            continue        # the template's own entries give way to ours
+        else:
+            out.append(line)
+    close_table()
+    BACKUPS_CONF.write_text("\n".join(out).rstrip("\n") + "\n", encoding="utf-8")
+
+
+def backup_dest(sel: str, settings: BackupSettings) -> Path:
+    value = _scoped(settings.dest, sel)
+    if not value:
+        raise ConfigError(f"{BACKUPS_CONF} [dest] has no entry for {sel} "
+                          "(nor a DEFAULT)")
+    return Path(expand_user_and_vars(value))
 
 
 def _scoped(table: dict[str, str], sel: str) -> str | None:
@@ -2195,12 +2256,15 @@ def backup_one(c: Conn, settings: BackupSettings, stamp: str,
     file list goes into a run folder on the PC, and WMI starts the PC's own
     archiver on it at below-normal priority — WinRAR by default, from its
     installation there, since plant PCs often let nothing else run. Only
-    the finished archive crosses the network, into <dest>/<YYYYMMDD_HHMM>/,
-    with the archiver's log beside it; the run folder on the PC is removed.
-    A dry run stops after the listing and reports what would go in, and the
-    largest files. An archiver exit other than 0 that still left an archive
-    (files in use, typically) keeps it and says so — the log names them.
-    Run folders older than keep_days are deleted after a backup.
+    the finished archive crosses the network, to <dest>/<YYYYMMDD>/<Group_
+    Name>_<YYYYMMDD_HHMM>.<ext> — [dest] is per scope too, so a project's
+    group can send its archives straight to its own folder — with the
+    archiver's log beside it; the run folder on the PC is removed. A dry
+    run stops after the listing and reports what would go in, what the
+    skip regex leaves out, and the largest files. An archiver exit other
+    than 0 that still left an archive (files in use, typically) keeps it
+    and says so — the log names them. Day folders older than keep_days are
+    deleted after a backup.
     """
     result = BackupResult(c.sel, False, "")
     folders = backup_folders(c.sel, settings)
@@ -2211,6 +2275,7 @@ def backup_one(c: Conn, settings: BackupSettings, stamp: str,
         result.message = f"nothing to back up (no [folders] entry in {BACKUPS_CONF.name})"
         return result
     skip = backup_skip(c.sel, settings)
+    result.dest_dir = backup_dest(c.sel, settings) / stamp[:8]
     user, password = creds_lookup(c.sel, c.username, proto="backup")
     if not password:
         result.message = "no password on its credential chain (Setup ▸ Credentials)"
@@ -2233,6 +2298,20 @@ def backup_one(c: Conn, settings: BackupSettings, stamp: str,
 
         progress("listing files")
         listed: list[tuple[str, int]] = []
+        left_out: list[tuple[int, str]] = []
+
+        def tally(local_dir: Path) -> tuple[int, int]:
+            """(files, bytes) under a skipped folder -- listed, never read."""
+            count = total = 0
+            for root, _dirs, names in os.walk(local_dir):
+                for name in names:
+                    try:
+                        total += os.stat(os.path.join(root, name)).st_size
+                        count += 1
+                    except OSError:
+                        pass
+            return count, total
+
         for folder in folders:
             share, rest = _admin_share(folder)
             top = Path(roots[share]) / rest
@@ -2253,21 +2332,29 @@ def backup_one(c: Conn, settings: BackupSettings, stamp: str,
                     if entry.is_dir(follow_symlinks=False):
                         if not (skip and skip.search(remote + "\\")):
                             stack.append((Path(entry.path), remote))
+                            continue
+                        count, total = tally(Path(entry.path))
+                        result.skipped += count
+                        result.skipped_size += total
+                        left_out.append((total, remote + "\\"))
                         continue
                     size = entry.stat(follow_symlinks=False).st_size
                     if skip and skip.search(remote):
                         result.skipped += 1
                         result.skipped_size += size
+                        left_out.append((size, remote))
                     else:
                         listed.append((remote, size))
         result.files = len(listed)
         result.size = sum(size for _, size in listed)
         result.largest = sorted(((s, p) for p, s in listed), reverse=True)[:10]
+        result.skipped_largest = sorted(left_out, reverse=True)[:200]
         if dry_run:
             result.ok = True
             result.message = (f"would archive {result.files} files "
                               f"({human_size(result.size)}), skip {result.skipped} "
-                              f"({human_size(result.skipped_size)})")
+                              f"({human_size(result.skipped_size)}) "
+                              f"into {result.dest_dir}")
             return result
         if not listed:
             result.message = "nothing left to archive once skip is applied"
@@ -2322,9 +2409,15 @@ def backup_one(c: Conn, settings: BackupSettings, stamp: str,
         leave_run_dir = False
         code = int(exit_file.read_text(encoding="ascii").strip() or "255")
 
-        name = f"{_archive_stem(c.sel)}_{stamp}"
-        dest_dir = settings.dest / stamp
+        # One folder per day, the time in the archive's name; a second run in
+        # the same minute gets _2 rather than overwriting the first.
+        dest_dir = result.dest_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
+        name = f"{_archive_stem(c.sel)}_{stamp}"
+        n = 2
+        while (dest_dir / f"{name}.{settings.extension}").exists():
+            name = f"{_archive_stem(c.sel)}_{stamp}_{n}"
+            n += 1
         result.log = dest_dir / f"{name}.log"
         shutil.copyfile(run_unc / "archiver.log", result.log)
         packed = run_unc / packed_name
@@ -2359,32 +2452,40 @@ def backup_one(c: Conn, settings: BackupSettings, stamp: str,
                       archive=str(result.archive or ""), log=str(result.log or ""))
 
 
-def prune_backups(settings: BackupSettings) -> list[str]:
-    """Delete run folders under dest older than keep_days; their names.
+def prune_backups(settings: BackupSettings) -> list[Path]:
+    """Delete day folders older than keep_days under every [dest]; them.
 
-    Only folders named like a run stamp, and only the archives and .log
-    files backups write in them -- anything else there is left, and keeps
-    its folder too.
+    Only folders named like a day (YYYYMMDD), and only the archives and
+    .log files backups write in them -- anything else there is left, and
+    keeps its folder too.
     """
-    from datetime import datetime, timedelta
-    if settings.keep_days <= 0 or not settings.dest.is_dir():
+    from datetime import date, datetime, timedelta
+    if settings.keep_days <= 0:
         return []
-    cutoff = datetime.now() - timedelta(days=settings.keep_days)
+    cutoff = date.today() - timedelta(days=settings.keep_days)
     removed = []
-    for run in sorted(settings.dest.iterdir()):
-        if not (run.is_dir() and re.fullmatch(r"\d{8}_\d{4}", run.name)):
+    roots = {Path(expand_user_and_vars(v)) for v in settings.dest.values() if v}
+    for root in sorted(roots):
+        if not root.is_dir():
             continue
-        if datetime.strptime(run.name, BACKUP_STAMP) >= cutoff:
-            continue
-        for item in run.iterdir():
-            if item.is_file() and item.suffix.lower() in (
-                    f".{settings.extension.lower()}", ".rar", ".7z", ".zip", ".log"):
-                item.unlink()
-        try:
-            run.rmdir()
-            removed.append(run.name)
-        except OSError:
-            pass
+        for day in sorted(root.iterdir()):
+            if not (day.is_dir() and re.fullmatch(r"\d{8}", day.name)):
+                continue
+            try:
+                if datetime.strptime(day.name, "%Y%m%d").date() >= cutoff:
+                    continue
+            except ValueError:
+                continue
+            for item in day.iterdir():
+                if item.is_file() and item.suffix.lower() in (
+                        f".{settings.extension.lower()}", ".rar", ".7z", ".zip",
+                        ".log"):
+                    item.unlink()
+            try:
+                day.rmdir()
+                removed.append(day)
+            except OSError:
+                pass
     return removed
 
 
@@ -3370,15 +3471,18 @@ def main(argv: list[str]) -> int:
             print(f"    {verdict}: {r.message}")
             if r.archive:
                 print(f"    -> {r.archive}")
+            if dry and r.skipped_largest:
+                print("    left out by skip (largest first):")
+                for size, path in r.skipped_largest[:20]:
+                    print(f"      {human_size(size):>9}  {path}")
             if dry and r.largest:
                 print("    largest files kept:")
                 for size, path in r.largest:
                     print(f"      {human_size(size):>9}  {path}")
             failed += not r.ok
         if not dry:
-            for run in prune_backups(settings):
-                print(f"removed {settings.dest / run} "
-                      f"(older than {settings.keep_days} days)")
+            for day in prune_backups(settings):
+                print(f"removed {day} (older than {settings.keep_days} days)")
         return 1 if failed else 0
 
     if cmd == "history":

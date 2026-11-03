@@ -7,17 +7,18 @@
 #      the list in a run folder under remote_temp there
 #   3. starts the PC's own archiver through WMI at below-normal priority and
 #      waits for it
-#   4. fetches the archive to <dest>\<YYYYMMDD_HHMM>\<Group_Name>_<stamp>.<ext>
+#   4. fetches the archive to <dest>\<YYYYMMDD>\<Group_Name>_<YYYYMMDD_HHMM>.<ext>
 #      with the archiver's log beside it, then removes the run folder
-# Afterwards, run folders under dest older than keep_days are deleted.
+# Afterwards, day folders under each dest older than keep_days are deleted.
 #
 # The PCs must answer on 445 (SMB) and allow WMI (135 + the dynamic RPC
 # ports), and the account must be an administrator there.
+#
+# Edit here, or in the manager: Setup > Backups (with a preview of what the
+# skip regex leaves out, listed from the PC itself).
 
 [backup]
-# Where archives land on this computer.
-dest = ~/Backups
-# Run folders under dest older than this many days are deleted (0 keeps all).
+# Day folders older than this many days are deleted (0 keeps all).
 keep_days = 30
 # The archiver, run ON each PC from its own installation: plant PCs commonly
 # let only approved, installed programs run, so nothing copied over could.
@@ -37,6 +38,12 @@ extension = rar
 remote_temp = C:\Windows\Temp
 # Stop waiting for one PC's archive after this many minutes.
 timeout_minutes = 60
+
+[dest]
+# Where archives land on this computer, per scope like [folders] below -- a
+# project's group can send its PCs' archives straight to its own folder.
+DEFAULT = ~/Backups
+#   FVT_LaPoste = D:\Projects\FVT_LaPoste\Backup
 
 [folders]
 # What to back up, per scope, most specific first exactly like creds.conf:
