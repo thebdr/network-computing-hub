@@ -84,10 +84,11 @@ The default launchers in `protocols.conf` are Linux clients. Set `default = msts
 (`rcm connect <sel> --via mstsc` from the command line).
 
 Credential typing works as it does on Linux, so Radmin gets its password typed into
-its prompt. Not on Windows yet, and each says so rather than failing: focusing a
-session's window, system shortcuts and the switcher, workspace monitor placement, and
-the icon and `.desktop` installers. These belong to the tray agent phase on the
-[Roadmap](#roadmap).
+its prompt, and 👁 Focus raises a live session's window — the one its own process owns,
+so an Explorer window open on `\\host\c$` is never mistaken for it. Not on Windows yet,
+and each says so rather than failing: system shortcuts and the switcher, workspace
+monitor placement, and the icon and `.desktop` installers. These belong to the tray
+agent phase on the [Roadmap](#roadmap).
 
 ## Quick start
 

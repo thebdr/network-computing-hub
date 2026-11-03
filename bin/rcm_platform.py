@@ -149,6 +149,14 @@ class LinuxX11:
         except Exception:
             return ""
 
+    def session_window(self, pid: int, title_pattern: str) -> str:
+        # By title alone, as it always was: a flatpak client reports its
+        # sandbox's pid in _NET_WM_PID, so the pid cannot narrow it here.
+        for w in self.xdotool("search", "--name", title_pattern).splitlines():
+            if w.strip():
+                return w.strip()
+        return ""
+
     def screenshot_to(self, dest: Path) -> bool:
         if not shutil.which("gnome-screenshot"):
             return False
@@ -314,11 +322,14 @@ class _Win32:
         self.user32.GetClassNameW(hwnd, buf, 256)
         return buf.value
 
-    def program(self, hwnd: int) -> str:
-        """Image name of the process that owns the window, e.g. Radmin.exe."""
+    def pid(self, hwnd: int) -> int:
         pid = self.wt.DWORD()
         self.user32.GetWindowThreadProcessId(hwnd, self.ctypes.byref(pid))
-        handle = self.kernel32.OpenProcess(0x1000, False, pid.value)  # query-limited
+        return pid.value
+
+    def program(self, hwnd: int) -> str:
+        """Image name of the process that owns the window, e.g. Radmin.exe."""
+        handle = self.kernel32.OpenProcess(0x1000, False, self.pid(hwnd))  # query-limited
         if not handle:
             return ""
         try:
@@ -417,21 +428,26 @@ class WindowsNative:
     _w32: _Win32 | None = None
     _typing_target = 0     # the window `windowactivate` last brought forward
 
+    def _win32(self) -> _Win32:
+        if self._w32 is None:
+            self._w32 = _Win32()
+        return self._w32
+
     def xdotool(self, *args: str) -> str:
-        """The xdotool subcommands credential typing and calibrate use, done
-        with user32 so rcm keeps one code path for both systems.
+        """The xdotool subcommands credential typing, calibrate and focusing
+        use, done with user32 so rcm keeps one code path for both systems.
 
         X11's WM_CLASS names the program, while a Windows window class names
         the widget (#32770 is every dialog), so `search --class` also matches
         the owning program's image name: [Rr]admin finds Radmin.exe's prompt
-        as it did under Wine. `type` and `key` go to the window
-        `windowactivate` last brought forward and stop once it is no longer
-        in front -- xdotool would type on into whatever took focus, and here
-        that can be a password. Moving windows stays with the tray agent.
+        as it did under Wine. A window that will not come forward fails
+        quietly, as with xdotool, but then `type` and `key` refuse: they go
+        only to the window `windowactivate` last brought forward, and stop
+        once it is no longer in front -- xdotool would type on into whatever
+        took focus, and here that can be a password. Moving windows stays
+        with the tray agent.
         """
-        if self._w32 is None:
-            self._w32 = _Win32()
-        w32 = self._w32
+        w32 = self._win32()
         cmd, rest = args[0], list(args[1:])
         if cmd == "search":
             # xdotool compiles its patterns case-insensitively too.
@@ -456,10 +472,7 @@ class WindowsNative:
                     f"WIDTH={right - left}\nHEIGHT={bottom - top}")
         if cmd == "windowactivate":
             hwnd = int(rest[-1])
-            if not w32.activate(hwnd):
-                raise RuntimeError(f"could not bring {w32.title(hwnd)!r} to the "
-                                   "front; typed nothing")
-            self._typing_target = hwnd
+            self._typing_target = hwnd if w32.activate(hwnd) else 0
             return ""
         if cmd == "type":
             delay = int(rest[rest.index("--delay") + 1]) if "--delay" in rest else 12
@@ -488,9 +501,30 @@ class WindowsNative:
         raise PlatformError(f"window control ({cmd}) is {self._TRAY_AGENT}")
 
     def _ensure_target_in_front(self, w32: _Win32) -> None:
-        if not self._typing_target or w32.foreground() != self._typing_target:
+        if not self._typing_target:
+            raise RuntimeError("the prompt would not come to the front -- "
+                               "typed nothing")
+        if w32.foreground() != self._typing_target:
             raise RuntimeError("the prompt is no longer in front -- stopped "
                                "typing so nothing lands in another window")
+
+    def session_window(self, pid: int, title_pattern: str) -> str:
+        """The live session's own window: visible, owned by its process, and
+        whose title matches if any does.
+
+        The process decides before the title does. An Explorer window open on
+        \\\\host\\c$ names the host in its title too, and a title search alone
+        would focus that instead of the RDP session.
+        """
+        w32 = self._win32()
+        mine = [h for h in w32.top_level_windows()
+                if w32.pid(h) == pid and w32.visible(h) and w32.title(h)]
+        try:
+            pattern = re.compile(title_pattern, re.IGNORECASE)
+        except re.error:
+            pattern = re.compile(re.escape(title_pattern), re.IGNORECASE)
+        titled = [h for h in mine if pattern.search(w32.title(h))]
+        return str((titled or mine or [""])[0])
 
     def screenshot_to(self, dest: Path) -> bool:
         return False

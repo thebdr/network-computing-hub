@@ -1557,12 +1557,9 @@ def sessions() -> list[Session]:
         seen.add(key)
 
         win = ""
-        if host and PLATFORM.window_control:
+        if host:
             pattern = (p.detect_window or "{host}").format(host=host, name=label)
-            for w in xdotool("search", "--name", pattern).splitlines():
-                if w.strip():
-                    win = w.strip()
-                    break
+            win = PLATFORM.session_window(pid, pattern)
         out.append(Session(proto, label, host, pid, win))
 
     # Stable, meaningful order: follow the saved list, then protocol. next/prev
