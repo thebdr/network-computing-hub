@@ -25,6 +25,8 @@ client does not provide a credentials management, automate the insertion on a pa
 - **Live session list** — see what is connected, focus it, disconnect it
 - **System-wide shortcuts** and an Alt-Tab-style switcher across active sessions
 - **Batch CSV import/export**, .rdp, and an experimental Radmin phonebook export
+- **Backups of folders on remote Windows PCs**, compressed on each PC by its own
+  WinRAR or 7-Zip and fetched as one archive, with a skip regex and retention
 - **Tick connections** to queue them up for the Connect buttons; right-click any
   selection to export it as `.rdp` files, a CSV, or a Radmin phonebook
 
@@ -139,6 +141,7 @@ back to something that happened to work on the author's machine.
 |---|---|
 | `protocols.conf` | the protocols: buttons, commands, detection, credential typing |
 | `creds.conf` | scope → username. **No passwords** — those are in the keyring |
+| `backups.conf` | where backups go, the archiver run on each PC, folders and skip per scope |
 | `shortcuts.conf` | system-wide keys |
 
 ### Protocols
@@ -285,6 +288,58 @@ second time and type — the slow double-click every file manager uses. On a gro
 heading row the Connection cell renames the group, which moves the folder with
 everything in it.
 
+## Backups
+
+Right-click a selection (a group means all of it) ▸ **Back up…**, or from Task
+Scheduler `rcm backup <connection or group>… [--dry-run]`. Each PC's folders are
+compressed **on that PC** by the archiver installed there, and only the finished
+archive crosses the network — no drive mapping, no copying every file to compress it
+here. Per PC:
+
+1. its admin shares (`C$`, `D$`…) open with the credential chain — a
+   `<scope>@backup` entry first, else the usual one — the password handed to the
+   Windows API, never put on a command line;
+2. the folders are listed and filtered here, and the exact file list is left in a
+   run folder on the PC;
+3. WMI starts the PC's archiver on that list at below-normal priority;
+4. the archive lands in `<dest>\<YYYYMMDD_HHMM>\<Group_Name>_<stamp>.rar` with the
+   archiver's log beside it, and the run folder on the PC is removed.
+
+Run folders under `dest` older than `keep_days` are deleted afterwards — only
+stamp-named folders, and only the archives and logs in them.
+
+```ini
+[backup]
+dest = C:\Backup_ALL
+keep_days = 30
+archiver = "C:\Program Files\WinRAR\rar.exe" a -ma5 -m5 -s -mt2 -dh -ep2 -scfl -idp -y {archive} @{list}
+extension = rar
+
+[folders]                        ; most specific scope wins, like creds.conf
+FVT_LaPoste/TRIB/bSorter = C:\PRODUCTION
+Plant = C:\PRODUCTION; D:\Recipes
+
+[skip]                           ; regex on each file's full path on the PC
+DEFAULT = \.dmp$|\\CrashDumps?\\
+```
+
+`skip` matches, ignoring case, against paths like `C:\PRODUCTION\Logs\a.dmp`; a
+folder that matches (tested with a trailing `\`) is left out whole, so hundreds of MB
+of crash dumps are never even read. **Dry run** lists what would go in and the ten
+largest files — the quickest way to write the regex. An archiver exit other than 0
+that still produced an archive (files held open by a running program, typically)
+keeps it and says so; the log names the files.
+
+The archiver must be the PC's own: plant PCs often run application whitelisting, and
+there a copied `7z.exe` or a `.cmd` started through WMI is refused even for a full
+administrator. RAR5 solid at `-m5` comes close to 7z; where 7-Zip is installed on the
+PCs, `backups.conf` has its line ready. The PCs must answer on 445 (SMB) and allow WMI
+(135 plus the dynamic RPC ports), and the account must be an administrator there.
+
+On Windows, schedule it with MSYS2's Python, which has the keyring:
+`C:\msys64\ucrt64\bin\python.exe <repo>\bin\rcm backup FVT_LaPoste`. The exit code
+is 1 when any PC failed.
+
 ## The manager
 
 The window has three layouts (the Layout button, saved as `layout =` in `ui.conf`):
@@ -381,6 +436,7 @@ rcm connect-all <group>
 rcm protocols | detect <protocol> [--write] | creds ... | shortcuts ...
 rcm import <csv> [--overwrite] [--dry-run] | export [csv] | phonebook [out.rpb]
 rcm calibrate <sel> [protocol] | gen-launcher | install-icon
+rcm backup <sel or group>... [--dry-run]
 ```
 
 ## Notes from building this
@@ -425,6 +481,17 @@ Things that cost real time, kept here so they cost you less:
   to match nothing — so drop those rows instead.
 - **`os.kill` on a PID that has already exited raises `PermissionError` on Windows**,
   not `ProcessLookupError`.
+- **Application whitelisting answers "Access is denied", not "blocked".** On a
+  Windows 10 IoT plant PC, WMI started `cmd /c` fine, but a `.cmd` file never ran
+  and a copied `7z.exe` failed with "Access is denied" — from `Windows\Temp` and from
+  `Program Files` alike, under a High-integrity administrator token with full control
+  of the folder. Only installed programs ran. Check the token and the ACL before
+  blaming permissions, then use what the PC already has.
+- **`cmd /c "a & echo %errorlevel%"` reports the code from before `a` ran**: the whole
+  line is expanded when it is parsed. `cmd /v:on` with `!errorlevel!` reads it when
+  that command runs.
+- **`echo 0> file` redirects handle 0** and writes "ECHO is off." — put the redirect
+  first: `> file echo %code%`.
 
 ### The Radmin phonebook format
 

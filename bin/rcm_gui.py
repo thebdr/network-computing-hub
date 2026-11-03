@@ -2554,6 +2554,127 @@ class Win(Gtk.Window):
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def backup_dialog(self, conns: list) -> None:
+        """Right-click ▸ Back up… archives each PC's folders on the PC itself.
+
+        What and how come from backups.conf (see the Backups topic). Each
+        row shows its step live — listing, compressing with the size so far,
+        fetching — then ✓ with the archive's size or ✗ with the reason;
+        double-clicking a finished row opens its archive's folder. "Dry run"
+        lists what would go in and archives nothing. Abort stops between
+        PCs, or stops waiting on the current one.
+        """
+        try:
+            settings = rcm.load_backup_settings()
+        except rcm.ConfigError as problem:
+            self._dialog(Gtk.MessageType.ERROR, "Backups are not set up",
+                         str(problem))
+            return
+        d = Gtk.Dialog(title=f"Back up {len(conns)} host(s)",
+                       transient_for=self, modal=False)
+        d.set_default_size(620, -1)
+        close_btn = d.add_button(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
+        abort_btn = d.add_button("Abort", 1)
+        run_btn = d.add_button("Back up", Gtk.ResponseType.OK)
+        abort_btn.set_sensitive(False)
+        d.set_default_response(Gtk.ResponseType.OK)
+        box = d.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(6)
+        archiver = Path(shlex.split(settings.archiver, posix=False)[0]
+                        .strip('"')).name
+        note = Gtk.Label(xalign=0)
+        note.set_markup(GLib.markup_escape_text(
+            f"{archiver} on each PC · into {settings.dest} · kept "
+            f"{settings.keep_days} days · folders and skip from backups.conf"))
+        note.get_style_context().add_class("dim-label")
+        note.set_line_wrap(True)
+        box.add(note)
+        dry_toggle = Gtk.CheckButton(
+            label="Dry run — list what would go in, archive nothing")
+        box.add(dry_toggle)
+        results = Gtk.ListStore(str, str, str)   # sel, verdict, folder to open
+        view = Gtk.TreeView(model=results)
+        for i, title in enumerate(("Host", "Result")):
+            cell = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
+            column = Gtk.TreeViewColumn(title, cell, text=i)
+            column.set_resizable(True)
+            column.set_expand(i == 1)
+            view.append_column(column)
+        view.set_tooltip_text("double-click a finished row to open its folder")
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_min_content_height(160)
+        scroller.add(view)
+        box.pack_start(scroller, True, True, 0)
+        for c in conns:
+            results.append([c.sel, "queued", ""])
+        view.connect("row-activated",
+                     lambda _tv, path, _col:
+                     results[path][2] and rcm.open_path(results[path][2]))
+        abort = threading.Event()
+
+        def on_response(_d, response):
+            if response == Gtk.ResponseType.OK:
+                run_btn.set_sensitive(False)
+                dry_toggle.set_sensitive(False)
+                abort_btn.set_sensitive(True)
+                self._backup_batch(conns, settings, dry_toggle.get_active(),
+                                   abort, results,
+                                   done=lambda: (abort_btn.set_sensitive(False),
+                                                 close_btn.grab_focus()))
+                return
+            if response == 1:
+                abort.set()
+                abort_btn.set_sensitive(False)
+                return
+            abort.set()
+            d.destroy()
+
+        d.connect("response", on_response)
+        d.show_all()
+
+    def _backup_batch(self, conns: list, settings, dry_run: bool,
+                      abort: threading.Event, results, done) -> None:
+        """Worker thread: one PC after another, live steps into `results`."""
+        stamp = time.strftime(rcm.BACKUP_STAMP)
+
+        def set_row(i, verdict, folder=""):
+            def apply():
+                results[i][1] = verdict
+                if folder:
+                    results[i][2] = folder
+            GLib.idle_add(apply)
+
+        def worker():
+            counts = {"ok": 0, "fail": 0}
+            for i, c in enumerate(conns):
+                if abort.is_set():
+                    set_row(i, "— aborted")
+                    continue
+                set_row(i, "⟳ starting…")
+                try:
+                    r = rcm.backup_one(
+                        c, settings, stamp, dry_run=dry_run, abort=abort,
+                        progress=lambda text, i=i: set_row(i, f"⟳ {text}"))
+                except rcm.ConfigError as problem:
+                    r = rcm.BackupResult(c.sel, False, str(problem))
+                where = str((r.archive or r.log).parent) if (r.archive or r.log) else ""
+                if not r.idle:
+                    counts["ok" if r.ok else "fail"] += 1
+                mark = "–" if r.idle else "✓" if r.ok else "✗"
+                set_row(i, f"{mark} {r.message}", where)
+            removed = [] if dry_run else rcm.prune_backups(settings)
+            GLib.idle_add(done)
+            GLib.idle_add(self.say,
+                          f"backup{' dry run' if dry_run else ''}: "
+                          f"{counts['ok']} ✓, {counts['fail']} ✗ on "
+                          f"{len(conns)} host(s)"
+                          + (f"; removed {len(removed)} run(s) older than "
+                             f"{settings.keep_days} days" if removed else ""))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _script_one_host(self, c, script_path) -> tuple[int, str, str]:
         """(exit code, output, transport) for one host: SSH else WinRM."""
         if rcm.probe_host(c.host, 22, timeout=2.0):
@@ -3998,6 +4119,12 @@ class Win(Gtk.Window):
         run_item.set_sensitive(bool(cs))
         run_item.connect("activate", lambda _m, sel=cs: self.run_script_dialog(sel))
         menu.append(run_item)
+
+        backup_item = Gtk.MenuItem(label=f"Back up… ({len(cs)})" if cs
+                                   else "Back up…")
+        backup_item.set_sensitive(bool(cs))
+        backup_item.connect("activate", lambda _m, sel=cs: self.backup_dialog(sel))
+        menu.append(backup_item)
 
         save_ws = Gtk.MenuItem(label=f"Save as workspace… ({len(cs)})" if cs
                                else "Save as workspace…")
