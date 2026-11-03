@@ -111,7 +111,11 @@ def build_protocol_css(protos) -> bytes:
                "background-color: alpha(currentColor, 0.22); }\n"
                # The Connect row: 20% shorter than a stock button.
                "button.rcm-connect { padding-top: 1px; padding-bottom: 1px; "
-               "min-height: 20px; }\n")
+               "min-height: 20px; }\n"
+               # Live cards' Focus / Disconnect: just the icon, so the card
+               # is one text line tall.
+               "button.rcm-cardbtn { padding: 0 2px; min-height: 0; "
+               "min-width: 0; }\n")
     # Group headings in the icon view read as bands, like the list's rows.
     out.append(".rcm-group-heading { background-color: alpha("
                "@theme_selected_bg_color, 0.16); padding: 2px 6px; }\n")
@@ -1231,9 +1235,12 @@ class Win(Gtk.Window):
         # so the whole set stays visible (see refresh_cockpit_cards).
         self.cockpit_cards = Gtk.FlowBox()
         self.cockpit_cards.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.cockpit_cards.set_homogeneous(False)
-        self.cockpit_cards.set_max_children_per_line(30)
-        self.cockpit_cards.set_min_children_per_line(1)
+        # Equal cards in a grid, packed from the left: a filling FlowBox
+        # hands each card an equal share of the row, so two cards sat half a
+        # window apart. A START FlowBox asks for one card's width, so
+        # pack_cards fixes how many a row holds.
+        self.cockpit_cards.set_homogeneous(True)
+        self.cockpit_cards.set_halign(Gtk.Align.START)
         self.cockpit_cards.set_row_spacing(3)
         self.cockpit_cards.set_column_spacing(4)
         self.cards_revealer.add(self.cockpit_cards)
@@ -1948,25 +1955,36 @@ class Win(Gtk.Window):
                 getattr(self, "_browse_side_box", None) is not None:
             self._browse_side_box.hide()
 
-    # Card widths per density, and how many rows each is allowed to fill
-    # before the strip gives up detail rather than height.
-    CARD_WIDTHS = (232, 150, 108)
+    # Card widths per density until cards at that density have been built
+    # and measured; each density may fill 2 + level rows before the strip
+    # gives up detail rather than height.
+    CARD_WIDTHS = (330, 170, 120)
+
+    def cards_per_row(self, width: int, card_width: int) -> int:
+        """How many cards of card_width the strip fits on one row -- the
+        FlowBox's own arithmetic, so the guess and the wrap agree."""
+        gap = self.cockpit_cards.get_column_spacing()
+        return max(1, (width + gap) // (card_width + gap))
+
+    def cards_fit(self, count: int, level: int, card_width: int) -> bool:
+        width = self.cards_revealer.get_allocated_width()
+        return width < 50 or \
+            count <= self.cards_per_row(width, card_width) * (2 + level)
 
     def card_density(self, count: int) -> int:
         """How much each live card may say, given the room and the crowd.
 
         Three steps: the full card (chip, path, host and shortcut, action
-        buttons), then name-only when that would spill past two rows, then a
-        chip-and-name tile with its actions on the right-click menu. The
-        strip never scrolls and never eats the list's height.
+        buttons, one line), then the leaf name and the buttons when that
+        would spill past two rows, then chip and name with the actions on
+        the right-click menu. The strip never scrolls and never eats the
+        list's height.
         """
-        width = self.cards_revealer.get_allocated_width() if getattr(
-            self, "cards_revealer", None) else 0
-        if width < 50:
+        if getattr(self, "cards_revealer", None) is None:
             return 0
-        for level, card_width in enumerate(self.CARD_WIDTHS):
-            per_row = max(1, width // card_width)
-            if count <= per_row * (2 + level):
+        measured = getattr(self, "_card_widths", {})
+        for level, guess in enumerate(self.CARD_WIDTHS):
+            if self.cards_fit(count, level, measured.get(level, guess)):
                 return level
         return len(self.CARD_WIDTHS) - 1
 
@@ -1992,7 +2010,8 @@ class Win(Gtk.Window):
         return True
 
     def reflow_cards_if_needed(self) -> None:
-        """Re-densify when the window resizes, but only on a real change."""
+        """Re-densify or re-pack when the window resizes, but only on a real
+        change."""
         if getattr(self, "cockpit_cards", None) is None:
             return
         count = len(getattr(self, "_card_sessions", []))
@@ -2000,6 +2019,84 @@ class Win(Gtk.Window):
             return
         if self.card_density(count) != getattr(self, "_card_density", None):
             GLib.idle_add(self.refresh_cockpit_cards)
+        elif self.cards_on_a_row() != \
+                self.cockpit_cards.get_min_children_per_line():
+            GLib.idle_add(self.pack_cards)
+
+    def cards_on_a_row(self) -> int:
+        """Cards per row for the strip's width at the current density."""
+        return min(max(1, len(self._card_sessions)), self.cards_per_row(
+            self.cards_revealer.get_allocated_width(),
+            self._card_widths.get(self._card_density, 0)))
+
+    def pack_cards(self) -> bool:
+        per_row = self.cards_on_a_row()
+        self.cockpit_cards.set_min_children_per_line(per_row)
+        self.cockpit_cards.set_max_children_per_line(per_row)
+        return False
+
+    def live_card(self, session, density: int, registry, keys) -> Gtk.Widget:
+        """One live session as a one-line card, saying as much as density
+        allows (see card_density)."""
+        inner = Gtk.Box(spacing=4)
+        inner.set_border_width(2)
+        proto = next((q for q in registry.values()
+                      if q.label == session.proto), None)
+        chip = (f'<span background="{resolve_colour(proto.color)}" '
+                f'foreground="#ffffff"> '
+                f'{GLib.markup_escape_text(session.proto)} </span> '
+                ) if proto else ""
+        # Level 0 shows the full path; tighter levels show the leaf name,
+        # which is what tells two live sessions apart at a glance.
+        shown = session.label if density == 0 \
+            else session.label.rsplit("/", 1)[-1]
+        head = Gtk.Label(xalign=0)
+        head.set_markup(chip + f"<b>{GLib.markup_escape_text(shown)}</b>")
+        head.set_ellipsize(Pango.EllipsizeMode.END)
+        inner.pack_start(head, True, True, 0)
+        if density == 0:
+            detail = session.host
+            key = pretty_key(keys.get(session.label, ""))
+            if key:
+                detail += f" · {key}"
+            sub = Gtk.Label(xalign=0)
+            sub.set_markup(f"<small>{GLib.markup_escape_text(detail)}</small>")
+            sub.get_style_context().add_class("dim-label")
+            sub.set_ellipsize(Pango.EllipsizeMode.END)
+            inner.pack_start(sub, False, False, 0)
+
+        if density < 2:
+            focus = Gtk.Button.new_from_icon_name("view-reveal-symbolic",
+                                                  Gtk.IconSize.MENU)
+            focus.set_relief(Gtk.ReliefStyle.NONE)
+            focus.set_tooltip_text(f"Focus {session.label}" if session.window
+                                   else f"no window found for {session.label}")
+            focus.set_sensitive(bool(session.window))
+            focus.get_style_context().add_class("rcm-cardbtn")
+            focus.connect("clicked",
+                          lambda _b, sess=session: rcm.focus_session(sess))
+            inner.pack_start(focus, False, False, 0)
+            end = Gtk.Button.new_from_icon_name(
+                "network-wired-disconnected-symbolic", Gtk.IconSize.MENU)
+            end.set_relief(Gtk.ReliefStyle.NONE)
+            end.set_tooltip_text(f"Disconnect {session.label}")
+            end.get_style_context().add_class("rcm-cardbtn")
+            end.connect("clicked",
+                        lambda _b, sess=session: (rcm.kill_session(sess),
+                                                  self.refresh_live()))
+            inner.pack_start(end, False, False, 0)
+        # At the tightest density the buttons would crowd out the name,
+        # so Focus and Disconnect move to the right-click menu.
+        card_event = Gtk.EventBox()
+        card_event.add(inner)
+        card_event.connect("button-press-event", self.on_card_click, session)
+        card_event.set_tooltip_text(
+            f"{session.label} — {session.host}"
+            + ("  ·  right-click for Focus and Disconnect"
+               if density == 2 else ""))
+        card = Gtk.Frame()
+        card.add(card_event)
+        return card
 
     def refresh_cockpit_cards(self) -> None:
         """Paint the live-session card strip; hidden entirely when idle."""
@@ -2011,83 +2108,26 @@ class Win(Gtk.Window):
         keys = rcm.session_bindings()
         sessions = rcm.sessions()
         self._card_sessions = sessions
-        density = self.card_density(len(sessions))
+        self.cards_revealer.set_reveal_child(bool(sessions))
+        # Cards are as wide as what they say, so each density is built and
+        # measured, starting from the fullest, until the crowd fits; the
+        # widths are kept for card_density to judge resizes by.
+        self._card_widths = {}
+        for density in range(len(self.CARD_WIDTHS)):
+            for session in sessions:
+                self.cockpit_cards.add(
+                    self.live_card(session, density, registry, keys))
+            self.cockpit_cards.show_all()
+            widest = max((child.get_preferred_width()[1] for child
+                          in self.cockpit_cards.get_children()), default=0)
+            self._card_widths[density] = widest
+            if density == len(self.CARD_WIDTHS) - 1 or \
+                    self.cards_fit(len(sessions), density, widest):
+                break
+            for child in self.cockpit_cards.get_children():
+                child.destroy()
         self._card_density = density
-        # Pack exactly as many per row as the density was calculated for, or
-        # the FlowBox spreads them wider and spills into an extra row.
-        width = self.cards_revealer.get_allocated_width() if getattr(
-            self, "cards_revealer", None) else 0
-        if width > 50:
-            self.cockpit_cards.set_max_children_per_line(
-                max(1, width // self.CARD_WIDTHS[density]))
-        if getattr(self, "cards_revealer", None) is not None:
-            self.cards_revealer.set_reveal_child(bool(sessions))
-        for session in sessions:
-            card = Gtk.Frame()
-            inner = Gtk.Box(spacing=4)
-            inner.set_border_width(2 if density else 4)
-            proto = next((q for q in registry.values()
-                          if q.label == session.proto), None)
-            chip = (f'<span background="{resolve_colour(proto.color)}" '
-                    f'foreground="#ffffff"> '
-                    f'{GLib.markup_escape_text(session.proto)} </span>  '
-                    ) if proto else ""
-            # Level 0 shows the full path; tighter levels show the leaf name,
-            # which is what tells two live sessions apart at a glance.
-            shown = session.label if density == 0 \
-                else session.label.rsplit("/", 1)[-1]
-            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-            head = Gtk.Label(xalign=0)
-            head.set_markup(chip + f"<b>{GLib.markup_escape_text(shown)}</b>")
-            head.set_ellipsize(Pango.EllipsizeMode.END)
-            text.pack_start(head, False, False, 0)
-            if density < 2:
-                sub = Gtk.Label(xalign=0)
-                key = pretty_key(keys.get(session.label, ""))
-                detail = GLib.markup_escape_text(session.host)
-                if key and density == 0:
-                    detail += f" · {GLib.markup_escape_text(key)}"
-                sub.set_markup(f"<small>{detail}</small>")
-                sub.get_style_context().add_class("dim-label")
-                sub.set_ellipsize(Pango.EllipsizeMode.END)
-                text.pack_start(sub, False, False, 0)
-            inner.pack_start(text, True, True, 0)
-
-            if density < 2:
-                focus = Gtk.Button.new_from_icon_name("view-reveal-symbolic",
-                                                      Gtk.IconSize.MENU)
-                focus.set_relief(Gtk.ReliefStyle.NONE)
-                focus.set_tooltip_text(f"Focus {session.label}" if session.window
-                                       else f"no window found for {session.label}")
-                focus.set_sensitive(bool(session.window))
-                focus.get_style_context().add_class("rcm-tab")
-                focus.connect("clicked",
-                              lambda _b, sess=session: rcm.focus_session(sess))
-                inner.pack_start(focus, False, False, 0)
-                end = Gtk.Button.new_from_icon_name(
-                    "network-wired-disconnected-symbolic", Gtk.IconSize.MENU)
-                end.set_relief(Gtk.ReliefStyle.NONE)
-                end.set_tooltip_text(f"Disconnect {session.label}")
-                end.get_style_context().add_class("rcm-tab")
-                end.connect("clicked",
-                            lambda _b, sess=session: (rcm.kill_session(sess),
-                                                      self.refresh_live()))
-                inner.pack_start(end, False, False, 0)
-            # At the tightest density the buttons would crowd out the name,
-            # so Focus and Disconnect move to the right-click menu.
-            card_event = Gtk.EventBox()
-            card_event.add(inner)
-            card_event.connect("button-press-event", self.on_card_click,
-                               session)
-            card_event.set_tooltip_text(
-                f"{session.label} — {session.host}"
-                + ("  ·  right-click for Focus and Disconnect"
-                   if density == 2 else ""))
-            card.add(card_event)
-            card.set_halign(Gtk.Align.START)
-            card.set_size_request(self.CARD_WIDTHS[density] - 8, -1)
-            self.cockpit_cards.add(card)
-        self.cockpit_cards.show_all()
+        self.pack_cards()
 
     def chip_filters_allow(self, c) -> bool:
         """Chip filters beside the Browse filter box (Live / per-protocol)."""
