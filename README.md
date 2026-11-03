@@ -83,11 +83,11 @@ The default launchers in `protocols.conf` are Linux clients. Set `default = msts
 `[protocol:rdp]`, or pick mstsc from a connection's right-click menu
 (`rcm connect <sel> --via mstsc` from the command line).
 
-Not on Windows yet, and each says so rather than failing: focusing a session's window,
-system shortcuts and the switcher, workspace monitor placement, the icon and `.desktop`
-installers, and credential typing — so Radmin, which relies on it, refuses to connect
-until you remove its `inject.*` lines and type the password yourself. These belong to
-the tray agent phase on the [Roadmap](#roadmap).
+Credential typing works as it does on Linux, so Radmin gets its password typed into
+its prompt. Not on Windows yet, and each says so rather than failing: focusing a
+session's window, system shortcuts and the switcher, workspace monitor placement, and
+the icon and `.desktop` installers. These belong to the tray agent phase on the
+[Roadmap](#roadmap).
 
 ## Quick start
 
@@ -182,7 +182,7 @@ Some clients refuse to take a password on the command line — Radmin has no
 Viewer machine. For those, describe the prompt and the keystrokes:
 
 ```ini
-inject.window_class = [Rr]admin      ; X11 class of the prompt
+inject.window_class = [Rr]admin      ; X11 class, or on Windows the program (Radmin.exe)
 inject.window_title = security       ; substring of its title
 inject.wait   = 20                   ; seconds to wait for it
 inject.settle = 0.3                  ; pause after focusing, before typing
@@ -191,6 +191,8 @@ inject.steps  = type:{user} | key:Tab | type:{password} | key:Return
 ```
 
 Steps are `type:<text>`, `key:<keysym>`, `sleep:<seconds>`, `activate` and `clear`.
+On Windows every keystroke first checks that the prompt is still in front, and typing
+stops if anything else has taken focus — a password never follows the focus elsewhere.
 `{password}` is read from the keyring at the moment it is typed and never written to
 disk. `rcm calibrate <connection> [protocol]` opens the prompt, reports exactly what it
 is, saves a screenshot of it, and types nothing — use it when writing the steps.
@@ -441,9 +443,10 @@ named with its full path (`Plant/Line2`). Names, hosts and usernames are correct
 
 - Windows support, in phases. **Done: the platform seam** — every OS call lives in
   `bin/rcm_platform.py` (`LinuxX11` is the reference behaviour; `WindowsNative`
-  really implements detached spawn, process listing, ARP lookup, opening files and
-  credentials via the `keyring` package, and raises a clear `PlatformError` for
-  window control, monitor placement, credential typing and system shortcuts).
+  really implements detached spawn, process listing, ARP lookup, opening files,
+  credentials via the `keyring` package and typing them into a prompt through user32,
+  and raises a clear `PlatformError` for window control, monitor placement and system
+  shortcuts).
   Still to come: the tray agent owning `RegisterHotKey` and window management
   (Windows has no per-command keybinding registry, and Win+W/Win+Q are
   shell-reserved), then PyInstaller bundling GTK. First run on a real machine

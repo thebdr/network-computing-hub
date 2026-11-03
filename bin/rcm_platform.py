@@ -5,9 +5,9 @@ LinuxX11 is the reference implementation — the exact behaviour the manager
 has always had, moved here verbatim. WindowsNative is the port's landing
 strip: the pieces that could be written and parse-tested now are real
 (detached spawn, process listing, ARP lookup, opening files, credentials
-through the `keyring` package), and everything still owned by later phases
-of the port plan raises PlatformError naming that plan, so nothing degrades
-silently.
+through the `keyring` package, and typing them into a prompt through
+user32), and everything still owned by later phases of the port plan
+raises PlatformError naming that plan, so nothing degrades silently.
 
 `PLATFORM` is chosen once from sys.platform; the rest of the code imports it
 and never asks "which OS?" again. The output parsers are module-level pure
@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -84,6 +85,36 @@ def parse_arp_windows(text: str, host: str) -> str:
             if re.fullmatch(r"([0-9a-f]{2}:){5}[0-9a-f]{2}", mac):
                 return mac
     return ""
+
+
+# xdotool keysyms -> Windows virtual-key codes, for inject.steps' key:<keysym>.
+_VK_NAMED = {"Return": 0x0D, "KP_Enter": 0x0D, "Tab": 0x09, "Escape": 0x1B,
+             "BackSpace": 0x08, "space": 0x20, "Delete": 0x2E, "Insert": 0x2D,
+             "Home": 0x24, "End": 0x23, "Prior": 0x21, "Next": 0x22,
+             "Left": 0x25, "Up": 0x26, "Right": 0x27, "Down": 0x28,
+             **{f"F{n}": 0x6F + n for n in range(1, 13)}}
+_VK_MODIFIERS = {"ctrl": 0x11, "control": 0x11, "shift": 0x10, "alt": 0x12,
+                 "super": 0x5B}
+# Without the extended flag Windows reads these as their numpad twins.
+_VK_EXTENDED = {0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28}
+
+
+def keysym_chord_to_vks(chord: str) -> list[tuple[int, bool]]:
+    """An xdotool chord ("ctrl+a", "Return") -> [(virtual key, extended)].
+
+    Modifiers come first, in the order written. A keysym with no Windows key
+    raises ValueError naming it, rather than pressing something else.
+    """
+    keys: list[tuple[int, bool]] = []
+    for part in chord.split("+"):
+        name = part.strip()
+        vk = _VK_MODIFIERS.get(name.lower()) or _VK_NAMED.get(name)
+        if vk is None and len(name) == 1 and name.isascii() and name.isalnum():
+            vk = ord(name.upper())
+        if vk is None:
+            raise ValueError(f"no Windows key for keysym {name!r} in {chord!r}")
+        keys.append((vk, vk in _VK_EXTENDED))
+    return keys
 
 
 # --------------------------------------------------------------------------- #
@@ -206,6 +237,149 @@ class LinuxX11:
 # --------------------------------------------------------------------------- #
 # Windows — the port's landing strip
 # --------------------------------------------------------------------------- #
+class _Win32:
+    """The user32 calls credential typing needs, bound on first use so this
+    module still imports where there is no ctypes.windll."""
+
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_EXTENDEDKEY = 0x1
+    KEYEVENTF_KEYUP = 0x2
+    KEYEVENTF_UNICODE = 0x4
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes as wt
+        self.ctypes, self.wt = ctypes, wt
+        u = self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        k = self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD),
+                        ("dwFlags", wt.DWORD), ("time", wt.DWORD),
+                        ("dwExtraInfo", ctypes.c_size_t)]
+
+        class MOUSEINPUT(ctypes.Structure):   # never sent; sizes the union
+            _fields_ = [("dx", wt.LONG), ("dy", wt.LONG),
+                        ("mouseData", wt.DWORD), ("dwFlags", wt.DWORD),
+                        ("time", wt.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+        class _EVENT(ctypes.Union):
+            _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT)]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [("type", wt.DWORD), ("event", _EVENT)]
+
+        self.INPUT, self.KEYBDINPUT = INPUT, KEYBDINPUT
+        self.ENUM_PROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        u.EnumWindows.argtypes = [self.ENUM_PROC, wt.LPARAM]
+        u.GetForegroundWindow.restype = wt.HWND
+        u.GetWindowTextLengthW.argtypes = [wt.HWND]
+        u.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+        u.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+        u.IsWindowVisible.argtypes = [wt.HWND]
+        u.IsIconic.argtypes = [wt.HWND]
+        u.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+        u.BringWindowToTop.argtypes = [wt.HWND]
+        u.SetForegroundWindow.argtypes = [wt.HWND]
+        u.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+        u.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+        u.GetWindowThreadProcessId.restype = wt.DWORD
+        u.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+        u.SendInput.argtypes = [wt.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+        u.SendInput.restype = wt.UINT
+        k.GetCurrentThreadId.restype = wt.DWORD
+        k.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        k.OpenProcess.restype = wt.HANDLE
+        k.QueryFullProcessImageNameW.argtypes = [
+            wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+        k.CloseHandle.argtypes = [wt.HANDLE]
+
+    def top_level_windows(self) -> list[int]:
+        found: list[int] = []
+        callback = self.ENUM_PROC(lambda hwnd, _: found.append(hwnd or 0) or True)
+        self.user32.EnumWindows(callback, 0)
+        return [h for h in found if h]
+
+    def visible(self, hwnd: int) -> bool:
+        return bool(self.user32.IsWindowVisible(hwnd))
+
+    def title(self, hwnd: int) -> str:
+        size = self.user32.GetWindowTextLengthW(hwnd) + 1
+        buf = self.ctypes.create_unicode_buffer(size)
+        self.user32.GetWindowTextW(hwnd, buf, size)
+        return buf.value
+
+    def class_name(self, hwnd: int) -> str:
+        buf = self.ctypes.create_unicode_buffer(256)
+        self.user32.GetClassNameW(hwnd, buf, 256)
+        return buf.value
+
+    def program(self, hwnd: int) -> str:
+        """Image name of the process that owns the window, e.g. Radmin.exe."""
+        pid = self.wt.DWORD()
+        self.user32.GetWindowThreadProcessId(hwnd, self.ctypes.byref(pid))
+        handle = self.kernel32.OpenProcess(0x1000, False, pid.value)  # query-limited
+        if not handle:
+            return ""
+        try:
+            size = self.wt.DWORD(1024)
+            buf = self.ctypes.create_unicode_buffer(size.value)
+            if self.kernel32.QueryFullProcessImageNameW(handle, 0, buf,
+                                                        self.ctypes.byref(size)):
+                return os.path.basename(buf.value)
+            return ""
+        finally:
+            self.kernel32.CloseHandle(handle)
+
+    def rect(self, hwnd: int) -> tuple[int, int, int, int]:
+        r = self.wt.RECT()
+        self.user32.GetWindowRect(hwnd, self.ctypes.byref(r))
+        return r.left, r.top, r.right, r.bottom
+
+    def foreground(self) -> int:
+        return self.user32.GetForegroundWindow() or 0
+
+    def activate(self, hwnd: int, timeout: float = 2.0) -> bool:
+        """Bring hwnd to the front; True once Windows reports it there.
+
+        Only the foreground thread may hand focus on, so the switch borrows
+        that thread's input queue for its duration (AttachThreadInput).
+        """
+        u, k = self.user32, self.kernel32
+        if u.IsIconic(hwnd):
+            u.ShowWindow(hwnd, 9)   # SW_RESTORE
+        deadline = time.time() + timeout
+        while self.foreground() != hwnd:
+            if time.time() > deadline:
+                return False
+            front = self.foreground()
+            theirs = u.GetWindowThreadProcessId(front, None) if front else 0
+            mine = k.GetCurrentThreadId()
+            attached = bool(theirs and theirs != mine
+                            and u.AttachThreadInput(mine, theirs, True))
+            try:
+                u.BringWindowToTop(hwnd)
+                u.SetForegroundWindow(hwnd)
+            finally:
+                if attached:
+                    u.AttachThreadInput(mine, theirs, False)
+            time.sleep(0.05)
+        return True
+
+    def send_keys(self, events: list[tuple[int, int, int]]) -> None:
+        """(virtual key, scan or UTF-16 unit, flags) events through SendInput."""
+        batch = (self.INPUT * len(events))()
+        for slot, (vk, scan, flags) in zip(batch, events):
+            slot.type = self.INPUT_KEYBOARD
+            slot.event.ki = self.KEYBDINPUT(vk, scan, flags, 0, 0)
+        sent = self.user32.SendInput(len(events), batch,
+                                     self.ctypes.sizeof(self.INPUT))
+        if sent != len(events):
+            raise RuntimeError("Windows refused the keystrokes (a prompt running "
+                               "as administrator only takes input from an "
+                               "elevated program)")
+
+
 class WindowsNative:
     name = "windows"
     window_control = False
@@ -240,14 +414,89 @@ class WindowsNative:
         return parse_pipe_processes(out)
 
     # ---- windows ---------------------------------------------------------- #
+    _w32: _Win32 | None = None
+    _typing_target = 0     # the window `windowactivate` last brought forward
+
     def xdotool(self, *args: str) -> str:
-        raise PlatformError(f"window control is {self._TRAY_AGENT}")
+        """The xdotool subcommands credential typing and calibrate use, done
+        with user32 so rcm keeps one code path for both systems.
+
+        X11's WM_CLASS names the program, while a Windows window class names
+        the widget (#32770 is every dialog), so `search --class` also matches
+        the owning program's image name: [Rr]admin finds Radmin.exe's prompt
+        as it did under Wine. `type` and `key` go to the window
+        `windowactivate` last brought forward and stop once it is no longer
+        in front -- xdotool would type on into whatever took focus, and here
+        that can be a password. Moving windows stays with the tray agent.
+        """
+        if self._w32 is None:
+            self._w32 = _Win32()
+        w32 = self._w32
+        cmd, rest = args[0], list(args[1:])
+        if cmd == "search":
+            # xdotool compiles its patterns case-insensitively too.
+            pattern = re.compile(rest[-1], re.IGNORECASE)
+            by_class = "--class" in rest
+            hits = []
+            for hwnd in w32.top_level_windows():
+                if "--onlyvisible" in rest and not w32.visible(hwnd):
+                    continue
+                names = ((w32.class_name(hwnd), w32.program(hwnd)) if by_class
+                         else (w32.title(hwnd),))
+                if any(pattern.search(n) for n in names):
+                    hits.append(str(hwnd))
+            return "\n".join(hits)
+        if cmd == "getwindowname":
+            return w32.title(int(rest[-1]))
+        if cmd == "getwindowfocus":
+            return str(w32.foreground())
+        if cmd == "getwindowgeometry":
+            left, top, right, bottom = w32.rect(int(rest[-1]))
+            return (f"WINDOW={rest[-1]}\nX={left}\nY={top}\n"
+                    f"WIDTH={right - left}\nHEIGHT={bottom - top}")
+        if cmd == "windowactivate":
+            hwnd = int(rest[-1])
+            if not w32.activate(hwnd):
+                raise RuntimeError(f"could not bring {w32.title(hwnd)!r} to the "
+                                   "front; typed nothing")
+            self._typing_target = hwnd
+            return ""
+        if cmd == "type":
+            delay = int(rest[rest.index("--delay") + 1]) if "--delay" in rest else 12
+            text = rest[rest.index("--") + 1] if "--" in rest else rest[-1]
+            units = text.encode("utf-16-le")
+            for i in range(0, len(units), 2):
+                self._ensure_target_in_front(w32)
+                unit = int.from_bytes(units[i:i + 2], "little")
+                w32.send_keys([(0, unit, w32.KEYEVENTF_UNICODE),
+                               (0, unit, w32.KEYEVENTF_UNICODE | w32.KEYEVENTF_KEYUP)])
+                time.sleep(delay / 1000)
+            return ""
+        if cmd == "key":
+            for chord in rest:
+                try:
+                    keys = keysym_chord_to_vks(chord)
+                except ValueError as e:
+                    raise RuntimeError(str(e)) from None
+                self._ensure_target_in_front(w32)
+                down = [(vk, 0, w32.KEYEVENTF_EXTENDEDKEY if ext else 0)
+                        for vk, ext in keys]
+                up = [(vk, 0, flags | w32.KEYEVENTF_KEYUP)
+                      for vk, _, flags in reversed(down)]
+                w32.send_keys(down + up)
+            return ""
+        raise PlatformError(f"window control ({cmd}) is {self._TRAY_AGENT}")
+
+    def _ensure_target_in_front(self, w32: _Win32) -> None:
+        if not self._typing_target or w32.foreground() != self._typing_target:
+            raise RuntimeError("the prompt is no longer in front -- stopped "
+                               "typing so nothing lands in another window")
 
     def screenshot_to(self, dest: Path) -> bool:
         return False
 
     def credential_typing_problem(self) -> str:
-        return f"credential typing is {self._TRAY_AGENT}"
+        return ""
 
     # ---- network / displays ----------------------------------------------- #
     def mac_for_host(self, host: str) -> str:

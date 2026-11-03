@@ -18,7 +18,8 @@
 #   detect.window    window-title pattern used to find that session's window
 #
 # Credential typing (optional; omit the whole block if the client handles auth)
-#   inject.window_class  X11 class of the credential dialog
+#   inject.window_class  X11 class of the credential dialog; on Windows its window
+#                        class or the program that owns it (Radmin.exe)
 #   inject.window_title  substring of its title
 #   inject.wait          seconds to wait for it to appear
 #   inject.settle        pause after focusing it, before typing
