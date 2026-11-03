@@ -2585,8 +2585,8 @@ class Win(Gtk.Window):
                         .strip('"')).name
         note = Gtk.Label(xalign=0)
         note.set_markup(GLib.markup_escape_text(
-            f"{archiver} on each PC · into {settings.dest} · kept "
-            f"{settings.keep_days} days · folders and skip from backups.conf"))
+            f"{archiver} on each PC · into its [dest] folder, one per day · "
+            f"kept {settings.keep_days} days · Setup ▸ Backups to change"))
         note.get_style_context().add_class("dim-label")
         note.set_line_wrap(True)
         box.add(note)
@@ -2975,9 +2975,9 @@ class Win(Gtk.Window):
     def on_setup(self) -> None:
         """Everything that used to hide in the menu lives on the Setup page.
 
-        Five cards — Protocols, Credentials, Keyboard shortcuts,
-        Import/Export, Workspaces — each fronting the same plain files you
-        can edit by hand. Warnings from the health check appear as a banner
+        Six cards — Protocols, Credentials, Keyboard shortcuts,
+        Import/Export, Workspaces, Backups — each fronting the same plain
+        files you can edit by hand. Warnings from the health check appear as a banner
         with a one-click action, and the badge on the Setup entry counts
         them.
         """
@@ -3112,6 +3112,21 @@ class Win(Gtk.Window):
              "workspaces.conf — named sets opened together, with per-member "
              "protocol and monitor and a shortcut per set",
              [("Edit…", self.on_workspaces)], summary_markup=space_line)
+
+        try:
+            backups = rcm.load_backup_settings()
+            covered = [c for c in rcm.conns_cached()
+                       if rcm.backup_folders(c.sel, backups)]
+            backup_line = (f"{len(covered)} PC(s) with folders · "
+                           f"{len(backups.dest)} destination(s) · "
+                           f"{len(backups.skip)} skip rule(s)")
+        except rcm.ConfigError as problem:
+            backup_line = f"⚠ {problem}"
+        card(1, 2, "Backups",
+             "backups.conf — per project: where archives go, the folders on "
+             "each PC, the skip regex; with a preview against a PC",
+             [("Edit…", self.on_backups)],
+             summary_markup=GLib.markup_escape_text(backup_line))
 
         foot = Gtk.Label(xalign=0)
         foot.set_markup(f"<small>all of it plain files in "
@@ -3363,6 +3378,318 @@ class Win(Gtk.Window):
         self.install_shortcuts()
         self.refresh_sidebar()
         self.say(f"{len(spaces)} workspace(s) saved to workspaces.conf")
+
+    def on_backups(self) -> None:
+        """Setup ▸ Backups edits backups.conf: where each project's archives
+        go, what each PC keeps, and what the skip regex leaves out.
+
+        Each row is a scope — DEFAULT, a group (a project), or one connection
+        — and each column is looked up on its own, most specific row first,
+        like credentials: a blank cell inherits from the broader rows. In
+        Folders and Skip a single "-" means "none here" and stops inheriting
+        (a PLC inside a group that backs up C:\\PRODUCTION, say). A regex
+        that does not compile marks its row and holds Save. Under Check, pick
+        a connection to see what its chain resolves to and which row said
+        so; Preview lists that PC's folders over C$ with the regex as edited
+        — what would be left out, largest first, and the largest files kept
+        — and archives nothing. Archiver, retention, scratch folder and
+        timeout sit under Advanced. Save rewrites backups.conf, comments
+        included.
+        """
+        try:
+            current = rcm.load_backup_settings()
+        except rcm.ConfigError as problem:
+            self._dialog(Gtk.MessageType.ERROR, "backups.conf has a problem",
+                         str(problem))
+            return
+        d = Gtk.Dialog(title="Backups", transient_for=self, modal=True)
+        d.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+                      Gtk.STOCK_SAVE, Gtk.ResponseType.OK)
+        d.set_default_size(900, 660)
+        box = d.get_content_area()
+        box.set_border_width(10)
+        box.set_spacing(6)
+
+        intro = Gtk.Label(xalign=0)
+        intro.set_markup(
+            "<small>Most specific row wins, per column. Blank inherits; "
+            "<b>-</b> in Folders or Skip means none here. Skip is a regex on "
+            "each file's full path on the PC (C:\\PRODUCTION\\Logs\\a.dmp), "
+            "case ignored; a folder it matches, tested with a trailing \\, "
+            "is left out whole.</small>")
+        intro.set_line_wrap(True)
+        intro.get_style_context().add_class("dim-label")
+        box.pack_start(intro, False, False, 0)
+
+        # scope, destination, folders, skip, problem
+        store = Gtk.ListStore(str, str, str, str, str)
+        scopes = list(dict.fromkeys(
+            ["DEFAULT"] + list(current.dest) + list(current.folders)
+            + list(current.skip)))
+
+        def cell_value(table, scope):
+            if scope not in table:
+                return ""
+            return table[scope] or "-"
+
+        for scope in scopes:
+            store.append([scope, current.dest.get(scope, ""),
+                          cell_value(current.folders, scope),
+                          cell_value(current.skip, scope), ""])
+
+        def problem_of(row) -> str:
+            folders, skip = row[2].strip(), row[3].strip()
+            if skip and skip != "-":
+                try:
+                    re.compile(skip)
+                except re.error as e:
+                    return f"regex: {e}"
+            if folders and folders != "-":
+                for folder in folders.split(";"):
+                    if folder.strip() and not re.match(
+                            r"^[A-Za-z]:\\", folder.strip().rstrip("\\") + "\\"):
+                        return f"not a full path: {folder.strip()}"
+            return ""
+
+        view = Gtk.TreeView(model=store)
+        view.append_column(Gtk.TreeViewColumn("Scope", Gtk.CellRendererText(),
+                                              text=0))
+        for index, title, tip in (
+                (1, "Destination", "folder on this computer; a day folder "
+                                   "is made inside"),
+                (2, "Folders", "on the PC, ; between several — - for none"),
+                (3, "Skip regex", "paths to leave out — - for none")):
+            renderer = Gtk.CellRendererText(editable=True,
+                                            ellipsize=Pango.EllipsizeMode.END)
+
+            def on_edited(_r, path, text, column=index):
+                store[path][column] = text.strip()
+                store[path][4] = problem_of(store[path])
+                refresh_check()
+            renderer.connect("edited", on_edited)
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_resizable(True)
+            column.set_expand(True)
+            header = Gtk.Label(label=title)
+            header.set_tooltip_text(tip)
+            header.show()
+            column.set_widget(header)
+            view.append_column(column)
+        problem_renderer = Gtk.CellRendererText(foreground="#c04040")
+        view.append_column(Gtk.TreeViewColumn("", problem_renderer, text=4))
+        scroller = Gtk.ScrolledWindow()
+        scroller.set_shadow_type(Gtk.ShadowType.IN)
+        scroller.set_min_content_height(150)
+        scroller.add(view)
+        box.pack_start(scroller, True, True, 0)
+
+        add_row = Gtk.Box(spacing=6)
+        add_combo = Gtk.ComboBoxText()
+        add_row.pack_start(add_combo, True, True, 0)
+        add_btn = Gtk.Button(label="Add scope")
+        remove_btn = Gtk.Button(label="Remove")
+        add_row.pack_start(add_btn, False, False, 0)
+        add_row.pack_start(remove_btn, False, False, 0)
+        box.pack_start(add_row, False, False, 0)
+
+        def refresh_add_choices():
+            add_combo.remove_all()
+            present = {row[0] for row in store}
+            for scope in ["DEFAULT"] + rcm.groups() + [c.sel for c in rcm.conns_cached()]:
+                if scope not in present:
+                    add_combo.append_text(scope)
+            add_combo.set_active(0)
+
+        def on_add(_b):
+            scope = add_combo.get_active_text()
+            if scope:
+                store.append([scope, "", "", "", ""])
+                refresh_add_choices()
+                refresh_check()
+        add_btn.connect("clicked", on_add)
+
+        def on_remove(_b):
+            model, it = view.get_selection().get_selected()
+            if it:
+                model.remove(it)
+                refresh_add_choices()
+                refresh_check()
+        remove_btn.connect("clicked", on_remove)
+
+        advanced = Gtk.Expander(label="Advanced — archiver, retention, scratch "
+                                      "folder, timeout")
+        grid = Gtk.Grid(column_spacing=8, row_spacing=4, margin_top=4)
+        keep_spin = Gtk.SpinButton.new_with_range(0, 3650, 1)
+        keep_spin.set_value(current.keep_days)
+        archiver_entry = Gtk.Entry(text=current.archiver, hexpand=True)
+        extension_entry = Gtk.Entry(text=current.extension, width_chars=6)
+        temp_entry = Gtk.Entry(text=current.remote_temp)
+        timeout_spin = Gtk.SpinButton.new_with_range(1, 1440, 5)
+        timeout_spin.set_value(current.timeout_minutes)
+        for row_index, (label, widget) in enumerate((
+                ("Keep day folders (days, 0 = forever)", keep_spin),
+                ("Archiver on each PC ({archive} {list})", archiver_entry),
+                ("Archive extension", extension_entry),
+                ("Scratch folder on each PC", temp_entry),
+                ("Give up after (minutes)", timeout_spin))):
+            grid.attach(Gtk.Label(label=label, xalign=0), 0, row_index, 1, 1)
+            grid.attach(widget, 1, row_index, 1, 1)
+        advanced.add(grid)
+        box.pack_start(advanced, False, False, 0)
+
+        check_frame = Gtk.Frame(label=" Check and preview ")
+        check_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        check_box.set_border_width(8)
+        check_frame.add(check_box)
+        pick_row = Gtk.Box(spacing=6)
+        check_combo = Gtk.ComboBoxText()
+        for c in rcm.conns_cached():
+            check_combo.append_text(c.sel)
+        pick_row.pack_start(check_combo, True, True, 0)
+        preview_btn = Gtk.Button(label="Preview")
+        preview_btn.set_tooltip_text("list the PC's folders over C$ with the "
+                                     "regex as edited — archives nothing")
+        pick_row.pack_start(preview_btn, False, False, 0)
+        check_box.pack_start(pick_row, False, False, 0)
+        resolved = Gtk.Label(xalign=0, selectable=True)
+        resolved.set_line_wrap(True)
+        check_box.pack_start(resolved, False, False, 0)
+        summary = Gtk.Label(xalign=0)
+        summary.set_line_wrap(True)
+        check_box.pack_start(summary, False, False, 0)
+        found = Gtk.ListStore(str, str, str)    # what, size, path
+        found_view = Gtk.TreeView(model=found)
+        for index, title in enumerate(("", "Size", "Path")):
+            cell = Gtk.CellRendererText(xalign=1.0 if index == 1 else 0.0)
+            found_view.append_column(Gtk.TreeViewColumn(title, cell, text=index))
+        found_scroller = Gtk.ScrolledWindow()
+        found_scroller.set_shadow_type(Gtk.ShadowType.IN)
+        found_scroller.set_min_content_height(170)
+        found_scroller.add(found_view)
+        check_box.pack_start(found_scroller, True, True, 0)
+        box.pack_start(check_frame, True, True, 0)
+
+        status = Gtk.Label(xalign=0)
+        box.pack_start(status, False, False, 0)
+
+        def edited_settings() -> tuple[object, list[str]]:
+            """The settings as the dialog shows them, and what is wrong."""
+            tables: dict[str, dict[str, str]] = {"dest": {}, "folders": {},
+                                                 "skip": {}}
+            problems = []
+            for row in store:
+                if row[4]:
+                    problems.append(f"{row[0]}: {row[4]}")
+                if row[1].strip():
+                    tables["dest"][row[0]] = row[1].strip()
+                for index, name in ((2, "folders"), (3, "skip")):
+                    value = row[index].strip()
+                    if value:
+                        tables[name][row[0]] = "" if value == "-" else value
+            archiver = archiver_entry.get_text().strip()
+            for placeholder in ("{archive}", "{list}"):
+                if placeholder not in archiver:
+                    problems.append(f"archiver has no {placeholder}")
+            if not extension_entry.get_text().strip(" ."):
+                problems.append("archive extension is empty")
+            if not re.match(r"^[A-Za-z]:\\", temp_entry.get_text().strip() + "\\"):
+                problems.append("scratch folder is not a full path on the PC")
+            if "DEFAULT" not in tables["dest"]:
+                problems.append("DEFAULT needs a destination")
+            settings = rcm.BackupSettings(
+                keep_days=keep_spin.get_value_as_int(), archiver=archiver,
+                extension=extension_entry.get_text().strip(" ."),
+                remote_temp=temp_entry.get_text().strip().rstrip("\\"),
+                timeout_minutes=timeout_spin.get_value(), **tables)
+            return settings, problems
+
+        def source_of(table, sel):
+            for scope in rcm.creds_chain(sel):
+                if scope in table:
+                    return scope, table[scope]
+            return "", None
+
+        def refresh_check(*_):
+            sel = check_combo.get_active_text()
+            settings, problems = edited_settings()
+            status.set_markup('<span foreground="#c04040">{}</span>'.format(
+                GLib.markup_escape_text("  ·  ".join(problems))) if problems else
+                "<small>Save writes backups.conf; nothing runs until you "
+                "back up.</small>")
+            if not sel:
+                resolved.set_text("")
+                return
+            lines = []
+            for label, table, shown in (
+                    ("into", settings.dest, lambda v: f"{v}\\<YYYYMMDD>"),
+                    ("folders", settings.folders, lambda v: v or "none"),
+                    ("skip", settings.skip, lambda v: v or "nothing")):
+                scope, value = source_of(table, sel)
+                lines.append(f"<b>{label}</b> "
+                             + (f"{GLib.markup_escape_text(shown(value))}  "
+                                f"<small>(from {GLib.markup_escape_text(scope)})"
+                                f"</small>" if scope else "<i>not set</i>"))
+            resolved.set_markup("   ".join(lines))
+
+        check_combo.connect("changed", refresh_check)
+
+        def on_preview(_b):
+            sel = check_combo.get_active_text()
+            c = rcm.find(sel) if sel else None
+            if not c:
+                return
+            settings, problems = edited_settings()
+            if problems:
+                summary.set_text("fix the marked problems first")
+                return
+            preview_btn.set_sensitive(False)
+            found.clear()
+            summary.set_text(f"listing {c.host}…")
+
+            def show(result):
+                preview_btn.set_sensitive(True)
+                summary.set_markup(GLib.markup_escape_text(result.message))
+                for size, path in result.skipped_largest:
+                    found.append(["left out", rcm.human_size(size), path])
+                for size, path in result.largest:
+                    found.append(["kept", rcm.human_size(size), path])
+
+            def work():
+                try:
+                    result = rcm.backup_one(
+                        c, settings, time.strftime(rcm.BACKUP_STAMP),
+                        dry_run=True,
+                        progress=lambda t: GLib.idle_add(summary.set_text, t))
+                except rcm.ConfigError as problem:
+                    result = rcm.BackupResult(c.sel, False, str(problem))
+                GLib.idle_add(show, result)
+            threading.Thread(target=work, daemon=True).start()
+        preview_btn.connect("clicked", on_preview)
+
+        for widget in (archiver_entry, extension_entry, temp_entry):
+            widget.connect("changed", refresh_check)
+        configured = [c.sel for c in rcm.conns_cached()
+                      if source_of(current.folders, c.sel)[1]]
+        if configured:
+            check_combo.set_active(
+                [c.sel for c in rcm.conns_cached()].index(configured[0]))
+        refresh_add_choices()
+        for row in store:
+            row[4] = problem_of(row)
+        d.show_all()
+        refresh_check()
+        while True:
+            response = d.run()
+            if response != Gtk.ResponseType.OK:
+                d.destroy()
+                return
+            settings, problems = edited_settings()
+            if not problems:
+                break
+            refresh_check()
+        d.destroy()
+        rcm.save_backup_settings(settings)
+        self.say("backups.conf saved")
 
     @help_topic_gui("help-window", "The Help window (F1)",
                     ("help", "f1", "guide", "open code"), section="Help")

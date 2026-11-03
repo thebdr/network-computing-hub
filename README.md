@@ -302,22 +302,34 @@ here. Per PC:
 2. the folders are listed and filtered here, and the exact file list is left in a
    run folder on the PC;
 3. WMI starts the PC's archiver on that list at below-normal priority;
-4. the archive lands in `<dest>\<YYYYMMDD_HHMM>\<Group_Name>_<stamp>.rar` with the
-   archiver's log beside it, and the run folder on the PC is removed.
+4. the archive lands in `<dest>\<YYYYMMDD>\<Group_Name>_<YYYYMMDD_HHMM>.rar` — one
+   folder per day, the time in the name, `_2` for a second run in the same minute —
+   with the archiver's log beside it, and the run folder on the PC is removed.
 
-Run folders under `dest` older than `keep_days` are deleted afterwards — only
-stamp-named folders, and only the archives and logs in them.
+Day folders older than `keep_days` are deleted afterwards, under every destination —
+only folders named like a day, and only the archives and logs in them.
+
+**Setup ▸ Backups** edits all of it: one row per scope (DEFAULT, a project's group,
+or one PC) with its destination, folders and skip regex, each column inherited from
+broader rows when blank; `-` in Folders or Skip means none here. A regex that does not
+compile marks its row and holds Save. **Preview** picks a PC and lists its folders
+over `C$` with the regex as edited — what is left out, largest first, skipped folders
+as one line with their total, and the largest files kept — without archiving anything.
 
 ```ini
 [backup]
-dest = C:\Backup_ALL
 keep_days = 30
 archiver = "C:\Program Files\WinRAR\rar.exe" a -ma5 -m5 -s -mt2 -dh -ep2 -scfl -idp -y {archive} @{list}
 extension = rar
 
+[dest]                           ; per scope: a project's archives go to its folder
+DEFAULT = C:\Backup_ALL
+FVT_LaPoste = D:\Projects\FVT_LaPoste\Backup
+
 [folders]                        ; most specific scope wins, like creds.conf
 FVT_LaPoste/TRIB/bSorter = C:\PRODUCTION
 Plant = C:\PRODUCTION; D:\Recipes
+Plant/PLC1 =                     ; nothing here, despite Plant
 
 [skip]                           ; regex on each file's full path on the PC
 DEFAULT = \.dmp$|\\CrashDumps?\\
@@ -325,10 +337,9 @@ DEFAULT = \.dmp$|\\CrashDumps?\\
 
 `skip` matches, ignoring case, against paths like `C:\PRODUCTION\Logs\a.dmp`; a
 folder that matches (tested with a trailing `\`) is left out whole, so hundreds of MB
-of crash dumps are never even read. **Dry run** lists what would go in and the ten
-largest files — the quickest way to write the regex. An archiver exit other than 0
-that still produced an archive (files held open by a running program, typically)
-keeps it and says so; the log names the files.
+of crash dumps are never even read. `rcm backup --dry-run` prints the same as Preview.
+An archiver exit other than 0 that still produced an archive (files held open by a
+running program, typically) keeps it and says so; the log names the files.
 
 The archiver must be the PC's own: plant PCs often run application whitelisting, and
 there a copied `7z.exe` or a `.cmd` started through WMI is refused even for a full
@@ -338,7 +349,7 @@ PCs, `backups.conf` has its line ready. The PCs must answer on 445 (SMB) and all
 
 On Windows, schedule it with MSYS2's Python, which has the keyring:
 `C:\msys64\ucrt64\bin\python.exe <repo>\bin\rcm backup FVT_LaPoste`. The exit code
-is 1 when any PC failed.
+is 1 when any PC failed; PCs with no folders configured are skipped, not failed.
 
 ## The manager
 
