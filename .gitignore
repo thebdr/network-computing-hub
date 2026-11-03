@@ -9,6 +9,7 @@ launchers.conf
 shortcuts.conf
 ui.conf
 workspaces.conf
+backups.conf
 
 # Generated output
 export/

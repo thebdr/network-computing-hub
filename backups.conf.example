@@ -1,0 +1,52 @@
+# Backups: folders on remote Windows PCs, archived ON each PC, fetched here.
+#
+# `rcm backup <connection or group>...`, or right-click > Back up..., does per PC:
+#   1. opens its admin shares (C$, D$...) with the credential chain, trying
+#      `<scope>@backup` entries before the usual ones (see creds.conf)
+#   2. lists the folders below, dropping every path `skip` matches, and leaves
+#      the list in a run folder under remote_temp there
+#   3. starts the PC's own archiver through WMI at below-normal priority and
+#      waits for it
+#   4. fetches the archive to <dest>\<YYYYMMDD_HHMM>\<Group_Name>_<stamp>.<ext>
+#      with the archiver's log beside it, then removes the run folder
+# Afterwards, run folders under dest older than keep_days are deleted.
+#
+# The PCs must answer on 445 (SMB) and allow WMI (135 + the dynamic RPC
+# ports), and the account must be an administrator there.
+
+[backup]
+# Where archives land on this computer.
+dest = ~/Backups
+# Run folders under dest older than this many days are deleted (0 keeps all).
+keep_days = 30
+# The archiver, run ON each PC from its own installation: plant PCs commonly
+# let only approved, installed programs run, so nothing copied over could.
+# {archive} is the file to write, {list} a UTF-8 file naming the files to
+# take, one full path per line. Exit 0 is success; any other exit that still
+# left an archive is kept and reported with the log.
+#
+# WinRAR: RAR5 (-ma5), best compression (-m5), solid (-s), 2 threads, files
+# held open by other programs read too (-dh), stored without the drive (-ep2).
+archiver = "C:\Program Files\WinRAR\rar.exe" a -ma5 -m5 -s -mt2 -dh -ep2 -scfl -idp -y {archive} @{list}
+extension = rar
+# 7-Zip, on PCs that have it installed (-mx9 squeezes a little more than -mx7
+# for about twice the memory, on a PC busy running production):
+#   archiver = "C:\Program Files\7-Zip\7z.exe" a -t7z -mx7 -mmt2 -ssw -spf2 -scsUTF-8 {archive} @{list}
+#   extension = 7z
+# Scratch space ON each PC: a run folder is made inside and removed after.
+remote_temp = C:\Windows\Temp
+# Stop waiting for one PC's archive after this many minutes.
+timeout_minutes = 60
+
+[folders]
+# What to back up, per scope, most specific first exactly like creds.conf:
+# Group/Name, then each group above it, then DEFAULT. Separate several
+# folders with ; -- an empty value means "nothing here" and ends the walk.
+#   FVT_LaPoste/TRIB/bSorter = C:\PRODUCTION
+#   Plant = C:\PRODUCTION; D:\Recipes
+
+[skip]
+# Regex of paths to leave out, per scope like [folders]. Matched, ignoring
+# case, against each file's full path on the PC (C:\PRODUCTION\Logs\a.dmp);
+# a folder that matches (tested with a trailing \) is skipped whole.
+#   DEFAULT = \.dmp$|\\CrashDumps?\\

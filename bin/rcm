@@ -52,6 +52,7 @@ LEGACY_LAUNCHERS = APP / "protocols.conf"
 SHORTCUTS = APP / "shortcuts.conf"
 UI_CONF = APP / "ui.conf"
 WORKSPACES_CONF = APP / "workspaces.conf"
+BACKUPS_CONF = APP / "backups.conf"
 LOGS_DIR = APP / "logs"
 
 # Window layouts a user can switch between. Browse absorbed the three flat
@@ -990,6 +991,59 @@ DEFAULT||
 #
 # Edit here, or in the manager: Setup > Workspaces (right-click a selection
 # > "Save as workspace..." starts one from whatever is highlighted).
+""",
+    "backups.conf": r"""# Backups: folders on remote Windows PCs, archived ON each PC, fetched here.
+#
+# `rcm backup <connection or group>...`, or right-click > Back up..., does per PC:
+#   1. opens its admin shares (C$, D$...) with the credential chain, trying
+#      `<scope>@backup` entries before the usual ones (see creds.conf)
+#   2. lists the folders below, dropping every path `skip` matches, and leaves
+#      the list in a run folder under remote_temp there
+#   3. starts the PC's own archiver through WMI at below-normal priority and
+#      waits for it
+#   4. fetches the archive to <dest>\<YYYYMMDD_HHMM>\<Group_Name>_<stamp>.<ext>
+#      with the archiver's log beside it, then removes the run folder
+# Afterwards, run folders under dest older than keep_days are deleted.
+#
+# The PCs must answer on 445 (SMB) and allow WMI (135 + the dynamic RPC
+# ports), and the account must be an administrator there.
+
+[backup]
+# Where archives land on this computer.
+dest = ~/Backups
+# Run folders under dest older than this many days are deleted (0 keeps all).
+keep_days = 30
+# The archiver, run ON each PC from its own installation: plant PCs commonly
+# let only approved, installed programs run, so nothing copied over could.
+# {archive} is the file to write, {list} a UTF-8 file naming the files to
+# take, one full path per line. Exit 0 is success; any other exit that still
+# left an archive is kept and reported with the log.
+#
+# WinRAR: RAR5 (-ma5), best compression (-m5), solid (-s), 2 threads, files
+# held open by other programs read too (-dh), stored without the drive (-ep2).
+archiver = "C:\Program Files\WinRAR\rar.exe" a -ma5 -m5 -s -mt2 -dh -ep2 -scfl -idp -y {archive} @{list}
+extension = rar
+# 7-Zip, on PCs that have it installed (-mx9 squeezes a little more than -mx7
+# for about twice the memory, on a PC busy running production):
+#   archiver = "C:\Program Files\7-Zip\7z.exe" a -t7z -mx7 -mmt2 -ssw -spf2 -scsUTF-8 {archive} @{list}
+#   extension = 7z
+# Scratch space ON each PC: a run folder is made inside and removed after.
+remote_temp = C:\Windows\Temp
+# Stop waiting for one PC's archive after this many minutes.
+timeout_minutes = 60
+
+[folders]
+# What to back up, per scope, most specific first exactly like creds.conf:
+# Group/Name, then each group above it, then DEFAULT. Separate several
+# folders with ; -- an empty value means "nothing here" and ends the walk.
+#   FVT_LaPoste/TRIB/bSorter = C:\PRODUCTION
+#   Plant = C:\PRODUCTION; D:\Recipes
+
+[skip]
+# Regex of paths to leave out, per scope like [folders]. Matched, ignoring
+# case, against each file's full path on the PC (C:\PRODUCTION\Logs\a.dmp);
+# a folder that matches (tested with a trailing \) is skipped whole.
+#   DEFAULT = \.dmp$|\\CrashDumps?\\
 """,
     "ui.conf": """\
 # Manager window state. The GUI writes this; editing it by hand is equally fine.
@@ -2012,6 +2066,337 @@ def place_workspace_members(pending: list[tuple[str, str]], lines: list[str],
 
 
 # --------------------------------------------------------------------------- #
+# backups: folders on remote PCs, archived there, fetched here
+# --------------------------------------------------------------------------- #
+BACKUP_STAMP = "%Y%m%d_%H%M"
+
+
+@dataclass
+class BackupSettings:
+    dest: Path
+    keep_days: int
+    archiver: str
+    extension: str
+    remote_temp: str
+    timeout_minutes: float
+    folders: dict[str, str]
+    skip: dict[str, str]
+
+
+@dataclass
+class BackupResult:
+    sel: str
+    ok: bool
+    message: str
+    archive: Path | None = None
+    log: Path | None = None
+    files: int = 0
+    size: int = 0
+    skipped: int = 0
+    skipped_size: int = 0
+    largest: list[tuple[int, str]] = field(default_factory=list)
+    idle: bool = False     # no folders configured: nothing to do, not a failure
+
+
+def load_backup_settings() -> BackupSettings:
+    if not BACKUPS_CONF.is_file():
+        raise ConfigError(f"no {BACKUPS_CONF} -- run `rcm init`, or open the "
+                          "manager once")
+    cp = configparser.ConfigParser(interpolation=None)
+    cp.optionxform = str
+    cp.read(BACKUPS_CONF, encoding="utf-8")
+    if not cp.has_section("backup"):
+        raise ConfigError(f"{BACKUPS_CONF}: no [backup] section")
+    raw = dict(cp.items("backup"))
+
+    def need(key: str) -> str:
+        value = raw.get(key, "").strip()
+        if not value:
+            raise ConfigError(f"{BACKUPS_CONF} [backup] {key} is not set")
+        return value
+
+    def number(key: str, cast):
+        try:
+            return cast(need(key))
+        except ValueError:
+            raise ConfigError(f"{BACKUPS_CONF} [backup] {key}={raw[key]!r} "
+                              "is not a number") from None
+
+    archiver = need("archiver")
+    for placeholder in ("{archive}", "{list}"):
+        if placeholder not in archiver:
+            raise ConfigError(f"{BACKUPS_CONF} [backup] archiver has no "
+                              f"{placeholder}")
+    return BackupSettings(
+        dest=Path(expand_user_and_vars(need("dest"))),
+        keep_days=number("keep_days", int),
+        archiver=archiver,
+        extension=need("extension").lstrip("."),
+        remote_temp=need("remote_temp").rstrip("\\"),
+        timeout_minutes=number("timeout_minutes", float),
+        folders=dict(cp.items("folders")) if cp.has_section("folders") else {},
+        skip=dict(cp.items("skip")) if cp.has_section("skip") else {})
+
+
+def _scoped(table: dict[str, str], sel: str) -> str | None:
+    """The most specific entry for sel: itself, each group up, DEFAULT."""
+    for scope in creds_chain(sel):
+        if scope in table:
+            return table[scope].strip()
+    return None
+
+
+def backup_folders(sel: str, settings: BackupSettings) -> list[str]:
+    value = _scoped(settings.folders, sel) or ""
+    folders = [f.strip().rstrip("\\") for f in value.split(";") if f.strip()]
+    for folder in folders:
+        if not re.match(r"^[A-Za-z]:\\", folder + "\\"):
+            raise ConfigError(f"{BACKUPS_CONF} [folders] {folder!r} is not a "
+                              r"full Windows path (C:\...)")
+    return folders
+
+
+def backup_skip(sel: str, settings: BackupSettings) -> re.Pattern | None:
+    value = _scoped(settings.skip, sel)
+    if not value:
+        return None
+    try:
+        return re.compile(value, re.IGNORECASE)
+    except re.error as e:
+        raise ConfigError(f"{BACKUPS_CONF} [skip] {value!r}: {e}") from None
+
+
+def _admin_share(path: str) -> tuple[str, str]:
+    """C:\\PRODUCTION -> ("c$", "PRODUCTION")."""
+    return path[0].lower() + "$", path[3:]
+
+
+def _archive_stem(sel: str) -> str:
+    return re.sub(r'[\\/:*?"<>|\s]+', "_", sel)
+
+
+@help_topic("backups", "Backups", ("backup", "archive", "rar", "7z", "winrar",
+                                   "wmi", "crash dump", "retention"),
+            section="Connections")
+def backup_one(c: Conn, settings: BackupSettings, stamp: str,
+               dry_run: bool = False, progress=lambda text: None,
+               abort=None) -> BackupResult:
+    """Back up… archives folders ON each remote PC, then fetches the archive.
+
+    Right-click a selection ▸ Back up… (a group means all of it), or run
+    `rcm backup <connection or group>… [--dry-run]` from Task Scheduler.
+    backups.conf says what: [folders] and [skip] are looked up per scope,
+    most specific first like credentials (Group/Name → Group → DEFAULT);
+    skip is a regex matched against each file's full path on the PC, and a
+    matching folder is left out whole — crash dumps never get read at all.
+
+    Per PC: its admin shares open with the credential chain (`@backup`
+    entries first), the folders are listed and filtered here, the exact
+    file list goes into a run folder on the PC, and WMI starts the PC's own
+    archiver on it at below-normal priority — WinRAR by default, from its
+    installation there, since plant PCs often let nothing else run. Only
+    the finished archive crosses the network, into <dest>/<YYYYMMDD_HHMM>/,
+    with the archiver's log beside it; the run folder on the PC is removed.
+    A dry run stops after the listing and reports what would go in, and the
+    largest files. An archiver exit other than 0 that still left an archive
+    (files in use, typically) keeps it and says so — the log names them.
+    Run folders older than keep_days are deleted after a backup.
+    """
+    result = BackupResult(c.sel, False, "")
+    folders = backup_folders(c.sel, settings)
+    if not folders:
+        # A group usually holds PCs with nothing to keep; a whole-group run
+        # from Task Scheduler must not read as failed because of them.
+        result.ok = result.idle = True
+        result.message = f"nothing to back up (no [folders] entry in {BACKUPS_CONF.name})"
+        return result
+    skip = backup_skip(c.sel, settings)
+    user, password = creds_lookup(c.sel, c.username, proto="backup")
+    if not password:
+        result.message = "no password on its credential chain (Setup ▸ Credentials)"
+        return result
+
+    shares = {_admin_share(f)[0] for f in folders}
+    if not dry_run:
+        shares.add(_admin_share(settings.remote_temp)[0])
+    opened: list[str] = []
+    run_dir, run_unc = "", None
+    leave_run_dir = False     # 7-Zip may still be using it
+    try:
+        roots: dict[str, str] = {}
+        for share in sorted(shares):
+            progress(f"opening \\\\{c.host}\\{share}")
+            unc, ours = PLATFORM.smb_connect(c.host, share, user, password)
+            roots[share] = unc
+            if ours:
+                opened.append(unc)
+
+        progress("listing files")
+        listed: list[tuple[str, int]] = []
+        for folder in folders:
+            share, rest = _admin_share(folder)
+            top = Path(roots[share]) / rest
+            if not top.is_dir():
+                result.message = f"{folder} does not exist on {c.host}"
+                return result
+            stack = [(top, folder)]
+            while stack:
+                local_dir, remote_dir = stack.pop()
+                try:
+                    entries = list(os.scandir(local_dir))
+                except OSError:
+                    continue
+                for entry in entries:
+                    remote = f"{remote_dir}\\{entry.name}"
+                    if entry.is_junction():
+                        continue    # can loop back on itself
+                    if entry.is_dir(follow_symlinks=False):
+                        if not (skip and skip.search(remote + "\\")):
+                            stack.append((Path(entry.path), remote))
+                        continue
+                    size = entry.stat(follow_symlinks=False).st_size
+                    if skip and skip.search(remote):
+                        result.skipped += 1
+                        result.skipped_size += size
+                    else:
+                        listed.append((remote, size))
+        result.files = len(listed)
+        result.size = sum(size for _, size in listed)
+        result.largest = sorted(((s, p) for p, s in listed), reverse=True)[:10]
+        if dry_run:
+            result.ok = True
+            result.message = (f"would archive {result.files} files "
+                              f"({human_size(result.size)}), skip {result.skipped} "
+                              f"({human_size(result.skipped_size)})")
+            return result
+        if not listed:
+            result.message = "nothing left to archive once skip is applied"
+            return result
+
+        import uuid
+        run_dir = f"{settings.remote_temp}\\nch-backup-{uuid.uuid4().hex[:8]}"
+        share, rest = _admin_share(run_dir)
+        run_unc = Path(roots[share]) / rest
+        packed_name = f"archive.{settings.extension}"
+        progress("writing the file list on the PC")
+        run_unc.mkdir(parents=True)
+        (run_unc / "files.txt").write_text(
+            "\n".join(p for p, _ in listed) + "\n", encoding="utf-8")
+        # One cmd line, no batch file: on a Windows 10 IoT plant PC, a .cmd or
+        # a copied .exe started through WMI were refused while cmd /c and the
+        # installed WinRAR ran. The outer quotes are the pair cmd /c strips;
+        # /v:on makes !errorlevel! the archiver's code, not the one when the
+        # line was parsed; `> file echo` puts the redirect first, since
+        # `echo 0> file` would redirect handle 0. The run folder holds only
+        # fixed ASCII names -- the archive gets its real name once fetched.
+        archiver = (settings.archiver
+                    .replace("{archive}", f'"{run_dir}\\{packed_name}"')
+                    .replace("{list}", f'"{run_dir}\\files.txt"'))
+        command = (f'cmd.exe /d /v:on /c "{archiver} > "{run_dir}\\archiver.log" '
+                   f'2>&1 & > "{run_dir}\\exit.txt" echo !errorlevel!"')
+
+        progress("starting the archiver through WMI")
+        PLATFORM.remote_start(c.host, user, password, command, run_dir)
+        leave_run_dir = True
+        started = time.time()
+        deadline = started + settings.timeout_minutes * 60
+        exit_file = run_unc / "exit.txt"
+        while not exit_file.is_file():
+            if abort is not None and abort.is_set():
+                result.message = (f"stopped waiting; the archiver may still be "
+                                  f"running in {run_dir} on {c.host}")
+                return result
+            if time.time() > deadline:
+                result.message = (f"no archive after {settings.timeout_minutes:g} "
+                                  f"min; its run folder is left at {run_dir}")
+                return result
+            try:
+                written = (run_unc / packed_name).stat().st_size
+            except OSError:
+                written = 0
+            minutes, seconds = divmod(int(time.time() - started), 60)
+            progress(f"compressing on the PC {minutes}:{seconds:02d}, "
+                     f"{human_size(written)} so far")
+            time.sleep(2)
+        time.sleep(0.5)   # the redirect closes the file a moment after it exists
+        leave_run_dir = False
+        code = int(exit_file.read_text(encoding="ascii").strip() or "255")
+
+        name = f"{_archive_stem(c.sel)}_{stamp}"
+        dest_dir = settings.dest / stamp
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        result.log = dest_dir / f"{name}.log"
+        shutil.copyfile(run_unc / "archiver.log", result.log)
+        packed = run_unc / packed_name
+        if packed.is_file():
+            progress(f"fetching {human_size(packed.stat().st_size)}")
+            result.archive = dest_dir / f"{name}.{settings.extension}"
+            shutil.copyfile(packed, result.archive)
+            result.ok = True
+            result.message = (f"{human_size(result.archive.stat().st_size)} from "
+                              f"{result.files} files ({human_size(result.size)})")
+            if code:
+                result.message += (f" -- archiver exit {code}, files in use "
+                                   "probably; the log names them")
+        else:
+            result.message = f"archiver exit {code}, no archive -- see {result.log}"
+        return result
+    except (RuntimeError, OSError) as problem:
+        result.ok = False
+        result.message = str(problem)
+        return result
+    finally:
+        if run_unc is not None and not leave_run_dir:
+            shutil.rmtree(run_unc, ignore_errors=True)
+            if run_unc.exists():
+                result.message += f"; could not remove {run_dir} on {c.host}"
+        for unc in opened:
+            PLATFORM.smb_disconnect(unc)
+        if not dry_run:
+            log_event("backup", sel=c.sel, host=c.host, ok=result.ok,
+                      message=result.message, files=result.files,
+                      skipped=result.skipped,
+                      archive=str(result.archive or ""), log=str(result.log or ""))
+
+
+def prune_backups(settings: BackupSettings) -> list[str]:
+    """Delete run folders under dest older than keep_days; their names.
+
+    Only folders named like a run stamp, and only the archives and .log
+    files backups write in them -- anything else there is left, and keeps
+    its folder too.
+    """
+    from datetime import datetime, timedelta
+    if settings.keep_days <= 0 or not settings.dest.is_dir():
+        return []
+    cutoff = datetime.now() - timedelta(days=settings.keep_days)
+    removed = []
+    for run in sorted(settings.dest.iterdir()):
+        if not (run.is_dir() and re.fullmatch(r"\d{8}_\d{4}", run.name)):
+            continue
+        if datetime.strptime(run.name, BACKUP_STAMP) >= cutoff:
+            continue
+        for item in run.iterdir():
+            if item.is_file() and item.suffix.lower() in (
+                    f".{settings.extension.lower()}", ".rar", ".7z", ".zip", ".log"):
+                item.unlink()
+        try:
+            run.rmdir()
+            removed.append(run.name)
+        except OSError:
+            pass
+    return removed
+
+
+def human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+# --------------------------------------------------------------------------- #
 # event log: one JSONL line per user-visible event
 # --------------------------------------------------------------------------- #
 @help_topic("logging", "The event log", ("logs", "jsonl", "history"),
@@ -2624,6 +3009,7 @@ USAGE = """rcm -- remote connection manager
   rcm import <file.csv> [--overwrite] [--dry-run]
   rcm export [file.csv]          default: export/connections.csv
   rcm phonebook [out.rpb]        experimental Radmin phonebook (never overwrites live)
+  rcm backup <sel>... [--dry-run]    archive folders on the PCs, per backups.conf
   rcm workspace [name]           open a named set of connections\n  rcm wake <sel>                 send a Wake-on-LAN magic packet\n  rcm history [sel]              recent events from the JSONL log\n  rcm gen-launcher               rebuild the .desktop jump list
   rcm install-icon               install the app icon into your icon theme
 """
@@ -2938,6 +3324,62 @@ def main(argv: list[str]) -> int:
         wake(mac, host=c.host)
         print(f"magic packet sent to {mac} ({c.sel})")
         return 0
+
+    if cmd == "backup":
+        dry = "--dry-run" in rest
+        names = [a for a in rest if a != "--dry-run"]
+        if not names:
+            print("usage: rcm backup <connection or group>... [--dry-run]",
+                  file=sys.stderr)
+            return 2
+        targets: list[Conn] = []
+        for name in names:
+            found = find(name)
+            members = [found] if found else group_members(name)
+            if not members:
+                print(f"no such connection or group: {name}", file=sys.stderr)
+                return 1
+            targets += [m for m in members if m not in targets]
+        try:
+            settings = load_backup_settings()
+        except ConfigError as e:
+            print(f"rcm: {e}", file=sys.stderr)
+            return 1
+        stamp = time.strftime(BACKUP_STAMP)
+        tty = sys.stdout.isatty()
+
+        def show(text: str) -> None:
+            # A terminal gets one line rewritten in place; a log (Task
+            # Scheduler) gets the steps without the every-2-s progress.
+            if tty:
+                print("\r    " + text.ljust(72), end="", flush=True)
+            elif not text.startswith("compressing"):
+                print("    " + text, flush=True)
+
+        failed = 0
+        for c in targets:
+            print(f"--- {c.sel} ({c.host})", flush=True)
+            try:
+                r = backup_one(c, settings, stamp, dry_run=dry, progress=show)
+            except ConfigError as e:
+                print(f"\nrcm: {e}", file=sys.stderr)
+                return 1
+            if tty:
+                print("\r" + " " * 76 + "\r", end="")
+            verdict = "skipped" if r.idle else "ok" if r.ok else "FAILED"
+            print(f"    {verdict}: {r.message}")
+            if r.archive:
+                print(f"    -> {r.archive}")
+            if dry and r.largest:
+                print("    largest files kept:")
+                for size, path in r.largest:
+                    print(f"      {human_size(size):>9}  {path}")
+            failed += not r.ok
+        if not dry:
+            for run in prune_backups(settings):
+                print(f"removed {settings.dest / run} "
+                      f"(older than {settings.keep_days} days)")
+        return 1 if failed else 0
 
     if cmd == "history":
         sel = rest[0] if rest else ""

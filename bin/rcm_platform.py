@@ -241,13 +241,29 @@ class LinuxX11:
         except Exception:
             return False
 
+    # ---- remote Windows PCs (backups) ------------------------------------- #
+    _NO_REMOTE = ("backups drive Windows' own SMB and WMI clients, so they run "
+                  "from the Windows build of the manager")
+
+    def smb_connect(self, host: str, share: str, user: str,
+                    password: str) -> tuple[str, bool]:
+        raise PlatformError(self._NO_REMOTE)
+
+    def smb_disconnect(self, unc: str) -> None:
+        raise PlatformError(self._NO_REMOTE)
+
+    def remote_start(self, host: str, user: str, password: str,
+                     command_line: str, cwd: str) -> int:
+        raise PlatformError(self._NO_REMOTE)
+
 
 # --------------------------------------------------------------------------- #
 # Windows — the port's landing strip
 # --------------------------------------------------------------------------- #
 class _Win32:
-    """The user32 calls credential typing needs, bound on first use so this
-    module still imports where there is no ctypes.windll."""
+    """The user32 calls credential typing needs, and the mpr ones backups use
+    to reach admin shares, bound on first use so this module still imports
+    where there is no ctypes.windll."""
 
     INPUT_KEYBOARD = 1
     KEYEVENTF_EXTENDEDKEY = 0x1
@@ -301,6 +317,29 @@ class _Win32:
         k.QueryFullProcessImageNameW.argtypes = [
             wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
         k.CloseHandle.argtypes = [wt.HANDLE]
+
+        class NETRESOURCEW(ctypes.Structure):
+            _fields_ = [("dwScope", wt.DWORD), ("dwType", wt.DWORD),
+                        ("dwDisplayType", wt.DWORD), ("dwUsage", wt.DWORD),
+                        ("lpLocalName", wt.LPWSTR), ("lpRemoteName", wt.LPWSTR),
+                        ("lpComment", wt.LPWSTR), ("lpProvider", wt.LPWSTR)]
+
+        self.NETRESOURCEW = NETRESOURCEW
+        m = self.mpr = ctypes.WinDLL("mpr")
+        m.WNetAddConnection2W.argtypes = [ctypes.POINTER(NETRESOURCEW),
+                                          wt.LPCWSTR, wt.LPCWSTR, wt.DWORD]
+        m.WNetAddConnection2W.restype = wt.DWORD
+        m.WNetCancelConnection2W.argtypes = [wt.LPCWSTR, wt.DWORD, wt.BOOL]
+        m.WNetCancelConnection2W.restype = wt.DWORD
+
+    def add_connection(self, unc: str, user: str, password: str) -> int:
+        """Authenticate to a share without mapping a drive letter. 0 = done."""
+        resource = self.NETRESOURCEW(dwType=1, lpRemoteName=unc)   # RESOURCETYPE_DISK
+        return self.mpr.WNetAddConnection2W(self.ctypes.byref(resource),
+                                            password, user, 0)
+
+    def cancel_connection(self, unc: str) -> None:
+        self.mpr.WNetCancelConnection2W(unc, 0, False)   # not if files are open
 
     def top_level_windows(self) -> list[int]:
         found: list[int] = []
@@ -588,6 +627,83 @@ class WindowsNative:
             return True
         except Exception:
             return False
+
+    # ---- remote Windows PCs (backups) ------------------------------------- #
+    def smb_connect(self, host: str, share: str, user: str,
+                    password: str) -> tuple[str, bool]:
+        """Authenticate to \\\\host\\share; (UNC path, whether we opened it).
+
+        The password goes to the API, never onto a command line the way
+        `net use` would put it. Windows keeps one set of credentials per
+        server, so when this PC already holds another (an Explorer window on
+        \\\\host\\c$, say) that session is used if it reaches the share, and
+        left as it was found.
+        """
+        unc = f"\\\\{host}\\{share}"
+        w32 = self._win32()
+        code = w32.add_connection(unc, user, password)
+        if code == 0:
+            return unc, True
+        if code == 1219 and os.path.isdir(unc):
+            return unc, False
+        raise RuntimeError(f"{unc}: {w32.ctypes.FormatError(code).strip()} "
+                           f"(error {code})")
+
+    def smb_disconnect(self, unc: str) -> None:
+        self._win32().cancel_connection(unc)
+
+    # Starts one process through WMI over DCOM (RPC on 135 plus the dynamic
+    # ports), below-normal priority so production software keeps the CPU.
+    # The job, password included, arrives on stdin as JSON.
+    _WMI_START = r"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+try {
+    $job = [Console]::In.ReadToEnd() | ConvertFrom-Json
+    $secret = ConvertTo-SecureString $job.password -AsPlainText -Force
+    $cred = New-Object System.Management.Automation.PSCredential($job.user, $secret)
+    $session = New-CimSession -ComputerName $job.host -Credential $cred `
+        -SessionOption (New-CimSessionOption -Protocol Dcom)
+    try {
+        $startup = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly `
+            -Property @{ PriorityClass = [uint32]16384; ShowWindow = [uint16]0 }
+        $r = Invoke-CimMethod -CimSession $session -ClassName Win32_Process `
+            -MethodName Create -Arguments @{ CommandLine = $job.command;
+                CurrentDirectory = $job.cwd; ProcessStartupInformation = $startup }
+        'OK|{0}|{1}' -f $r.ReturnValue, $r.ProcessId
+    } finally { Remove-CimSession $session }
+} catch { 'ERR|' + $_.Exception.Message }
+"""
+    _WMI_CREATE_ERRORS = {2: "access denied", 3: "insufficient privilege",
+                          8: "unknown failure", 9: "path not found",
+                          21: "invalid parameter"}
+
+    def remote_start(self, host: str, user: str, password: str,
+                     command_line: str, cwd: str) -> int:
+        """Start command_line on host as user; its pid there. Does not wait."""
+        import base64
+        import json
+        encoded = base64.b64encode(self._WMI_START.encode("utf-16-le")).decode()
+        job = json.dumps({"host": host, "user": user, "password": password,
+                          "command": command_line, "cwd": cwd})
+        try:
+            reply = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive",
+                 "-EncodedCommand", encoded],
+                input=job, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=120,
+                creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"{host}: WMI did not answer within 120 s") from None
+        last = next((ln for ln in reversed(reply.splitlines())
+                     if ln.startswith(("OK|", "ERR|"))), "ERR|no reply from PowerShell")
+        if last.startswith("ERR|"):
+            raise RuntimeError(f"{host}: WMI: {last[4:].strip()}")
+        _, code, pid = last.split("|")
+        if int(code):
+            raise RuntimeError(f"{host}: WMI could not start the process: "
+                               f"{self._WMI_CREATE_ERRORS.get(int(code), 'code ' + code)}")
+        return int(pid)
 
 
 PLATFORM = WindowsNative() if sys.platform == "win32" else LinuxX11()
