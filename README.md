@@ -522,8 +522,17 @@ Things that cost real time, kept here so they cost you less:
 - **mstsc saves `.rdp` files as UTF-16 with a BOM.** Sniff the bytes. Decoding bytes
   also skips newline translation, so normalise CRLF before writing back in text mode,
   or every line grows CR CR LF.
-- **PowerShell writes to a pipe in the OEM code page.** The process query sets
-  `[Console]::OutputEncoding` to UTF-8, or `Café Box.rdp` never matches its own path.
+- **PowerShell writes to a pipe in the OEM code page.** A script whose output is read
+  back sets `[Console]::OutputEncoding` to UTF-8 (the backups' does), or `Café Box.rdp`
+  never matches its own path.
+- **Never poll through PowerShell.** Session detection once ran `Get-CimInstance
+  Win32_Process` every 4 s on the manager's main loop: 1.5–3 s a call on a quiet PC,
+  26 s on a busy one, and the window was "Not responding" two thirds of the time —
+  longer still with the Live chip on, which asked once per row on every refilter.
+  `NtQueryInformationProcess` with `ProcessCommandLineInformation` reads the same
+  text in ~40 ms with query-limited access, including whole multi-line command
+  lines the pipe format cut at the first newline; and one answer now serves every
+  question asked within a second.
 - **Windows gives an empty command line for processes it will not reveal** (System,
   other users' without elevation). An empty string matches `^$` — the pattern meant
   to match nothing — so drop those rows instead.

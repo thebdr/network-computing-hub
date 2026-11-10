@@ -142,25 +142,6 @@ def parse_ps_lines(text: str) -> list[tuple[int, str]]:
     return rows
 
 
-def parse_pipe_processes(text: str) -> list[tuple[int, str]]:
-    """`<pid>|<command line>` lines (the PowerShell process query) -> rows.
-
-    System processes, and other users' unless elevated, report no command line
-    at all. That means "unreadable", not "no arguments", so they are dropped:
-    left in, an empty string matches web's deliberately unmatchable `^$`.
-    """
-    rows: list[tuple[int, str]] = []
-    for line in text.splitlines():
-        pid, sep, args = line.partition("|")
-        if not sep or not args.strip():
-            continue
-        try:
-            rows.append((int(pid.strip()), args.strip()))
-        except ValueError:
-            continue
-    return rows
-
-
 def parse_xrandr_monitors(text: str) -> dict[int, tuple[int, int, int, int]]:
     """`xrandr --listactivemonitors` -> {1-based index: (x, y, w, h)}."""
     out: dict[int, tuple[int, int, int, int]] = {}
@@ -360,9 +341,10 @@ class LinuxX11:
 # Windows — the port's landing strip
 # --------------------------------------------------------------------------- #
 class _Win32:
-    """The user32 calls credential typing needs, and the mpr ones backups use
-    to reach admin shares, bound on first use so this module still imports
-    where there is no ctypes.windll."""
+    """The user32 calls credential typing needs, the mpr ones backups use to
+    reach admin shares, and the process queries session detection uses,
+    bound on first use so this module still imports where there is no
+    ctypes.windll."""
 
     INPUT_KEYBOARD = 1
     KEYEVENTF_EXTENDEDKEY = 0x1
@@ -416,6 +398,19 @@ class _Win32:
         k.QueryFullProcessImageNameW.argtypes = [
             wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
         k.CloseHandle.argtypes = [wt.HANDLE]
+        k.K32EnumProcesses.argtypes = [
+            ctypes.POINTER(wt.DWORD), wt.DWORD, ctypes.POINTER(wt.DWORD)]
+        nt = self.ntdll = ctypes.WinDLL("ntdll")
+        nt.NtQueryInformationProcess.argtypes = [
+            wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.ULONG,
+            ctypes.POINTER(wt.ULONG)]
+        nt.NtQueryInformationProcess.restype = ctypes.c_long
+
+        class UNICODE_STRING(ctypes.Structure):
+            _fields_ = [("Length", wt.USHORT), ("MaximumLength", wt.USHORT),
+                        ("Buffer", ctypes.c_void_p)]
+
+        self.UNICODE_STRING = UNICODE_STRING
 
         class NETRESOURCEW(ctypes.Structure):
             _fields_ = [("dwScope", wt.DWORD), ("dwType", wt.DWORD),
@@ -439,6 +434,47 @@ class _Win32:
 
     def cancel_connection(self, unc: str) -> None:
         self.mpr.WNetCancelConnection2W(unc, 0, False)   # not if files are open
+
+    def process_ids(self) -> list[int]:
+        size = 1024
+        while True:
+            pids = (self.wt.DWORD * size)()
+            got = self.wt.DWORD()
+            if not self.kernel32.K32EnumProcesses(
+                    pids, self.ctypes.sizeof(pids), self.ctypes.byref(got)):
+                raise self.ctypes.WinError(self.ctypes.get_last_error())
+            count = got.value // self.ctypes.sizeof(self.wt.DWORD)
+            if count < size:       # a full array may have been cut short
+                return [p for p in pids[:count] if p]
+            size *= 2
+
+    def command_line(self, pid: int) -> str:
+        """The process's command line, or "" where Windows will not say.
+
+        ProcessCommandLineInformation (60) needs only query-limited access,
+        the same Task Manager's column gets by with.
+        """
+        ctypes = self.ctypes
+        handle = self.kernel32.OpenProcess(0x1000, False, pid)  # query-limited
+        if not handle:
+            return ""
+        try:
+            need = self.wt.ULONG(0)
+            buf = ctypes.create_string_buffer(512)
+            status = self.ntdll.NtQueryInformationProcess(
+                handle, 60, buf, len(buf), ctypes.byref(need))
+            if status != 0 and need.value > len(buf):   # too small: retry
+                buf = ctypes.create_string_buffer(need.value)
+                status = self.ntdll.NtQueryInformationProcess(
+                    handle, 60, buf, len(buf), ctypes.byref(need))
+            if status != 0:
+                return ""
+            text = self.UNICODE_STRING.from_buffer(buf)
+            if not text.Length or not text.Buffer:
+                return ""
+            return ctypes.wstring_at(text.Buffer, text.Length // 2)
+        finally:
+            self.kernel32.CloseHandle(handle)
 
     def top_level_windows(self) -> list[int]:
         found: list[int] = []
@@ -549,18 +585,25 @@ class WindowsNative:
                     stderr=subprocess.DEVNULL, creationflags=flags)
 
     def process_command_lines(self) -> list[tuple[int, str]]:
-        # PowerShell writes a pipe in the OEM code page by default, which turns
-        # "Café.rdp" into something no saved connection path matches.
-        # CREATE_NO_WINDOW: the manager polls this every few seconds, and from
-        # a process without a console each run would flash one up.
-        out = subprocess.run(
-            ["powershell", "-NoProfile", "-Command",
-             "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
-             "Get-CimInstance Win32_Process | ForEach-Object "
-             "{ '{0}|{1}' -f $_.ProcessId, $_.CommandLine }"],
-            capture_output=True, text=True, encoding="utf-8",
-            errors="replace", creationflags=subprocess.CREATE_NO_WINDOW).stdout
-        return parse_pipe_processes(out)
+        """Read in this process, never through PowerShell.
+
+        The PowerShell Get-CimInstance query this replaces took 1.5-3 s on a
+        quiet PC and 26 s on a busy one, and the manager runs it on its main
+        loop every few seconds: the window was "Not responding" most of the
+        time. Read from the kernel the same text takes ~35 ms.
+
+        Processes Windows will not reveal (System, other users' unless
+        elevated) have no command line. That means "unreadable", not "no
+        arguments", so they are dropped: left in, an empty string matches
+        web's deliberately unmatchable `^$`.
+        """
+        w32 = self._win32()
+        rows: list[tuple[int, str]] = []
+        for pid in w32.process_ids():
+            args = w32.command_line(pid).strip()
+            if args:
+                rows.append((pid, args))
+        return rows
 
     # ---- windows ---------------------------------------------------------- #
     _w32: _Win32 | None = None
