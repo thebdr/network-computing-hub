@@ -30,8 +30,9 @@ client does not provide a credentials management, automate the insertion on a pa
 - **Tick connections** to queue them up for the Connect buttons; right-click any
   selection to export it as `.rdp` files, a CSV, or a Radmin phonebook
 
-Linux/X11 (developed on Cinnamon). On Windows the command line and the manager run,
-without window control yet — see [Windows](#windows) and the [Roadmap](#roadmap).
+Linux/X11 (developed on Cinnamon). On Windows the command line and the manager run —
+as a self-contained `.exe`, or under Python — without window control yet; see
+[Windows](#windows) and the [Roadmap](#roadmap).
 
 ---
 
@@ -54,9 +55,43 @@ Open the manager once (`rcm gui`) and it will create any missing config for you.
 
 ### Windows
 
-The command line runs under any Windows Python 3.11+. The manager needs GTK 3, which
-on Windows comes from MSYS2, so the manager runs under MSYS2's own Python rather than
-one from python.org.
+**The .exe.** `NetworkComputingHub.exe` opens the manager on a double-click; `rcm.exe`
+beside it is the command line. Both carry Python, GTK 3 and PyGObject in the
+`runtime\` folder next to them, so the PC running them needs none of it. They keep
+their data where they stand: `RDP\`, the `.conf` files and `logs\` live in the folder
+that holds them — the same layout as a clone, and the clone itself works (the two
+`.exe` files and `runtime\` are git-ignored). Pin the `.exe` to Start or the taskbar.
+Not under `%TEMP%`: cleaners there delete files by age, and copies keep their old dates.
+
+Build it once, on a PC with MSYS2 set up as under *From Python* below, plus
+PyInstaller (in the MSYS2 UCRT64 shell):
+
+```bash
+pacman -S --needed mingw-w64-ucrt-x86_64-{pyinstaller,pyinstaller-hooks-contrib}
+```
+
+Then, in PowerShell in the clone:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 -InstallTo .
+```
+
+`dist\NetworkComputingHub\` holds the same three as a folder to copy to another PC.
+`-InstallTo` replaces `runtime\` whole, so close the manager first. It is one folder
+rather than one file on purpose: a single `.exe` unpacks its thousand-odd GTK files
+into `%TEMP%` on every start: `rcm list` measured 40 s behind antivirus that way,
+and under two seconds this way.
+
+`rcm.exe` is `bin/rcm` exactly — output, exit codes, the `creds set` prompt. The
+windowed `.exe` runs commands too, and from Task Scheduler that is the one to use,
+since no console window flashes up: `<folder>\NetworkComputingHub.exe backup
+FVT_LaPoste`. It prints only into a pipe and cannot prompt; `creds set` there says so.
+Not in the `.exe`: `pywinrm`, so **Run script** over WinRM asks for the Python
+route, and the Help window's Open-code links, since it ships compiled code.
+
+**From Python.** The command line runs under any Windows Python 3.11+. The manager
+needs GTK 3, which on Windows comes from MSYS2, so the manager runs under MSYS2's own
+Python rather than one from python.org.
 
 ```powershell
 winget install --id MSYS2.MSYS2 --exact
@@ -347,9 +382,11 @@ administrator. RAR5 solid at `-m5` comes close to 7z; where 7-Zip is installed o
 PCs, `backups.conf` has its line ready. The PCs must answer on 445 (SMB) and allow WMI
 (135 plus the dynamic RPC ports), and the account must be an administrator there.
 
-On Windows, schedule it with MSYS2's Python, which has the keyring:
-`C:\msys64\ucrt64\bin\python.exe <repo>\bin\rcm backup FVT_LaPoste`. The exit code
-is 1 when any PC failed; PCs with no folders configured are skipped, not failed.
+On Windows, schedule the `.exe`, which shows no window:
+`<folder>\NetworkComputingHub.exe backup FVT_LaPoste` — or MSYS2's Python, which has
+the keyring: `C:\msys64\ucrt64\bin\python.exe <repo>\bin\rcm backup FVT_LaPoste`. The
+exit code is 1 when any PC failed; PCs with no folders configured are skipped, not
+failed.
 
 ## The manager
 
@@ -503,6 +540,21 @@ Things that cost real time, kept here so they cost you less:
   that command runs.
 - **`echo 0> file` redirects handle 0** and writes "ECHO is off." — put the redirect
   first: `> file echo %code%`.
+- **MSYS2's pacman behind a TLS-inspecting proxy** times out or fails with
+  "self-signed certificate in certificate chain" while PowerShell reaches the same
+  URL: Windows trusts the company's root certificate, MSYS2's curl does not. Download
+  each `.pkg.tar.zst` and its `.sig` with `Invoke-WebRequest` into a folder, then
+  `pacman -S --cachedir <folder> <packages>` — pacman still checks every file against
+  its signed database.
+- **A frozen app's children inherit its DLL directory.** PyInstaller puts `runtime\`
+  on `SetDllDirectory`, which every `CreateProcess` passes on, searched before
+  System32 — so a client loading `zlib1.dll` by name gets GTK's copy — along with
+  `GI_TYPELIB_PATH`, `GTK_*` and `XDG_DATA_DIRS` pointing into it. Clear the DLL
+  directory around each start, not for good (GTK loads pixbuf loaders from there
+  later), and drop the variables.
+- **`GetConsoleWindow()` is NULL for a console program started with
+  `CREATE_NO_WINDOW`**: it has a console, just no window. Whether a prompt can be
+  answered is `GetConsoleProcessList()`, which is 0 only in a windowed program.
 
 ### The Radmin phonebook format
 
@@ -526,9 +578,10 @@ named with its full path (`Plant/Line2`). Names, hosts and usernames are correct
   credentials via the `keyring` package and typing them into a prompt through user32,
   and raises a clear `PlatformError` for window control, monitor placement and system
   shortcuts).
+  **Done too: the `.exe`** — PyInstaller bundling GTK, see [Windows](#windows).
   Still to come: the tray agent owning `RegisterHotKey` and window management
   (Windows has no per-command keybinding registry, and Win+W/Win+Q are
-  shell-reserved), then PyInstaller bundling GTK. First run on a real machine
+  shell-reserved). First run on a real machine
   (Windows 11, October 2026): the command line, and the manager under MSYS2's GTK —
   every layout, Setup, Logs, connecting through mstsc, live cards and disconnect.
 - VNC is implemented but has not been exercised against a real server

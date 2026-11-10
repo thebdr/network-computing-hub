@@ -26,3 +26,11 @@ __pycache__/
 .DS_Store
 logs/
 help/
+
+# Windows build (packaging/windows/build.ps1), and the .exe files with their
+# runtime folder once placed beside the data they manage
+build/
+dist/
+NetworkComputingHub.exe
+rcm.exe
+runtime/

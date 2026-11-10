@@ -15,17 +15,113 @@ functions so the Windows ones can be tested from any machine.
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 
 class PlatformError(RuntimeError):
     """This operation is not available on this platform (yet). Says why."""
+
+
+# --------------------------------------------------------------------------- #
+# programs we start, from the Windows .exe
+# --------------------------------------------------------------------------- #
+# The .exe (PyInstaller) points GTK at its own runtime folder through
+# environment variables, and puts that folder on the DLL search path; both are
+# inherited by every program it starts. A client that loads zlib1.dll or
+# OpenSSL by name would then find GTK's copies before its own, and a GTK or
+# Python program would look for its data in our folder. Children get neither.
+FROZEN_BUNDLE = getattr(sys, "_MEIPASS", "") if getattr(sys, "frozen", False) else ""
+
+
+def child_environ(environ: dict, bundle: str) -> dict:
+    """`environ` without what a frozen app at `bundle` set for itself.
+
+    Drops PyInstaller's own `_PYI_*` markers and every variable pointing into
+    the bundle (GI_TYPELIB_PATH, GTK_*, XDG_DATA_DIRS…); PATH loses only its
+    entries inside the bundle. Not frozen (`bundle` empty): unchanged.
+    """
+    if not bundle:
+        return dict(environ)
+    root = os.path.normcase(os.path.normpath(bundle))
+
+    def inside(path: str) -> bool:
+        p = os.path.normcase(os.path.normpath(path.strip().strip('"')))
+        return p == root or p.startswith(root + os.sep)
+
+    env = {}
+    for key, value in environ.items():
+        if key.upper().startswith("_PYI_"):
+            continue
+        if key.upper() == "PATH":
+            env[key] = os.pathsep.join(
+                p for p in value.split(os.pathsep) if p and not inside(p))
+        elif os.path.normcase(bundle) not in os.path.normcase(value):
+            env[key] = value
+    return env
+
+
+_dll_dir_lock = threading.Lock()
+
+
+@contextlib.contextmanager
+def _dll_dir_not_inherited():
+    """Clear the frozen app's DLL directory while a child is created.
+
+    Only for the instant of CreateProcess: GTK itself still loads DLLs from
+    there later (pixbuf loaders, on first use), so it is put back at once.
+    """
+    if not (FROZEN_BUNDLE and os.name == "nt"):
+        yield
+        return
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetDllDirectoryW.restype = ctypes.c_uint32
+    kernel32.SetDllDirectoryW.argtypes = [ctypes.c_wchar_p]
+    buf = ctypes.create_unicode_buffer(32768)
+    with _dll_dir_lock:
+        had = kernel32.GetDllDirectoryW(len(buf), buf) > 0
+        kernel32.SetDllDirectoryW(None)
+        try:
+            yield
+        finally:
+            kernel32.SetDllDirectoryW(buf.value if had else None)
+
+
+def start_child(argv, **kwargs) -> subprocess.Popen:
+    """subprocess.Popen, minus what the frozen .exe set for itself."""
+    kwargs["env"] = child_environ(kwargs.get("env") or os.environ, FROZEN_BUNDLE)
+    with _dll_dir_not_inherited():
+        return subprocess.Popen(argv, **kwargs)
+
+
+def run_child(argv, *, input=None, timeout=None, capture_output=False,
+              **kwargs) -> subprocess.CompletedProcess:
+    """subprocess.run for a helper whose output we keep (ssh, a hook).
+
+    Started through start_child, and on Windows without a console window:
+    the windowed .exe has none to lend, so each would open its own.
+    """
+    if capture_output:
+        kwargs["stdout"] = kwargs["stderr"] = subprocess.PIPE
+    if os.name == "nt":
+        kwargs["creationflags"] = (kwargs.get("creationflags", 0)
+                                   | subprocess.CREATE_NO_WINDOW)
+    with start_child(argv, **kwargs) as proc:
+        try:
+            out, err = proc.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +290,9 @@ class LinuxX11:
 
     def open_path(self, target: str) -> None:
         self.spawn_detached(["xdg-open", str(target)])
+
+    def console_attached(self) -> bool:
+        return True     # a terminal-less launch still has stdin for getpass
 
     # ---- credentials (libsecret; the operator's stored secrets stay put) -- #
     def _backend(self):
@@ -446,8 +545,8 @@ class WindowsNative:
             e.update(env)
         flags = (subprocess.DETACHED_PROCESS
                  | subprocess.CREATE_NEW_PROCESS_GROUP)
-        subprocess.Popen(argv, env=e, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, creationflags=flags)
+        start_child(argv, env=e, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, creationflags=flags)
 
     def process_command_lines(self) -> list[tuple[int, str]]:
         # PowerShell writes a pipe in the OEM code page by default, which turns
@@ -586,7 +685,20 @@ class WindowsNative:
         print(f"rcm: {message}", file=sys.stderr)
 
     def open_path(self, target: str) -> None:
-        os.startfile(str(target))    # noqa: S606 -- the Windows "xdg-open"
+        with _dll_dir_not_inherited():
+            os.startfile(str(target))    # noqa: S606 -- the Windows "xdg-open"
+
+    def console_attached(self) -> bool:
+        """False in a windowed program (pythonw, NetworkComputingHub.exe).
+
+        There no prompt can be answered: getpass would wait forever on a
+        console that does not exist, even with stdout piped somewhere. Asked
+        of the console's process list, not its window: a console program
+        started with CREATE_NO_WINDOW has a console but no window.
+        """
+        import ctypes
+        pids = (ctypes.c_uint32 * 1)()
+        return ctypes.windll.kernel32.GetConsoleProcessList(pids, 1) > 0
 
     # ---- credentials (`keyring` -> Windows Credential Locker) -------------- #
     def _keyring(self):
