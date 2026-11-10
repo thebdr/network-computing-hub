@@ -2720,7 +2720,7 @@ class Win(Gtk.Window):
         if rcm.probe_host(c.host, 22, timeout=2.0):
             target = f"{c.username}@{c.host}" if c.username else c.host
             with open(script_path) as script:
-                completed = subprocess.run(
+                completed = rcm.run_child(
                     ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
                      target, "bash -s"], stdin=script,
                     capture_output=True, text=True, timeout=300)
@@ -2762,6 +2762,11 @@ class Win(Gtk.Window):
             return winrm
         except ImportError:
             pass
+        if rcm.FROZEN:
+            # sys.executable is the .exe itself, not a Python pip can run in.
+            raise RuntimeError("WinRM needs pywinrm, which the Windows .exe "
+                               "does not include — run this script from the "
+                               "manager started with Python (see README)")
         GLib.idle_add(self.say, "installing pywinrm (first WinRM use)…")
         import sys
         done = subprocess.run(
@@ -3773,6 +3778,7 @@ class Win(Gtk.Window):
         body_scroller.add(body_label)
         source_button = Gtk.Button(label="")
         source_button.set_relief(Gtk.ReliefStyle.NONE)
+        source_button.set_no_show_all(True)   # shown per topic, when it has one
         content.pack_start(title_label, False, False, 0)
         content.pack_start(body_scroller, True, True, 0)
         content.pack_start(source_button, False, False, 0)
@@ -3787,6 +3793,8 @@ class Win(Gtk.Window):
             body_label.set_text(topic.body)
             source_button.set_label(f"⌁ Open the code — {topic.source_file}:"
                                     f"{topic.source_line} {topic.symbol}()")
+            # The .exe ships compiled code only, so its topics have no file.
+            source_button.set_visible(bool(topic.source_file))
 
         def fill(query=""):
             topics_store.clear()

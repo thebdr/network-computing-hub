@@ -40,9 +40,17 @@ from pathlib import Path
 # path; rcm_gui/rcm_switch are imported the same way further down.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from rcm_help import HELP_TOPICS, help_topic, register_topic  # noqa: E402
-from rcm_platform import PLATFORM, PlatformError  # noqa: E402
+from rcm_platform import PLATFORM, PlatformError, run_child  # noqa: E402
 
-APP = Path(__file__).resolve().parent.parent
+# The Windows .exe (PyInstaller) runs this file from its runtime\ folder, where
+# __file__'s grandparent is whatever folder the .exe was copied into. Its data
+# -- RDP/, the .conf files, logs/ -- lives beside the .exe, the same
+# one-directory layout a clone has; only the read-only resources it ships
+# (icons, the default template) are read from the bundle.
+FROZEN = bool(getattr(sys, "frozen", False))
+APP = (Path(sys.executable).resolve().parent if FROZEN
+       else Path(__file__).resolve().parent.parent)
+BUNDLE = Path(getattr(sys, "_MEIPASS", APP))
 RDP_DIR = APP / "RDP"
 TEMPLATE = APP / "templates" / "default.rdp"
 EXPORT_DIR = APP / "export"
@@ -1116,6 +1124,12 @@ def write_default_configs(names: list[str] | None = None) -> list[str]:
         if name == "creds.conf":
             dest.chmod(0o600)
         written.append(name)
+    # A clone carries templates/ in the repo; the .exe carries it inside, so
+    # its first run puts an editable copy beside it like any other default.
+    if names is None and not TEMPLATE.is_file() and BUNDLE != APP:
+        TEMPLATE.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(BUNDLE / "templates" / "default.rdp", TEMPLATE)
+        written.append("templates/default.rdp")
     return written
 
 
@@ -1325,8 +1339,8 @@ def open_via_tunnel(via_name: str, dest_host: str, dest_port: int) -> int:
     # stderr open for its whole life, and reading a pipe to EOF would block
     # the launch here until the tunnel died.
     with tempfile.TemporaryFile(mode="w+") as output:
-        completed = subprocess.run(argv, stdin=subprocess.DEVNULL,
-                                   stdout=output, stderr=output, timeout=45)
+        completed = run_child(argv, stdin=subprocess.DEVNULL,
+                              stdout=output, stderr=output, timeout=45)
         output.seek(0)
         ssh_said = output.read().strip()
     log_event("via", via=via_name, host=dest_host, port=dest_port,
@@ -1386,8 +1400,8 @@ def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
     if pre_command:
         rendered = pre_command.format(
             **launch_placeholder_values(c, p, via=via_name))
-        completed = subprocess.run(rendered, shell=True, capture_output=True,
-                                   text=True, timeout=120)
+        completed = run_child(rendered, shell=True, capture_output=True,
+                              text=True, timeout=120)
         log_event("pre-hook", sel=c.sel, command=rendered,
                   exit_code=completed.returncode)
         if completed.returncode != 0:
@@ -1915,11 +1929,12 @@ def dump_help_html() -> int:
                 f"{html.escape(topic.title)}</a></li>")
             body = "".join(f"<p>{html.escape(par)}</p>"
                            for par in topic.body.split("\n\n"))
+            source = (f"<hr><p><small>⌁ the source is the full manual: "
+                      f"{html.escape(topic.source_file)}:{topic.source_line} "
+                      f"{html.escape(topic.symbol)}()</small></p>"
+                      if topic.source_file else "")
             (HELP_DIR / f"{topic.topic_id}.html").write_text(
-                f"<h1>{html.escape(topic.title)}</h1>{style}{body}"
-                f"<hr><p><small>⌁ the source is the full manual: "
-                f"{html.escape(topic.source_file)}:{topic.source_line} "
-                f"{html.escape(topic.symbol)}()</small></p>"
+                f"<h1>{html.escape(topic.title)}</h1>{style}{body}{source}"
                 f'<p><a href="index.html">← guide index</a></p>',
                 encoding="utf-8")
         index_lines.append("</ul>")
@@ -2768,8 +2783,15 @@ def focus_gui() -> str:
     if win:
         xdotool("windowactivate", "--sync", win)
         return "focused the manager"
-    spawn_detached([sys.executable, str(Path(__file__).resolve()), "gui"])
+    spawn_detached(self_argv() + ["gui"])
     return "starting the manager"
+
+
+def self_argv() -> list[str]:
+    """The command that runs rcm again: the .exe alone, or Python + this file."""
+    if FROZEN:
+        return [sys.executable]
+    return [sys.executable, str(Path(__file__).resolve())]
 
 
 def goto(sel: str) -> str:
@@ -2974,8 +2996,8 @@ def parse_gsettings_list(raw: str) -> list[str]:
 # .desktop jump list
 # --------------------------------------------------------------------------- #
 ICON_NAME = "network-computing-hub"
-ICON_SVG = APP / "assets" / f"{ICON_NAME}.svg"
-ICON_SVG_SMALL = APP / "assets" / f"{ICON_NAME}-small.svg"
+ICON_SVG = BUNDLE / "assets" / f"{ICON_NAME}.svg"
+ICON_SVG_SMALL = BUNDLE / "assets" / f"{ICON_NAME}-small.svg"
 ICON_THEME_DIR = Path.home() / ".local/share/icons/hicolor"
 # Below 48px the detailed icon turns to mush, so the simplified variant is used
 # there -- that is exactly what per-size directories in an icon theme are for.
@@ -3267,6 +3289,11 @@ def main(argv: list[str]) -> int:
             if not keyring_available():
                 print("rcm: no keyring available", file=sys.stderr)
                 return 1
+            if not PLATFORM.console_attached():
+                print("rcm: creds set prompts for the password and this "
+                      "program has no console -- use rcm.exe, or the "
+                      "manager's Credentials page", file=sys.stderr)
+                return 2
             pw = getpass.getpass(f"password for {rest[1]} (not echoed): ")
             if not pw:
                 print("aborted, nothing stored")
@@ -3632,10 +3659,15 @@ if __name__ == "__main__":
     for stream in (sys.stdout, sys.stderr):
         if stream and stream.encoding.lower().replace("-", "") != "utf8":
             stream.reconfigure(encoding="utf-8")
+    # NetworkComputingHub.exe is windowed: double-clicking it means "open the
+    # manager", and a window is the only place it has to say anything. Its
+    # console twin rcm.exe, like bin/rcm, prints the usage instead.
+    windowed = FROZEN and not PLATFORM.console_attached()
+    args = sys.argv[1:] or (["gui"] if windowed else [])
     # Anything a port phase has not reached yet says so in one line, rather
     # than as a traceback ending in the same sentence.
     try:
-        sys.exit(main(sys.argv[1:]))
+        sys.exit(main(args))
     except PlatformError as e:
         print(f"rcm: {e}", file=sys.stderr)
         sys.exit(1)
