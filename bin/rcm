@@ -1417,6 +1417,7 @@ def launch(c: Conn, proto: str = "", launcher: str = "") -> str:
     else:
         spawn_detached(argv, env=p.env or None)
         result = f"{p.label} -> {c.sel} ({c.host}) via {Path(argv[0]).name}"
+    forget_sessions()
     if via_name:
         result += f" (through via {via_name})"
     log_event("launch", sel=c.sel, host=c.host, protocol=p.id,
@@ -1591,8 +1592,32 @@ class Session:
     window: str = ""   # X11 window id, empty when none was found
 
 
+# One answer per moment. The manager's 4 s tick asks twice (the cards, the
+# list), and the Live chip asks once per row each time the list refilters --
+# on every keystroke in the filter box. Launching or ending a session forgets
+# the answer, so neither waits for it to age out.
+SESSIONS_FRESH_FOR = 1.0    # seconds
+_sessions_seen: tuple[float, list[Session]] | None = None
+
+
+def forget_sessions() -> None:
+    global _sessions_seen
+    _sessions_seen = None
+
+
 def sessions() -> list[Session]:
     """Live sessions from any configured launcher, matched back to connections."""
+    global _sessions_seen
+    seen = _sessions_seen
+    if seen and time.monotonic() - seen[0] < SESSIONS_FRESH_FOR:
+        return list(seen[1])
+    found = scan_sessions()
+    _sessions_seen = (time.monotonic(), found)
+    return list(found)
+
+
+def scan_sessions() -> list[Session]:
+    """sessions(), read from the process list now."""
     out: list[Session] = []
     by_path = {str(c.path): c for c in conns_cached()}
     seen: set[tuple[str, str, str]] = set()
@@ -1667,6 +1692,7 @@ def kill_session(s: Session) -> None:
     # Already gone: ProcessLookupError on Linux, "access denied" on Windows.
     except (ProcessLookupError, PermissionError):
         pass
+    forget_sessions()
 
 
 # --------------------------------------------------------------------------- #
