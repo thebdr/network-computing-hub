@@ -392,11 +392,14 @@ failed.
 
 The window has three layouts (the Layout button, saved as `layout =` in `ui.conf`):
 **Browse** — the everyday view: a filter-first flat list with match highlighting, a
-collapsible group sidebar (the ⊞ button), Live and per-protocol filter chips, and
+collapsible group sidebar (the ⊞ button), Live and per-protocol filter chips (each in
+its protocol's colour, filled with it while on), and
 live sessions appearing as a strip of one-line cards only while any exist — each with
-👁 to focus it and an unplugged-cable button to disconnect. Browse also has an **icon
-view** (the grid button, saved as `browse_view` in `ui.conf`): every connection as a
-machine with its protocol chips across its screen — wrapping, spilling past the case
+👁 to focus it and an unplugged-cable button to disconnect. A row's protocol chips
+connect on a click and sink for a moment to show it; under the list, one ▶ button per
+protocol, all as wide as the widest, does the same for whatever is ticked. Browse
+also has an **icon view** (the grid button, saved as `browse_view` in `ui.conf`):
+every connection as a monitor showing a desktop, its protocol chips across the screen — wrapping, spilling past the case
 when there are many, the default underlined — grouped under the same headings and
 tickboxes as the list, with a details pane beside the grid carrying the full record of
 whatever is selected. A single click selects; double-click a chip to connect over that
@@ -529,6 +532,15 @@ Things that cost real time, kept here so they cost you less:
 - **PowerShell writes to a pipe in the OEM code page.** A script whose output is read
   back sets `[Console]::OutputEncoding` to UTF-8 (the backups' does), or `Café Box.rdp`
   never matches its own path.
+- **Hit-testing markup in a TreeView cell means laying out what was drawn.** The
+  protocol chips are one cell of Pango markup; measuring each chip on its own drifted
+  by up to 6 px on a live row, which is drawn bold, so clicks on the right half of
+  a chip missed. Lay out the cell's whole markup in the row's weight and ask
+  `xy_to_index` which character is under the click.
+- **An ellipsizing TreeView column gets only its header's width.** The backup
+  dialog showed "FVT_LaPoste/TRIB/bSorter…" under a column sized to the word "Host".
+  Measure the longest value and set the column's minimum width; `width-chars`
+  counts average characters and still cuts real names short.
 - **A TCP connect can be answered by the network, not the host.** On a corporate
   network every address "accepted" 80 and 443 — including `192.0.2.1`, which
   RFC 5737 reserves so that no machine ever has it — so a Web connection showed

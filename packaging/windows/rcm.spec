@@ -24,6 +24,7 @@ a = Analysis(
     datas=[
         (str(ROOT / "assets" / "network-computing-hub.svg"), "assets"),
         (str(ROOT / "assets" / "network-computing-hub-small.svg"), "assets"),
+        (str(ROOT / "assets" / "machine.svg"), "assets"),
         (str(ROOT / "templates" / "default.rdp"), "templates"),
     ],
     hooksconfig={

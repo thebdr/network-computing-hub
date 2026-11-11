@@ -30,6 +30,12 @@ except (ValueError, ImportError):
 
 REFRESH_SECONDS = 4
 STAGGER = 2  # seconds between launches when several are selected
+CHIP_PRESS_MS = 180   # how long a clicked protocol chip stays pressed
+# The icon view's machine: assets/machine.svg drawn at this size, and that
+# drawing's screen (top edge, taskbar edge, drawing height) in its own units.
+MACHINE_SIZE = (126, 105)
+MACHINE_SCREEN = (7, 65, 100)
+_machine_pixbuf = None
 
 # background-image:none is needed or the theme's gradient paints over the colour.
 CSS_TEMPLATE = """
@@ -57,11 +63,14 @@ def resolve_colour(colour: str) -> str:
     return _ACCENT if not colour or colour == "accent" else colour
 
 
-def protocol_badges(pids, registry, default_pid: str = "") -> str:
+def protocol_badges(pids, registry, default_pid: str = "",
+                    pressed: str = "") -> str:
     """Pango markup: one coloured chip per enabled protocol.
 
     The colour lives on the protocol, so the button and the chip are two views
-    of the same setting rather than two settings to keep in sync.
+    of the same setting rather than two settings to keep in sync. `pressed`
+    draws that chip darker for a moment, the way a button sinks under a
+    click -- colour only, so nothing beside it moves.
     """
     out = []
     for pid in pids:
@@ -69,15 +78,71 @@ def protocol_badges(pids, registry, default_pid: str = "") -> str:
         if not pr:
             continue
         bg = resolve_colour(pr.color)
+        fg = "#ffffff"
+        if pid == pressed:
+            bg, fg = _shift(bg, 0.62), "#e8e8e8"
         label = GLib.markup_escape_text(pr.label)
         if pid == default_pid:
             label = f"<u>{label}</u>"
-        out.append(f'<span background="{bg}" foreground="#ffffff"> {label} </span>')
+        out.append(f'<span background="{bg}" foreground="{fg}"> {label} </span>')
     return " ".join(out)
+
+
+def tile_chip_markup(proto, is_default: bool, pressed: bool = False) -> str:
+    """One chip on an icon-view machine; `pressed` sinks it, colour only."""
+    bg, fg = resolve_colour(proto.color), "#ffffff"
+    if pressed:
+        bg, fg = _shift(bg, 0.62), "#e8e8e8"
+    name = GLib.markup_escape_text(proto.label)
+    if is_default:
+        name = f"<u>{name}</u>"
+    return (f'<span background="{bg}" foreground="{fg}" size="small">'
+            f' {name} </span>')
+
+
+def machine_image() -> Gtk.Image:
+    """The icon view's monitor, drawn once from assets/machine.svg.
+
+    Falls back to the theme's computer icon if the SVG cannot be read, so a
+    missing asset costs the picture, not the view.
+    """
+    global _machine_pixbuf
+    if _machine_pixbuf is None:
+        try:
+            gi.require_version("GdkPixbuf", "2.0")
+            from gi.repository import GdkPixbuf
+            _machine_pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_size(
+                str(rcm.BUNDLE / "assets" / "machine.svg"), *MACHINE_SIZE)
+        except Exception:
+            _machine_pixbuf = False
+    if _machine_pixbuf:
+        return Gtk.Image.new_from_pixbuf(_machine_pixbuf)
+    image = Gtk.Image.new_from_icon_name("computer", Gtk.IconSize.DIALOG)
+    image.set_pixel_size(MACHINE_SIZE[1])
+    return image
+
+
+def badge_ranges(pids, registry) -> list[tuple[int, int, str]]:
+    """(first byte, end byte, pid) of each chip in protocol_badges' text."""
+    ranges, pos = [], 0
+    for pid in pids:
+        pr = registry.get(pid)
+        if not pr:
+            continue
+        if ranges:
+            pos += 1                         # the space joining two chips
+        size = len(f" {pr.label} ".encode())
+        ranges.append((pos, pos + size, pid))
+        pos += size
+    return ranges
 
 
 def protocol_css_class(pid: str) -> str:
     return "rcm-proto-" + re.sub(r"[^a-z0-9]+", "-", pid.lower()).strip("-")
+
+
+def filter_css_class(pid: str) -> str:
+    return protocol_css_class(pid).replace("rcm-proto-", "rcm-filter-", 1)
 
 
 def build_protocol_css(protos) -> bytes:
@@ -90,6 +155,16 @@ def build_protocol_css(protos) -> bytes:
     out = []
     for pr in protos.values():
         colour = (pr.color or "").strip()
+        # Browse's filter chips: the protocol's colour as text, and filled
+        # with it while on -- the same colour as its Connect button and its
+        # chips, so a chip, a button and a filter read as one protocol.
+        fill = colour if colour.startswith("#") else "@theme_selected_bg_color"
+        out.append(f"button.{filter_css_class(pr.id)} label {{ color: {fill}; "
+                   f"font-weight: bold; }}\n"
+                   f"button.{filter_css_class(pr.id)}:checked {{ "
+                   f"background-image: none; background-color: {fill}; }}\n"
+                   f"button.{filter_css_class(pr.id)}:checked label {{ "
+                   f"color: #ffffff; }}\n")
         if not colour or colour == "accent" or not colour.startswith("#"):
             continue
         out.append(CSS_TEMPLATE.format(cls=protocol_css_class(pr.id), bg=colour,
@@ -111,7 +186,7 @@ def build_protocol_css(protos) -> bytes:
                "background-color: alpha(currentColor, 0.22); }\n"
                # The Connect row: 20% shorter than a stock button.
                "button.rcm-connect { padding-top: 1px; padding-bottom: 1px; "
-               "min-height: 20px; }\n"
+               "padding-left: 0; padding-right: 0; min-height: 20px; }\n"
                # Live cards' Focus / Disconnect: just the icon, so the card
                # is one text line tall.
                "button.rcm-cardbtn { padding: 0 2px; min-height: 0; "
@@ -1182,10 +1257,14 @@ class Win(Gtk.Window):
         """The Connect row, framed against the list it acts on."""
         self.button_box = Gtk.FlowBox()
         self.button_box.set_selection_mode(Gtk.SelectionMode.NONE)
-        self.button_box.set_max_children_per_line(4)
+        # Homogeneous: every button as wide as the widest. START, not FILL:
+        # the row is only as wide as its buttons, so they are not stretched
+        # to share the window's width; they wrap only when it runs out.
+        self.button_box.set_max_children_per_line(16)
         self.button_box.set_row_spacing(4)
         self.button_box.set_column_spacing(4)
         self.button_box.set_homogeneous(True)
+        self.button_box.set_halign(Gtk.Align.START)
         self.button_box.set_border_width(4)
         self.rebuild_buttons()
         # A frame tied to the list above it: these buttons act on that list,
@@ -1266,6 +1345,8 @@ class Win(Gtk.Window):
         self.proto_chips = {}
         for proto in protocols_safe().values():
             chip = Gtk.ToggleButton(label=proto.label)
+            chip.get_style_context().add_class(filter_css_class(proto.id))
+            chip.set_tooltip_text(f"Only rows that offer {proto.label}")
             chip.connect("toggled", lambda *_: self.reload())
             self.proto_chips[proto.id] = chip
             row.pack_start(chip, False, False, 0)
@@ -1478,7 +1559,7 @@ class Win(Gtk.Window):
         tile.rcm_sel = c.sel
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         box.set_border_width(4)
-        box.set_size_request(132, -1)   # room for two chips side by side
+        box.set_size_request(MACHINE_SIZE[0] + 8, -1)
 
         top = Gtk.Box()
         check = Gtk.CheckButton()
@@ -1493,8 +1574,7 @@ class Win(Gtk.Window):
         # whole tile, so a machine with many protocols spills its chips into
         # the space either side of the case instead of stacking one per row.
         overlay.set_halign(Gtk.Align.FILL)
-        machine = Gtk.Image.new_from_icon_name("computer", Gtk.IconSize.DIALOG)
-        machine.set_pixel_size(72)
+        machine = machine_image()
         machine.set_halign(Gtk.Align.CENTER)
         overlay.add(machine)
         # The chips ride on the screen of the machine: two per row, wrapping
@@ -1507,7 +1587,11 @@ class Win(Gtk.Window):
         chip_grid.set_column_spacing(1)
         chip_grid.set_halign(Gtk.Align.CENTER)
         chip_grid.set_valign(Gtk.Align.CENTER)
-        chip_grid.set_margin_bottom(16)      # sit on the screen, not the base
+        # Centred on the screen above the taskbar, not on the whole drawing:
+        # a bottom margin twice the distance between the two centres.
+        top, bottom, height = MACHINE_SCREEN
+        chip_grid.set_margin_bottom(
+            round((height - top - bottom) * MACHINE_SIZE[1] / height))
         for pid in c.protocols:
             proto = registry.get(pid)
             if not proto:
@@ -1515,12 +1599,8 @@ class Win(Gtk.Window):
             chip = Gtk.EventBox()
             chip.rcm_pid = pid
             label = Gtk.Label()
-            name = GLib.markup_escape_text(proto.label)
-            if pid == c.default_protocol:
-                name = f"<u>{name}</u>"
-            label.set_markup(
-                f'<span background="{resolve_colour(proto.color)}" '
-                f'foreground="#ffffff" size="small"> {name} </span>')
+            label.set_markup(tile_chip_markup(proto, pid == c.default_protocol))
+            chip.rcm_markup = (proto, pid == c.default_protocol)
             chip.add(label)
             chip.set_tooltip_text(
                 f"double-click: connect {c.sel} over {proto.label}"
@@ -1595,6 +1675,14 @@ class Win(Gtk.Window):
                 self.connect_selected(pid, "", [c])
             return True
         if event.type == Gdk.EventType.BUTTON_PRESS:
+            # Sink the chip for a moment, as a button does under a click.
+            label = widget.get_child()
+            proto, is_default = getattr(widget, "rcm_markup", (None, False))
+            if proto is not None and isinstance(label, Gtk.Label):
+                label.set_markup(tile_chip_markup(proto, is_default, True))
+                GLib.timeout_add(CHIP_PRESS_MS, lambda: (
+                    label.set_markup(tile_chip_markup(proto, is_default)),
+                    False)[1])
             # Not get_ancestor(FlowBoxChild): the chips sit in a FlowBox of
             # their own, so each is wrapped in one too. The tile is the
             # ancestor that carries the connection.
@@ -2631,6 +2719,14 @@ class Win(Gtk.Window):
         for i, title in enumerate(("Host", "Result")):
             cell = Gtk.CellRendererText(ellipsize=Pango.EllipsizeMode.END)
             column = Gtk.TreeViewColumn(title, cell, text=i)
+            if i == 0:
+                # An ellipsizing column is only ever given its header's width,
+                # which hid every name behind "…": measure the longest name
+                # as drawn, and stop at a sane cap past which it ellipsizes.
+                widest = max((view.create_pango_layout(c.sel).get_pixel_size()[0]
+                              for c in conns), default=0)
+                column.set_min_width(min(widest + 2 * cell.get_padding()[0] + 12,
+                                         420))
             column.set_resizable(True)
             column.set_expand(i == 1)
             view.append_column(column)
@@ -3848,8 +3944,25 @@ class Win(Gtk.Window):
             lbl = Gtk.Label()
             lbl.set_markup("<small>no protocols configured — see Protocols…</small>")
             self.button_box.add(lbl)
+        # One character of padding either side of the content, which sits at
+        # the left: the buttons share one width, so their names line up.
+        metrics = self.get_pango_context().get_metrics(None, None)
+        char = max(1, metrics.get_approximate_char_width() // Pango.SCALE)
         for pr in protos.values():
-            b = Gtk.Button(label=f"Connect {pr.label}")
+            # ▶ and the protocol's name, not "Connect RDP": the row then fits
+            # every protocol on one line far more often. The tooltip says it.
+            b = Gtk.Button()
+            content = Gtk.Box(spacing=max(2, char // 2))
+            content.set_halign(Gtk.Align.START)
+            content.set_margin_start(char)
+            content.set_margin_end(char)
+            content.pack_start(Gtk.Image.new_from_icon_name(
+                "media-playback-start-symbolic", Gtk.IconSize.BUTTON),
+                False, False, 0)
+            content.pack_start(Gtk.Label(label=pr.label), False, False, 0)
+            b.add(content)
+            b.set_tooltip_text(f"Connect {pr.label} — the ticked connections, "
+                               "else the selected ones")
             css = "suggested-action" if pr.color in ("", "accent") \
                 else protocol_css_class(pr.id)
             b.get_style_context().add_class(css)
@@ -4087,9 +4200,27 @@ class Win(Gtk.Window):
         renderer.connect("editing-started", self.on_cell_editing, True)
         renderer.connect("editing-canceled", self.on_cell_editing, False)
 
-    def on_cell_editing(self, _renderer, *args) -> None:
-        """Editing holds the repaints off until you are done."""
-        self._editing_cell = bool(args[-1])
+    def on_cell_editing(self, renderer, *args) -> None:
+        """Editing holds the repaints off until you are done.
+
+        And it opens only in the cell that was clicked: a press in another
+        column -- a protocol chip, say -- never hands its row's Host or User
+        cell an editor, whatever GTK's own focus bookkeeping would do.
+        """
+        starting = bool(args[-1])
+        if starting and len(args) >= 2:
+            pressed, when = getattr(self, "_press_column", (None, 0.0))
+            mine = next((col for col in self.tree.get_columns()
+                         if renderer in col.get_cells()), None)
+            if (pressed is not None and mine is not None and pressed is not mine
+                    and time.monotonic() - when < 1.5):
+                editable = args[0]
+                editable.set_property("editing-canceled", True)
+                GLib.idle_add(lambda: (editable.editing_done(),
+                                       editable.remove_widget(), False)[2])
+                self._editing_cell = False
+                return
+        self._editing_cell = starting
 
     def on_cell_edited(self, _renderer, path, text, column_index: int) -> None:
         self._editing_cell = False
@@ -4348,27 +4479,59 @@ class Win(Gtk.Window):
         if c and c.default_protocol:
             self.connect_selected(c.default_protocol, "", [c])
 
-    def chip_at_position(self, c, cell_x: int):
+    def chip_at_position(self, c, cell_x: int, path=None, column=None):
         """Which protocol chip a click at cell_x landed on, or None.
 
         Chips are Pango markup inside one text cell, so there are no per-chip
-        widgets to receive the click: the cell is measured with the same Pango
-        machinery that rendered it, giving each chip its x-range.
+        widgets to receive the click. The cell's own markup is laid out again,
+        in the row's weight -- a live row is bold, and bold chips are wider --
+        and Pango says which character sits under the click.
         """
         registry = protocols_safe()
-        x = 4   # renderer left padding
+        pids = [pid for pid in c.protocols if pid in registry]
+        markup = protocol_badges(pids, registry, c.default_protocol)
+        weight = 0
+        if path is not None and self.store is not None:
+            try:
+                weight = int(self.store[path][C_WEIGHT])
+            except (ValueError, TypeError):
+                weight = 0
+        if weight:
+            markup = f'<span weight="{weight}">{markup}</span>'
         layout = self.tree.create_pango_layout("")
-        for pid in c.protocols:
-            proto = registry.get(pid)
-            if not proto:
-                continue
-            layout.set_markup(f" {GLib.markup_escape_text(proto.label)} ")
-            width = layout.get_pixel_size()[0]
-            if x <= cell_x <= x + width:
+        layout.set_markup(markup)
+        # Where the text starts: the cell area inside the column's background,
+        # then the renderer's own padding.
+        origin = 4
+        if path is not None and column is not None:
+            cell = self.tree.get_cell_area(path, column)
+            back = self.tree.get_background_area(path, column)
+            renderers = column.get_cells()
+            pad = renderers[0].get_padding()[0] if renderers else 2
+            origin = cell.x - back.x + pad
+        x = cell_x - origin
+        if x < 0 or x >= layout.get_pixel_size()[0]:
+            return None
+        _inside, index, _trailing = layout.xy_to_index(
+            int(x * Pango.SCALE), int(layout.get_pixel_size()[1] * Pango.SCALE / 2))
+        for start, end, pid in badge_ranges(pids, registry):
+            if start <= index < end:
                 return pid
-            layout.set_markup(" ")
-            x += width + layout.get_pixel_size()[0]   # chip + joining space
-        return None
+        return None                          # the space between two chips
+
+    def flash_chip(self, path, c, pid: str) -> None:
+        """Draw a pressed chip darker for a moment: the click registered."""
+        registry = protocols_safe()
+        row = Gtk.TreeRowReference.new(self.store, path)
+        self.store[path][C_PROTOS] = protocol_badges(
+            c.protocols, registry, c.default_protocol, pressed=pid)
+
+        def restore():
+            if row.valid():
+                self.store[row.get_path()][C_PROTOS] = protocol_badges(
+                    c.protocols, registry, c.default_protocol)
+            return False
+        GLib.timeout_add(CHIP_PRESS_MS, restore)
 
     @help_topic_gui("protocol-chips", "Protocol chips",
                     ("chips", "left-click", "launcher menu"),
@@ -4377,10 +4540,13 @@ class Win(Gtk.Window):
         """The coloured protocol chips on a row are controls, not just labels.
 
         Left-clicking a chip connects to that row over that protocol with its
-        default launcher. Right-clicking opens the launcher menu — every
-        command configured for the protocol, the default marked — plus a jump
-        to editing the launchers. The chip for the connection's default
-        protocol is underlined.
+        default launcher; the chip sinks for a moment to show the click
+        landed, and a double-click still connects only once. Right-clicking
+        opens the launcher menu — every command configured for the protocol,
+        the default marked — plus a jump to editing the launchers. The chip
+        for the connection's default protocol is underlined. A click beside
+        the chips only selects the row: it never opens the Host or User cell
+        for editing, which takes a click on that cell itself.
         """
         registry = protocols_safe()
         proto = registry.get(pid)
@@ -4405,15 +4571,33 @@ class Win(Gtk.Window):
 
     def on_tree_click(self, _w, event):
         info = self.tree.get_path_at_pos(int(event.x), int(event.y))
+        # Remembered so an editor can only open in the cell that was clicked.
+        self._press_column = (info[1] if info else None, time.monotonic())
         if info and getattr(self, "protocols_column", None) is not None:
             path, column, cell_x, _cell_y = info
             if column is self.protocols_column:
                 sel = self.store[self.store.get_iter(path)][C_SEL]
                 c = rcm.find(sel) if sel else None
-                pid = self.chip_at_position(c, cell_x) if c else None
+                pid = self.chip_at_position(c, cell_x, path, column) if c else None
                 if c and pid:
+                    # A double-click is press, press, 2BUTTON_PRESS: the
+                    # first press connects, and the second press on the same
+                    # chip within the double-click time is the same gesture.
+                    if event.type != Gdk.EventType.BUTTON_PRESS:
+                        return True
+                    last = getattr(self, "_last_chip_press", None)
+                    self._last_chip_press = (sel, pid, event.button, event.time)
+                    window = Gtk.Settings.get_default().get_property(
+                        "gtk-double-click-time")
+                    if (last and last[:3] == (sel, pid, event.button)
+                            and 0 <= event.time - last[3] <= window):
+                        return True
                     if event.button == 1:
-                        self.connect_selected(pid, "", [c])
+                        self.flash_chip(path, c, pid)
+                        # After the darker chip has been drawn: a launch with
+                        # a pre hook or a tunnel can hold this thread a while.
+                        GLib.timeout_add(CHIP_PRESS_MS // 3, lambda: (
+                            self.connect_selected(pid, "", [c]), False)[1])
                         return True
                     if event.button == 3:
                         self.open_chip_menu(c, pid, event)
