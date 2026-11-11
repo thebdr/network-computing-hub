@@ -2591,14 +2591,99 @@ def read_log_events(days: int = 7, kind: str = "", sel: str = "") -> list[dict]:
 # online probe + Wake-on-LAN
 # --------------------------------------------------------------------------- #
 def probe_host(host: str, port: int, timeout: float = 1.0) -> bool:
-    """One TCP connect, the whole probe. Serial by design: the caller runs ONE
-    of these at a time so 500 hosts never means 500 sockets."""
+    """One TCP connect: does anything accept on host:port."""
     import socket
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
+
+
+PROBE_TIMEOUT = 1.0     # seconds, per ping and per TCP connect
+PROBE_PARALLEL = 16     # hosts in flight at once, so 500 never means 500 sockets
+# TEST-NET-1 (RFC 5737), assigned to no machine anywhere. A port that accepts a
+# connection there is answered by something on the way -- a proxy taking every
+# web connection, as on the network this was written on -- and a connect to
+# that port proves nothing about a real host.
+PROBE_SENTINEL = "192.0.2.1"
+
+
+def probe_targets(conns: list[Conn]) -> dict[str, list[int]]:
+    """{host: ports to try when it ignores ping}, in the order given.
+
+    The ports are each enabled protocol's, default first. A connection behind
+    a via gateway is left out: only the gateway can reach it.
+    """
+    targets: dict[str, list[int]] = {}
+    for c in conns:
+        if not c.host or (c.extra.get("rcm-via") or "").strip():
+            continue
+        ports = targets.setdefault(c.host, [])
+        default = c.default_protocol
+        for pid in ([default] if default else []) + [
+                p for p in c.protocols if p != default]:
+            port = c.port_for(pid)
+            if port and port not in ports:
+                ports.append(port)
+    return targets
+
+
+def sweep_reachability(conns: list[Conn], report, stop=lambda: False) -> None:
+    """Decide every probe-able host, calling report(host, reachable, how).
+
+    Ping first, all hosts at once: it answers for nearly every machine.
+    Only hosts that stay silent get a TCP connect to each of their ports,
+    skipping any port the network itself answers (PROBE_SENTINEL). `how` is
+    "ping", "tcp/<port>", or "" for offline. stop() ends the sweep early.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    targets = probe_targets(conns)
+    if not targets:
+        return
+    order = list(targets)
+
+    def ping(host: str) -> bool | None:
+        try:
+            return PLATFORM.ping(host, PROBE_TIMEOUT)
+        except Exception:
+            return None
+
+    silent: list[str] = []
+    pool = ThreadPoolExecutor(PROBE_PARALLEL)
+    try:
+        asked = {pool.submit(ping, host): host for host in order}
+        for done in as_completed(asked):
+            if stop():
+                return
+            if done.result():
+                report(asked[done], True, "ping")
+            else:
+                silent.append(asked[done])
+        if not silent:
+            return
+        silent.sort(key=order.index)
+        ports = sorted({p for host in silent for p in targets[host]})
+        blind = {port for port, hit in zip(ports, pool.map(
+            lambda p: probe_host(PROBE_SENTINEL, p, PROBE_TIMEOUT), ports)) if hit}
+
+        def connect(host: str) -> int | None:
+            for port in targets[host]:
+                if stop():
+                    return None
+                if port not in blind and probe_host(host, port, PROBE_TIMEOUT):
+                    return port
+            return 0
+
+        asked = {pool.submit(connect, host): host for host in silent}
+        for done in as_completed(asked):
+            if stop():
+                return
+            port = done.result()
+            if port is not None:
+                report(asked[done], bool(port), f"tcp/{port}" if port else "")
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def learn_mac(host: str) -> str:
