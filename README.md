@@ -419,9 +419,13 @@ aside on Setup, Logs and the first-run checklist.
 docstrings that implement each behaviour, and every topic ends with an Open-code
 link to that file and line.
 
-The **Net** column probes reachability (one TCP connect at a time, visible rows
-first, paused while hidden — cheap even at hundreds of hosts); offline rows with a
-learned MAC offer **⚡ Wake** (`rcm wake <sel>`). Right-click also gives **Open
+The **Net** column probes reachability: every host is pinged first, 16 at a time,
+and only those that ignore ping get a TCP connect to each of their protocols'
+ports — skipping a port the network answers by itself, so a proxy that takes every
+web connection cannot make a host look online. Visible rows first, a sweep a minute,
+**⟳** in the title bar for one now, paused while hidden; connections behind a via
+gateway are not probed. Offline rows with a learned MAC offer **⚡ Wake**
+(`rcm wake <sel>`). Right-click also gives **Open
 terminal** (embedded VTE tabs when the library is present, each in its own scroller
 so the prompt never scrolls out of reach — right-click the *tab* to pop that terminal
 into its own window, or right-click inside it for **Send script** — it types a file from `scripts/` into the live session with the
@@ -525,6 +529,11 @@ Things that cost real time, kept here so they cost you less:
 - **PowerShell writes to a pipe in the OEM code page.** A script whose output is read
   back sets `[Console]::OutputEncoding` to UTF-8 (the backups' does), or `Café Box.rdp`
   never matches its own path.
+- **A TCP connect can be answered by the network, not the host.** On a corporate
+  network every address "accepted" 80 and 443 — including `192.0.2.1`, which
+  RFC 5737 reserves so that no machine ever has it — so a Web connection showed
+  online wherever it was. Ask the reserved address first; a port it answers on
+  proves nothing about anyone else.
 - **Never poll through PowerShell.** Session detection once ran `Get-CimInstance
   Win32_Process` every 4 s on the manager's main loop: 1.5–3 s a call on a quiet PC,
   26 s on a busy one, and the window was "Not responding" two thirds of the time —

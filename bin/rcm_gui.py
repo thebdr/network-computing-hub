@@ -273,8 +273,8 @@ class Win(Gtk.Window):
         hb.pack_start(b)
 
         b = Gtk.Button.new_from_icon_name("view-refresh-symbolic", Gtk.IconSize.BUTTON)
-        b.set_tooltip_text("Refresh")
-        b.connect("clicked", lambda *_: self.reload())
+        b.set_tooltip_text("Refresh — re-read the files and re-probe the network")
+        b.connect("clicked", lambda *_: (self.reload(), self.reprobe()))
         hb.pack_end(b)
 
         # Layout switcher (design 6c): a popover of radio rows, one per layout,
@@ -1140,22 +1140,6 @@ class Win(Gtk.Window):
         scroller.set_shadow_type(Gtk.ShadowType.IN)
         return scroller
 
-    def build_filter_row(self, placeholder: str):
-        row = Gtk.Box(spacing=6)
-        self.filter_entry = Gtk.SearchEntry()
-        self.filter_entry.set_placeholder_text(placeholder)
-        self.filter_entry.set_text(self.query_text)
-        self.filter_entry.connect("search-changed", self.on_filter_changed)
-        row.pack_start(self.filter_entry, True, True, 0)
-        recheck = Gtk.Button(label="Recheck")
-        recheck.set_tooltip_text("Re-probe the visible rows now")
-        recheck.connect("clicked", lambda *_: self.recheck_visible())
-        row.pack_start(recheck, False, False, 0)
-        new_button = Gtk.Button(label="New")
-        new_button.connect("clicked", lambda *_: self.edit_dialog(None))
-        row.pack_start(new_button, False, False, 0)
-        return row
-
     def on_filter_changed(self, entry) -> None:
         self.query_text = entry.get_text().strip()
         self.reload()
@@ -1285,13 +1269,6 @@ class Win(Gtk.Window):
             chip.connect("toggled", lambda *_: self.reload())
             self.proto_chips[proto.id] = chip
             row.pack_start(chip, False, False, 0)
-        recheck = Gtk.Button(label="Recheck")
-        recheck.set_tooltip_text("Re-probe the visible rows now")
-        recheck.connect("clicked", lambda *_: self.recheck_visible())
-        row.pack_start(recheck, False, False, 0)
-        new_button = Gtk.Button(label="New")
-        new_button.connect("clicked", lambda *_: self.edit_dialog(None))
-        row.pack_start(new_button, False, False, 0)
         outer.pack_start(row, False, False, 0)
 
         paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -2208,13 +2185,18 @@ class Win(Gtk.Window):
     def start_prober(self) -> None:
         """The Net column shows whether a machine answers at all.
 
-        ● reachable, ○ offline, ◌ not probed yet. The probe is one TCP connect
-        to the connection's default-protocol port with a ~1s timeout, and only
-        ONE probe socket exists at any moment — visible rows are probed first,
-        a full sweep of everything else trickles along behind, and probing
-        pauses entirely while the window is hidden. That is what keeps 500
-        hosts cheap. "Recheck" re-probes the visible rows on demand; offline
-        rows offer ⚡ Wake when a MAC has been learned.
+        ● reachable, ○ offline, ◌ not probed. Each sweep first pings every
+        host at once — 16 in flight, a second each — which answers for nearly
+        every machine. Only hosts that ignore ping then get a TCP connect to
+        each of their protocols' ports, default first. A port that also
+        "connects" to 192.0.2.1, an address no machine has, is being answered
+        by the network itself (a proxy that takes every web connection) and is
+        skipped: it would call any host reachable. Connections behind a via
+        gateway stay ◌, since only the gateway can reach them.
+
+        Visible rows go first, a sweep runs every minute, ⟳ Refresh in the
+        title bar starts one now, and probing pauses while the window is
+        hidden. Offline rows offer ⚡ Wake when a MAC has been learned.
         """
         import threading
         self.net_state: dict = {}
@@ -2229,30 +2211,41 @@ class Win(Gtk.Window):
                 order = [c for c in rcm.conns_cached()
                          if self.connection_matches_query(c)]
                 order += [c for c in rcm.conns_cached() if c not in order]
+                sels_of: dict[str, list[str]] = {}
                 for c in order:
+                    sels_of.setdefault(c.host, []).append(c.sel)
+
+                def report(host, reachable, how):
+                    for sel in sels_of.get(host, []):
+                        previous = self.net_state.get(sel)
+                        self.net_state[sel] = reachable
+                        if previous is not None and previous != reachable:
+                            rcm.log_event("probe", sel=sel,
+                                          state="up" if reachable else "down",
+                                          **({"by": how} if how else {}))
+                    GLib.idle_add(self.paint_net_cells)
+
+                try:
+                    rcm.sweep_reachability(
+                        order, report,
+                        stop=lambda: (generation != self.prober_generation
+                                      or not self.get_visible()))
+                except Exception as e:     # a broken protocols.conf, say
+                    GLib.idle_add(self.say, f"network probe stopped: {e}")
+                for _ in range(60):        # rest between sweeps, unless ⟳
                     if generation != self.prober_generation:
                         break
-                    if not self.get_visible():
-                        break
-                    reachable = rcm.probe_host(c.host, c.port_for(c.default_protocol))
-                    previous = self.net_state.get(c.sel)
-                    self.net_state[c.sel] = reachable
-                    if previous is not None and previous != reachable:
-                        rcm.log_event("probe", sel=c.sel,
-                                      state="up" if reachable else "down")
-                    GLib.idle_add(self.paint_net_cells)
-                    time.sleep(0.4)
-                time.sleep(60)   # rest between sweeps
+                    time.sleep(1)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def recheck_visible(self) -> None:
-        """Toolbar Recheck: forget visible results and let the prober redo them."""
-        for c in rcm.conns_cached():
-            if self.connection_matches_query(c):
-                self.net_state.pop(c.sel, None)
+    def reprobe(self) -> None:
+        """⟳ Refresh: forget every result and sweep again now."""
+        if not hasattr(self, "net_state"):
+            return
+        self.net_state.clear()
         self.prober_generation += 1
-        self.say("re-probing visible rows")
+        self.paint_net_cells()
 
     def net_cell(self, c) -> str:
         state = getattr(self, "net_state", {}).get(c.sel)

@@ -253,6 +253,21 @@ class LinuxX11:
         return ""
 
     # ---- network / displays ----------------------------------------------- #
+    def ping(self, host: str, timeout: float = 1.0) -> bool | None:
+        """One ICMP echo through the system ping (raw ICMP needs privileges
+        it already has). None when it could not be asked: no ping, or a name
+        that does not resolve."""
+        if not shutil.which("ping"):
+            return None
+        wait = str(max(1, int(timeout + 0.999)))     # iputils takes whole seconds
+        try:
+            done = subprocess.run(["ping", "-n", "-q", "-c", "1", "-W", wait, host],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=timeout + 5)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return {0: True, 1: False}.get(done.returncode)   # 2: could not send
+
     def mac_for_host(self, host: str) -> str:
         neigh = subprocess.run(["ip", "neigh", "show", host],
                                capture_output=True, text=True).stdout
@@ -714,6 +729,42 @@ class WindowsNative:
         return ""
 
     # ---- network / displays ----------------------------------------------- #
+    def ping(self, host: str, timeout: float = 1.0) -> bool | None:
+        """One ICMP echo, in this process (IcmpSendEcho needs no admin and
+        starts no ping.exe). None when it could not be asked: a name that
+        does not resolve, or an IPv6 address, which this call cannot take."""
+        import ctypes
+        import socket
+        import struct
+        from ctypes import wintypes as wt
+        try:
+            address = socket.gethostbyname(host)
+        except OSError:
+            return None
+        icmp = ctypes.WinDLL("iphlpapi", use_last_error=True)
+        icmp.IcmpCreateFile.restype = wt.HANDLE
+        icmp.IcmpSendEcho.argtypes = [wt.HANDLE, wt.ULONG, ctypes.c_void_p,
+                                      wt.WORD, ctypes.c_void_p, ctypes.c_void_p,
+                                      wt.DWORD, wt.DWORD]
+        icmp.IcmpSendEcho.restype = wt.DWORD
+        icmp.IcmpCloseHandle.argtypes = [wt.HANDLE]
+        handle = icmp.IcmpCreateFile()
+        if not handle or handle == wt.HANDLE(-1).value:
+            return None
+        try:
+            payload = b"rcm"
+            reply = ctypes.create_string_buffer(256)   # ICMP_ECHO_REPLY + data
+            # IPAddr is the address in network byte order, as inet_aton's bytes.
+            target = struct.unpack("<I", socket.inet_aton(address))[0]
+            count = icmp.IcmpSendEcho(handle, target, payload, len(payload),
+                                      None, reply, len(reply),
+                                      max(1, int(timeout * 1000)))
+            # A router's "host unreachable" is a reply too; only IP_SUCCESS
+            # (Status, after the 4-byte Address) means the host itself answered.
+            return bool(count) and struct.unpack_from("<I", reply.raw, 4)[0] == 0
+        finally:
+            icmp.IcmpCloseHandle(handle)
+
     def mac_for_host(self, host: str) -> str:
         out = subprocess.run(["arp", "-a", host], capture_output=True,
                              text=True,
