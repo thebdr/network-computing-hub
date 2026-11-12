@@ -145,7 +145,7 @@ def filter_css_class(pid: str) -> str:
     return protocol_css_class(pid).replace("rcm-proto-", "rcm-filter-", 1)
 
 
-def build_protocol_css(protos) -> bytes:
+def build_protocol_css(protos, dark: bool = False) -> bytes:
     """One CSS rule per protocol that defines its own colour.
 
     Colours are config, so the stylesheet has to be generated rather than
@@ -159,7 +159,10 @@ def build_protocol_css(protos) -> bytes:
         # with it while on -- the same colour as its Connect button and its
         # chips, so a chip, a button and a filter read as one protocol.
         fill = colour if colour.startswith("#") else "@theme_selected_bg_color"
-        out.append(f"button.{filter_css_class(pr.id)} label {{ color: {fill}; "
+        # On a dark theme the deeper protocol colours (a grey, a purple)
+        # sink into the button as text: lift them toward white, as text only.
+        text = f"mix({fill}, #ffffff, 0.45)" if dark else fill
+        out.append(f"button.{filter_css_class(pr.id)} label {{ color: {text}; "
                    f"font-weight: bold; }}\n"
                    f"button.{filter_css_class(pr.id)}:checked {{ "
                    f"background-image: none; background-color: {fill}; }}\n"
@@ -209,20 +212,46 @@ def pretty_key(binding: str) -> str:
     return "+".join([m.replace("Primary", "Ctrl") for m in mods] + [key])
 
 
+_CSS_PROVIDER = None
+
+
 def install_css(protos=None, widget=None) -> None:
+    """Install the generated stylesheet, replacing the one installed before.
+
+    Run again whenever the protocols or the theme change: the accent and
+    whether the theme is dark are read from the theme each time.
+    """
     # Pull the theme's real accent so "accent" protocols match their button.
-    global _ACCENT
+    global _ACCENT, _CSS_PROVIDER
+    dark = False
     if widget is not None:
-        ok, rgba = widget.get_style_context().lookup_color("theme_selected_bg_color")
+        context = widget.get_style_context()
+        ok, rgba = context.lookup_color("theme_selected_bg_color")
         if ok:
             _ACCENT = "#{:02x}{:02x}{:02x}".format(
                 int(rgba.red * 255), int(rgba.green * 255), int(rgba.blue * 255))
+        ok, bg = context.lookup_color("theme_bg_color")
+        dark = ok and (0.299 * bg.red + 0.587 * bg.green + 0.114 * bg.blue) < 0.5
     prov = Gtk.CssProvider()
-    prov.load_from_data(build_protocol_css(protos or {}))
+    prov.load_from_data(build_protocol_css(protos or {}, dark))
     screen = Gdk.Screen.get_default()
     if screen:
+        if _CSS_PROVIDER is not None:
+            Gtk.StyleContext.remove_provider_for_screen(screen, _CSS_PROVIDER)
         Gtk.StyleContext.add_provider_for_screen(
             screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        _CSS_PROVIDER = prov
+
+
+def set_dark(on: bool) -> None:
+    """Ask the GTK theme for its dark variant, or for its usual self.
+
+    Adwaita has both built into GTK itself, so the .exe needs no theme
+    files; on Linux, `off` leaves a dark system theme dark.
+    """
+    settings = Gtk.Settings.get_default()
+    if settings is not None:
+        settings.set_property("gtk-application-prefer-dark-theme", bool(on))
 
 # TreeStore columns. Checkboxes and selection are deliberately independent:
 # the Connect buttons act on what is ticked, the context menu on what is
@@ -356,6 +385,7 @@ class Win(Gtk.Window):
         # each with a one-line description. The choice persists as `layout =`
         # in ui.conf. Layouts not yet built in this branch are insensitive.
         self.ui_state = rcm.load_ui_state()
+        set_dark(self.ui_state["dark"])     # before anything is drawn light
         # Copy/paste holds real objects, not text: it survives a reload and
         # knows the difference between a group and its members.
         self.clipboard = {"conns": [], "groups": []}
@@ -430,6 +460,17 @@ class Win(Gtk.Window):
             row.set_sensitive(layout_id in self.IMPLEMENTED_LAYOUTS)
             row.connect("toggled", self.on_layout_chosen, layout_id)
             box.pack_start(row, False, False, 2)
+        box.pack_start(Gtk.Separator(), False, False, 4)
+        dark_row = Gtk.Box(spacing=12)
+        dark_label = Gtk.Label(xalign=0, label="Dark mode")
+        dark_row.pack_start(dark_label, True, True, 0)
+        self.dark_switch = Gtk.Switch()
+        self.dark_switch.set_active(self.ui_state["dark"])
+        self.dark_switch.set_tooltip_text("The theme's dark variant — saved as "
+                                          "dark = in ui.conf")
+        self.dark_switch.connect("notify::active", self.on_dark_toggled)
+        dark_row.pack_start(self.dark_switch, False, False, 0)
+        box.pack_start(dark_row, False, False, 2)
         logs_row = Gtk.ModelButton(label="Logs…")
         logs_row.connect("clicked", lambda *_: (popover.popdown(), self.show_logs()))
         setup_row = Gtk.ModelButton(label="Setup…")
@@ -438,13 +479,35 @@ class Win(Gtk.Window):
         box.pack_start(logs_row, False, False, 0)
         box.pack_start(setup_row, False, False, 0)
         foot = Gtk.Label(xalign=0)
-        foot.set_markup("<small>saved as <tt>layout =</tt> in ui.conf</small>")
+        foot.set_markup("<small>saved as <tt>layout =</tt> and <tt>dark =</tt> "
+                        "in ui.conf</small>")
         foot.get_style_context().add_class("dim-label")
         foot.set_margin_top(6)
         box.pack_start(foot, False, False, 0)
         box.show_all()
         popover.add(box)
         return popover
+
+    @help_topic_gui("dark-mode", "Dark mode", ("dark", "theme", "night"),
+                    section="The window")
+    def on_dark_toggled(self, switch, _param) -> None:
+        """Layout ▸ Dark mode switches the window to its theme's dark variant.
+
+        It is GTK's own dark Adwaita, so every dialog follows, and it is
+        saved as `dark = on` in ui.conf for the next start. Off leaves the
+        theme as it is: on Linux a dark system theme stays dark either way.
+        The colours the manager adds itself — the accent, the group bands,
+        the filter chips' text — are rebuilt for the new background.
+        """
+        on = switch.get_active()
+        if on == self.ui_state["dark"]:
+            return
+        self.ui_state["dark"] = on
+        rcm.save_ui_state(self.ui_state)
+        set_dark(on)
+        install_css(protocols_safe(), self)
+        self.apply_layout(self.ui_state["layout"])
+        self.say(f"dark mode {'on' if on else 'off'} — saved in ui.conf")
 
     def on_layout_chosen(self, radio, layout_id: str) -> None:
         if not radio.get_active() or layout_id == self.ui_state["layout"]:

@@ -1205,6 +1205,9 @@ sidebar = on
 # Browse only: list | icons. Icons draws each connection as a machine with its
 # protocols on it, and a details pane beside the grid.
 browse_view = list
+# on: ask the GTK theme for its dark variant (the Layout menu's switch). off
+# leaves the theme as it is, so a dark system theme on Linux stays dark.
+dark = off
 
 [tabs]
 # Pinned filter tabs, shared by every layout. One per line:
@@ -2873,7 +2876,7 @@ def load_ui_state() -> dict:
     Older files naming rail, spotlight or cockpit are read as Browse.
     """
     state = {"layout": "browse", "tabs": [], "editor": "", "sidebar": True,
-             "browse_view": "list"}
+             "browse_view": "list", "dark": False}
     if not UI_CONF.is_file():
         return state
     parser = configparser.ConfigParser(inline_comment_prefixes=(";",))
@@ -2885,6 +2888,10 @@ def load_ui_state() -> dict:
     state["sidebar"] = parser.getboolean("ui", "sidebar", fallback=True)
     view = parser.get("ui", "browse_view", fallback="list").strip().lower()
     state["browse_view"] = view if view in ("list", "icons") else "list"
+    try:
+        state["dark"] = parser.getboolean("ui", "dark", fallback=False)
+    except ValueError:
+        state["dark"] = False
     if parser.has_section("tabs"):
         for _key, raw in sorted(parser.items("tabs")):
             parts = (raw.split("|") + ["", "", ""])[:3]
@@ -2901,6 +2908,7 @@ def save_ui_state(state: dict) -> None:
              f"layout = {state.get('layout', 'browse')}",
              f"sidebar = {'on' if state.get('sidebar', True) else 'off'}",
              f"browse_view = {state.get('browse_view', 'list')}",
+             f"dark = {'on' if state.get('dark', False) else 'off'}",
              "", "[tabs]"]
     for index, (label, group, text) in enumerate(state.get("tabs", []), start=1):
         lines.append(f"tab.{index} = {label}|{group}|{text}")

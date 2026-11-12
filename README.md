@@ -390,6 +390,10 @@ failed.
 
 ## The manager
 
+The Layout button's menu also holds **Dark mode**: the GTK theme's dark variant
+(Adwaita's, built into GTK, so the `.exe` has it too), saved as `dark = on` in
+`ui.conf`. Off leaves the theme alone, so a dark system theme on Linux stays dark.
+
 The window has three layouts (the Layout button, saved as `layout =` in `ui.conf`):
 **Browse** — the everyday view: a filter-first flat list with match highlighting, a
 collapsible group sidebar (the ⊞ button), Live and per-protocol filter chips (each in
@@ -664,7 +668,8 @@ since the `.desktop` it writes references the icon by name.
 python -m unittest discover -s tests
 ```
 
-Standard library only, so any Python 3.11+ runs them — the query language so far.
+Standard library only, so any Python 3.11+ runs them — the query language and
+`ui.conf` so far.
 
 ## License
 
