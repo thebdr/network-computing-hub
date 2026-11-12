@@ -441,7 +441,7 @@ by kind, text and range back to 90 days, shows each event with its captured outp
 and exports the filtered view as CSV. History is the same page pre-filtered to one
 connection. **Tags** (`rcm-tags`, edited in the Edit dialog) are free labels
 orthogonal to groups: they appear as #chips with counts under TAGS in the Browse
-sidebar — click one to filter — and match in the filter box. **Workspaces**
+sidebar — click one to filter — and match in the filter box (`#tag`). **Workspaces**
 (`workspaces.conf`, `rcm workspace <name>`) open named sets together, focusing
 members that are already live; they sit under WORKSPACES in the same sidebar
 (click shows the members, double-click connects them all), a member with a
@@ -450,6 +450,38 @@ monitor number gets its window moved there once it appears, and
 the whole set. Build them with right-click ▸ **Save as workspace…** on a
 selection, then shape members, launch order (drag), monitors and the shortcut
 under **Setup ▸ Workspaces**.
+
+### Filtering
+
+The filter box takes plain text, or keys each followed by a regex. Plain text is a
+regex tried against every field — the `Group/Name` path, host, user and tags — so a
+word still finds whatever contains it. Matching ignores case and finds the regex
+anywhere in the value; `^` and `$` pin it.
+
+| Key | Looks at |
+|---|---|
+| `#group` `#name` `#host` `#user` | that field |
+| `#tag` | each tag on its own |
+| `#and` | nothing new: terms side by side must all hold anyway |
+| `#or` | alternatives; binds looser than and — `a #or b #and c` is a, or b and c |
+| `#not` | negates the term after it |
+
+A key starts with `#` at the start or after a space and ends at the next space; its
+regex runs up to the next ` #` or the end (a `#` inside a word, `a#b`, is text).
+Text straight after `#and`, `#or` or `#not` is a term over every field.
+
+```
+#group trib #name sorter        the sorters in TRIB
+#name sorter #not maint         sorters, without the maintenance ones
+#host \.1[0-3]$ #or #tag plc    four hosts, or anything tagged plc
+#user ^$                        connections with no username set
+```
+
+Half-typed input never empties the list: a key with nothing after it, a partial key
+at the end, or a trailing operator adds nothing. A regex that does not compile is
+matched as plain text and an unknown key matches nothing; the status bar says which.
+Matches are highlighted in the Connection and Host columns, and Ctrl+T pins the
+whole query as a tab.
 
 ## Keyboard shortcuts
 
@@ -625,6 +657,14 @@ named with its full path (`Plant/Line2`). Names, hosts and usernames are correct
 puts the SVG in `hicolor/scalable/apps` and renders PNGs for each size, picking the
 right variant per size. `rcm gen-launcher` installs it automatically if it is missing,
 since the `.desktop` it writes references the icon by name.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests
+```
+
+Standard library only, so any Python 3.11+ runs them — the query language so far.
 
 ## License
 

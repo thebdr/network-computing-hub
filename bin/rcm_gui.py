@@ -812,12 +812,14 @@ class Win(Gtk.Window):
         elif query and not (c.group == query or
                             c.group.startswith(query + "/")):
             return False
-        if self.query_text:
-            haystack = " ".join([c.sel, c.host, c.username,
-                                 " ".join("#" + t for t in c.tags)]).lower()
-            if self.query_text.lower() not in haystack:
-                return False
-        return True
+        return self.parsed_query().matches(c)
+
+    def parsed_query(self) -> "rcm.Query":
+        """The filter box's text as a query, parsed once per text."""
+        if getattr(self, "_query_source", None) != self.query_text:
+            self._query = rcm.parse_query(self.query_text)
+            self._query_source = self.query_text
+        return self._query
 
     def refresh_health(self) -> None:
         problems = rcm.config_health()
@@ -1217,6 +1219,9 @@ class Win(Gtk.Window):
 
     def on_filter_changed(self, entry) -> None:
         self.query_text = entry.get_text().strip()
+        problems = self.parsed_query().problems
+        if problems:
+            self.say("filter: " + problems[0])
         self.reload()
 
     def build_active_pane(self):
@@ -1334,7 +1339,15 @@ class Win(Gtk.Window):
         row.pack_start(view_toggle, False, False, 0)
         self.filter_entry = Gtk.SearchEntry()
         self.filter_entry.set_placeholder_text(
-            "matches name · host · group · user   (Ctrl+T pins as tab)")
+            "text, or #name #host #group #user #tag + regex · #and #or #not")
+        self.filter_entry.set_tooltip_markup(
+            "<b>Text</b> is a regex over every field; ignores case.\n"
+            "<b>#name #host #group #user #tag</b> pick a field — the regex "
+            "after a key runs to the next <tt>' #'</tt>.\n"
+            "Side by side = all must hold · <b>#or</b> = alternatives · "
+            "<b>#not</b> negates the next term.\n"
+            "<tt>#group trib #name sorter #not maint</tt>\n"
+            "Ctrl+T pins the filter as a tab · F1 ▸ Filter syntax")
         self.filter_entry.set_text(self.query_text)
         self.filter_entry.connect("search-changed", self.on_filter_changed)
         row.pack_start(self.filter_entry, True, True, 0)
@@ -4004,27 +4017,39 @@ class Win(Gtk.Window):
         registry = protocols_safe()
         self.store.clear()
 
-        def highlight(text: str) -> str:
-            """Escape, and in Spotlight wrap filter matches in the search tint."""
-            escaped = GLib.markup_escape_text(text)
-            needle = self.query_text.strip()
-            if not (self.highlight_matches and needle):
-                return escaped
-            pattern = re.compile(re.escape(GLib.markup_escape_text(needle)),
-                                 re.IGNORECASE)
-            return pattern.sub(
-                lambda m: f'<span background="#f8e45c" foreground="#000000">'
-                          f'{m.group(0)}</span>', escaped)
+        query = self.parsed_query()
+
+        def highlight(text: str, field_name: str) -> str:
+            """Escape, and wrap what the filter matched in the search tint.
+
+            Matched on the raw text and escaped piece by piece, so a regex
+            never lands inside an &amp; it did not write.
+            """
+            patterns = query.patterns_for(field_name) \
+                if self.highlight_matches else []
+            spans = sorted((m.start(), m.end()) for p in patterns
+                           for m in p.finditer(text) if m.end() > m.start())
+            out, at = [], 0
+            for start, end in spans:
+                if end <= at:
+                    continue
+                start = max(start, at)
+                out.append(GLib.markup_escape_text(text[at:start]))
+                out.append('<span background="#f8e45c" foreground="#000000">'
+                           f'{GLib.markup_escape_text(text[start:end])}</span>')
+                at = end
+            out.append(GLib.markup_escape_text(text[at:]))
+            return "".join(out)
 
         def connection_row(c, parent):
-            name_markup = highlight(c.name)
+            name_markup = highlight(c.name, "name")
             state, _scope = rcm.connection_password_state(c)
             if state == "none":
                 name_markup += ('\n<small><span foreground="#c04040">'
                                 'no password — will prompt</span></small>')
             self.store.append(parent, [
                 c.sel in ticked, "", self.net_cell(c), name_markup,
-                highlight(c.host), c.username,
+                highlight(c.host, "host"), c.username,
                 protocol_badges(c.protocols, registry, c.default_protocol),
                 pretty_key(keys.get(c.sel, "")), c.sel, 400, Pango.Style.NORMAL])
 

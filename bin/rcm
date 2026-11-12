@@ -227,6 +227,139 @@ def find(sel: str) -> Conn | None:
 
 
 # --------------------------------------------------------------------------- #
+# filter queries
+# --------------------------------------------------------------------------- #
+QUERY_FIELDS = ("group", "name", "host", "user", "tag")
+QUERY_OPERATORS = ("and", "or", "not")
+# A key is a '#' at the start of the text or after whitespace; a '#' anywhere
+# else (a#b) belongs to the regex around it.
+_QUERY_KEY = re.compile(r"(?:^|(?<=\s))#(\w*)")
+
+
+@dataclass
+class QueryTerm:
+    field: str              # one of QUERY_FIELDS, or "" for every field
+    pattern: re.Pattern
+    negated: bool = False
+
+    def values(self, c: Conn) -> list[str]:
+        if self.field == "group":
+            return [c.group]
+        if self.field == "name":
+            return [c.name]
+        if self.field == "host":
+            return [c.host]
+        if self.field == "user":
+            return [c.username]
+        if self.field == "tag":
+            return list(c.tags)
+        return [c.sel, c.host, c.username, *c.tags]
+
+    def holds(self, c: Conn) -> bool:
+        found = any(self.pattern.search(v) for v in self.values(c))
+        return found != self.negated
+
+
+@dataclass
+class Query:
+    """A parsed filter: OR of AND-groups of terms. No groups matches all."""
+    groups: list[list[QueryTerm]] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+    impossible: bool = False     # an unknown key: nothing can match
+
+    def matches(self, c: Conn) -> bool:
+        if self.impossible:
+            return False
+        if not self.groups:
+            return True
+        return any(all(term.holds(c) for term in group) for group in self.groups)
+
+    def patterns_for(self, field_name: str) -> list[re.Pattern]:
+        """What to highlight in one field: its own terms and the free ones."""
+        return [t.pattern for group in self.groups for t in group
+                if not t.negated and t.field in (field_name, "")]
+
+
+def _query_pattern(text: str, problems: list[str]) -> re.Pattern:
+    try:
+        return re.compile(text, re.IGNORECASE)
+    except re.error as e:
+        problems.append(f"{text!r} is not a regex ({e}) -- matched as plain text")
+        return re.compile(re.escape(text), re.IGNORECASE)
+
+
+@help_topic("filter-syntax", "Filter syntax",
+            ("filter", "search", "query", "regex", "#name", "#host", "#and",
+             "#or", "#not"), section="Connections")
+def parse_query(text: str) -> Query:
+    """The filter box takes text, or keys each followed by a regex.
+
+    Plain text is a regex tried against every field -- the group/name path,
+    host, user and tags -- so a word still finds what contains it. Keys pick
+    one field: #group #name #host #user #tag (#tag tries each tag on its
+    own). A key starts with # at the start or after a space, ends at the next
+    space, and its regex runs up to the next " #" or the end. Matching
+    ignores case and finds the regex anywhere in the value: use ^ and $ to
+    pin it. Spaces around a regex are dropped; inside one they count.
+
+    Terms side by side must all hold. #or separates alternatives, and binds
+    looser than #and: "a #or b #and c" is a, or both b and c. #not negates
+    the term after it; text straight after #not, #and or #or is a term over
+    every field.
+
+      #group trib #name sorter      sorters in TRIB
+      #name sorter #not maint       sorters, without the maintenance ones
+      #host \\.1[0-3]$ #or #tag plc  four hosts, or anything tagged plc
+      #user ^$                      connections with no username set
+
+    Half-typed input never empties the list: a key with no regex yet, a
+    partial key at the end, or a trailing operator adds nothing. A regex
+    that does not compile is matched as plain text, and an unknown key
+    matches nothing; the status bar says which.
+    """
+    query = Query()
+    text = text.strip()
+    if not text:
+        return query
+    keys = list(_QUERY_KEY.finditer(text))
+    pieces: list[tuple[str | None, str]] = []      # (key or None, regex)
+    head = text[:keys[0].start()] if keys else text
+    if head.strip():
+        pieces.append((None, head.strip()))
+    for i, m in enumerate(keys):
+        end = keys[i + 1].start() if i + 1 < len(keys) else len(text)
+        pieces.append((m.group(1).lower(), text[m.end():end].strip()))
+
+    groups: list[list[QueryTerm]] = [[]]
+    negate = False
+    for n, (key, regex) in enumerate(pieces):
+        if key is not None and key not in QUERY_FIELDS + QUERY_OPERATORS:
+            last = n == len(pieces) - 1
+            if last and not regex and any(k.startswith(key)
+                                          for k in QUERY_FIELDS + QUERY_OPERATORS):
+                continue                      # still typing it
+            query.problems.append(
+                f"unknown key #{key} -- the keys are "
+                + " ".join("#" + k for k in QUERY_FIELDS + QUERY_OPERATORS))
+            query.impossible = True
+            continue
+        if key == "or":
+            if groups[-1]:
+                groups.append([])
+        elif key == "not":
+            negate = not negate
+        field_name = key if key in QUERY_FIELDS else ""
+        if not regex:
+            continue                          # a key with nothing after it yet
+        groups[-1].append(QueryTerm(field_name,
+                                    _query_pattern(regex, query.problems),
+                                    negate))
+        negate = False
+    query.groups = [g for g in groups if g]
+    return query
+
+
+# --------------------------------------------------------------------------- #
 # credentials
 # --------------------------------------------------------------------------- #
 def creds_path() -> Path | None:
